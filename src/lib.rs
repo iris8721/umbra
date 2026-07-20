@@ -4,7 +4,9 @@ pub mod gc;
 pub mod chunk;
 pub mod compiler;
 pub mod lexer;
+pub mod pack;
 pub mod parser;
+pub mod pattern;
 pub mod value;
 pub mod vm;
 
@@ -77,7 +79,7 @@ mod tests {
     #[test]
     fn lex_line_comment() {
         use lexer::Lexer;
-        let toks = Lexer::tokenize("42 // this is a comment\n99").unwrap();
+        let toks = Lexer::tokenize("42 @ this is a comment\n99").unwrap();
         assert!(matches!(toks[0].kind, lexer::TokenKind::Int(42)));
         assert!(matches!(toks[1].kind, lexer::TokenKind::Int(99)));
     }
@@ -266,6 +268,952 @@ mod tests {
     }
 
     #[test]
+    fn vm_gc_preserves_suspended_coroutine_locals() {
+        // Without scanning a suspended coroutine's own regs as a GC root, the
+        // allocation pressure below frees `t` and resuming reads a dangling pointer.
+        assert_output(
+            "let co = coroutine.create(fn() {
+                let t = {123}
+                yield()
+                print(t[1])
+            })
+            coroutine.resume(co)
+            var i = 0
+            while i < 2000 {
+                let junk = {i}
+                i = i + 1
+            }
+            coroutine.resume(co)",
+            &["123"],
+        );
+    }
+
+    #[test]
+    fn pcall_catches_internal_panic_cleanly() {
+        assert_output(
+            "let ok, msg = pcall(__debug_panic)
+            print(ok)
+            print(msg:sub(1, 14))",
+            &["false", "internal error"],
+        );
+    }
+
+    #[test]
+    fn top_level_panic_without_pcall_is_caught_not_crashed() {
+        // Exercises Vm::run()'s own catch_unwind directly: __debug_panic() called
+        // bare (not through pcall/call_value_isolated) panics inside Op::TailCall's
+        // unprotected cfn(&args)? — the unwind must still be caught, just one level
+        // up, rather than propagating out of this test process.
+        let mut vm = vm::Vm::new();
+        assert!(run_with_vm("__debug_panic()", &mut vm).is_err());
+        assert!(vm.poisoned);
+    }
+
+    #[test]
+    fn coroutine_resume_panic_is_caught_not_crashed() {
+        // coroutine.resume swaps the coroutine's regs/frames into self before
+        // calling run_inner() directly (vm.rs, no local catch_unwind at that call);
+        // a panic there skips the swap-back on its way out, so this also checks
+        // that poisoning still holds even with regs/frames left unrestored.
+        let mut vm = vm::Vm::new();
+        let result = run_with_vm(
+            "let co = coroutine.create(fn() { __debug_panic() })
+            coroutine.resume(co)",
+            &mut vm,
+        );
+        assert!(result.is_err());
+        assert!(vm.poisoned);
+    }
+
+    #[test]
+    fn api_pcall_catches_panic_in_native_function_directly() {
+        // Exercises api.rs's own call_value()/umbra_pcall catch_unwind, independent
+        // of vm.rs's — this path never goes through call_value_isolated at all.
+        use std::ffi::CString;
+        let U = api::umbra_newstate();
+        let name = CString::new("__debug_panic").unwrap();
+        unsafe { api::umbra_getglobal(U, name.as_ptr()) };
+        let rc = unsafe { api::umbra_pcall(U, 0, 0) };
+        assert_eq!(rc, 1);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn vm_poisons_after_panic_and_refuses_further_top_level_runs() {
+        let mut vm = vm::Vm::new();
+        assert!(run_with_vm("pcall(__debug_panic)", &mut vm).is_ok());
+        assert!(vm.poisoned);
+        assert!(run_with_vm("print(1)", &mut vm).is_err());
+    }
+
+    #[test]
+    fn stdlib_string_rep_rejects_oversized_result() {
+        assert!(run("let s = \"x\"\nlet r = s:rep(999999999999)").is_err());
+    }
+
+    #[test]
+    fn stdlib_string_format_clamps_huge_width() {
+        assert_output(
+            "print(string.len(string.format(\"%999999999999d\", 1)))",
+            &["67108864"],
+        );
+    }
+
+    #[test]
+    fn stdlib_table_concat_unpack_move_reject_huge_ranges() {
+        assert!(run("let t = {1, 2, 3}\ntable.concat(t, \",\", 1, 999999999999)").is_err());
+        assert!(run("let t = {1, 2, 3}\ntable.unpack(t, 1, 999999999999)").is_err());
+        assert!(run("let t = {1, 2, 3}\nlet u = {}\ntable.move(t, 1, 999999999999, 1, u)").is_err());
+    }
+
+    #[test]
+    fn stdlib_table_insert_rejects_out_of_bounds_position() {
+        assert!(run("let t = {1, 2, 3}\ntable.insert(t, math.mininteger, 99)").is_err());
+    }
+
+    #[test]
+    fn vm_mod_min_int_overflow() {
+        // 9223372036854775808 (2^63) itself doesn't fit in i64 and can't be lexed,
+        // so i64::MIN is constructed as (i64::MAX negated) - 1.
+        assert_output("print((-9223372036854775807 - 1) % -1)", &["0"]);
+        assert_output("print((-9223372036854775807 - 1) // -1)", &["-9223372036854775808"]);
+    }
+
+    #[test]
+    fn vm_continue_in_while_loop() {
+        assert_output(
+            "var i = 0
+            var sum = 0
+            while i < 5 {
+                i = i + 1
+                if i % 2 == 0 { continue }
+                sum = sum + i
+            }
+            print(sum)",
+            &["9"], // 1 + 3 + 5
+        );
+    }
+
+    #[test]
+    fn vm_continue_in_for_num_loop() {
+        assert_output(
+            "var sum = 0
+            for i = 1, 5 {
+                if i % 2 == 0 { continue }
+                sum = sum + i
+            }
+            print(sum)",
+            &["9"],
+        );
+    }
+
+    #[test]
+    fn vm_continue_in_for_in_loop() {
+        assert_output(
+            "var sum = 0
+            for i, v in ipairs({1, 2, 3, 4, 5}) {
+                if v % 2 == 0 { continue }
+                sum = sum + v
+            }
+            print(sum)",
+            &["9"],
+        );
+    }
+
+    #[test]
+    fn vm_continue_outside_loop_is_compile_error() {
+        assert!(run("continue").is_err());
+    }
+
+    #[test]
+    fn vm_repeat_until_runs_body_at_least_once() {
+        assert_output(
+            "var i = 0
+            repeat {
+                i = i + 1
+            } until i >= 3
+            print(i)",
+            &["3"],
+        );
+        assert_output(
+            "var i = 10
+            repeat {
+                i = i + 1
+            } until true
+            print(i)",
+            &["11"],
+        );
+    }
+
+    #[test]
+    fn vm_repeat_until_condition_sees_body_locals() {
+        // Lua's repeat-until scoping rule: `until` can reference locals the body just declared.
+        assert_output(
+            "var i = 0
+            repeat {
+                let done = i >= 2
+                i = i + 1
+            } until done
+            print(i)",
+            &["3"],
+        );
+    }
+
+    #[test]
+    fn vm_repeat_until_break_and_continue() {
+        assert_output(
+            "var i = 0
+            var sum = 0
+            repeat {
+                i = i + 1
+                if i % 2 == 0 { continue }
+                sum = sum + i
+            } until i >= 5
+            print(sum)",
+            &["9"],
+        );
+        assert_output(
+            "var i = 0
+            repeat {
+                i = i + 1
+                if i == 3 { break }
+            } until false
+            print(i)",
+            &["3"],
+        );
+    }
+
+    #[test]
+    fn vm_goto_forward_skips_code() {
+        assert_output(
+            "print(\"a\")
+            goto skip
+            print(\"b\")
+            ::skip::
+            print(\"c\")",
+            &["a", "c"],
+        );
+    }
+
+    #[test]
+    fn vm_goto_backward_loops() {
+        assert_output(
+            "var i = 0
+            ::top::
+            i = i + 1
+            print(i)
+            if i < 3 { goto top }",
+            &["1", "2", "3"],
+        );
+    }
+
+    #[test]
+    fn vm_goto_undefined_label_is_compile_error() {
+        assert!(run("goto nowhere").is_err());
+    }
+
+    #[test]
+    fn vm_goto_duplicate_label_is_compile_error() {
+        assert!(run("::here:: ::here::").is_err());
+    }
+
+    #[test]
+    fn vm_runtime_errors_carry_line_numbers() {
+        let e = run("print(1)\nprint(2)\nerror(\"boom\")").unwrap_err();
+        assert_eq!(e, "line 3: boom");
+    }
+
+    #[test]
+    fn vm_type_errors_carry_line_numbers() {
+        let e = run("let x = nil\nprint(1)\nx + 1").unwrap_err();
+        assert!(e.starts_with("line 3:"), "expected line 3 prefix, got: {e}");
+    }
+
+    #[test]
+    fn vm_error_level_2_attributes_to_caller_line() {
+        let e = run("fn f() {\n    error(\"boom\", 2)\n}\nf()").unwrap_err();
+        assert_eq!(e, "line 4: boom");
+    }
+
+    #[test]
+    fn vm_error_level_1_is_same_as_default() {
+        let e = run("fn f() {\n    error(\"boom\", 1)\n}\nf()").unwrap_err();
+        assert_eq!(e, "line 2: boom");
+    }
+
+    #[test]
+    fn vm_pcall_error_message_carries_line_number() {
+        assert_output(
+            "let ok, msg = pcall(fn() {
+                print(\"a\")
+                error(\"deep boom\")
+            })
+            print(msg)",
+            &["a", "line 3: deep boom"],
+        );
+    }
+
+    #[test]
+    fn vm_xpcall_success_passes_through_results() {
+        assert_output(
+            "let ok, a, b = xpcall(fn() { return 1, 2 }, fn(m) { return m })
+            print(ok)
+            print(a)
+            print(b)",
+            &["true", "1", "2"],
+        );
+    }
+
+    #[test]
+    fn vm_xpcall_runs_handler_on_error() {
+        assert_output(
+            "let ok, msg = xpcall(fn() { error(\"boom\") }, fn(m) { return \"handled: \" .. m })
+            print(ok)
+            print(msg)",
+            &["false", "handled: line 1: boom"],
+        );
+    }
+
+    #[test]
+    fn vm_xpcall_survives_handler_that_itself_errors() {
+        assert_output(
+            "let ok, msg = xpcall(fn() { error(\"boom\") }, fn(m) { error(\"handler boom\") })
+            print(ok)
+            print(type(msg))",
+            &["false", "string"],
+        );
+    }
+
+    #[test]
+    fn pattern_find_character_classes_and_anchors() {
+        assert_output(
+            "let a, b = string.find(\"hello 123 world\", \"%d+\")
+            print(a)
+            print(b)",
+            &["7", "9"],
+        );
+        assert_output(
+            "let a, b = string.find(\"abc\", \"^a\")\nprint(a)\nprint(b)",
+            &["1", "1"],
+        );
+        assert_output(r#"print(string.find("abc", "^b"))"#, &["nil"]);
+        assert_output(
+            "let a, b = string.find(\"abc\", \"c$\")\nprint(a)\nprint(b)",
+            &["3", "3"],
+        );
+    }
+
+    #[test]
+    fn pattern_sets_and_quantifiers() {
+        assert_output(r#"print(string.match("hello123world", "[%a]+"))"#, &["hello"]);
+        assert_output(r#"print(string.match("hello123world", "[^%d]+"))"#, &["hello"]);
+        assert_output(r#"print(string.match("aaa", "a-b") == nil)"#, &["true"]);
+        assert_output(r#"print(string.match("<b>bold</b>", "<(.-)>"))"#, &["b"]);
+        assert_output(r#"print(string.match("color", "colou?r"))"#, &["color"]);
+        assert_output(r#"print(string.match("colour", "colou?r"))"#, &["colour"]);
+    }
+
+    #[test]
+    fn pattern_captures() {
+        assert_output(
+            r#"let y, m, d = string.match("2026-07-19", "(%d+)-(%d+)-(%d+)")
+            print(y)
+            print(m)
+            print(d)"#,
+            &["2026", "07", "19"],
+        );
+        assert_output(
+            "let a, b = string.match(\"hello\", \"()ll()\")\nprint(a)\nprint(b)",
+            &["3", "5"],
+        );
+    }
+
+    #[test]
+    fn pattern_balanced_match() {
+        assert_output(r#"print(string.match("(foo(bar)baz)", "%b()"))"#, &["(foo(bar)baz)"]);
+    }
+
+    #[test]
+    fn pattern_gmatch_iterates_all_matches() {
+        assert_output(
+            "var words = \"\"
+            for w in string.gmatch(\"the quick brown fox\", \"%a+\") {
+                words = words .. w .. \",\"
+            }
+            print(words)",
+            &["the,quick,brown,fox,"],
+        );
+    }
+
+    #[test]
+    fn pattern_gsub_string_replacement_with_backreference() {
+        assert_output(
+            r#"let s, n = string.gsub("hello world", "(%a+)", "<%1>")
+            print(s)
+            print(n)"#,
+            &["<hello> <world>", "2"],
+        );
+    }
+
+    #[test]
+    fn pattern_gsub_function_replacement() {
+        assert_output(
+            "let s = string.gsub(\"abc\", \"%a\", fn(c) { return string.upper(c) })
+            print(s)",
+            &["ABC"],
+        );
+    }
+
+    #[test]
+    fn pattern_gsub_table_replacement() {
+        assert_output(
+            "let t = {foo = \"bar\"}
+            let s = string.gsub(\"hello foo world\", \"%a+\", t)
+            print(s)",
+            &["hello bar world"],
+        );
+    }
+
+    #[test]
+    fn pattern_gsub_respects_max_count() {
+        assert_output(
+            r#"let s, n = string.gsub("aaaa", "a", "b", 2)
+            print(s)
+            print(n)"#,
+            &["bbaa", "2"],
+        );
+    }
+
+    #[test]
+    fn stdlib_table_pack_and_unpack_round_trip() {
+        assert_output(
+            "let t = table.pack(10, 20, 30)
+            print(t.n)
+            print(t[1])
+            print(t[3])
+            let a, b, c = table.unpack(t, 1, t.n)
+            print(a + b + c)",
+            &["3", "10", "30", "60"],
+        );
+    }
+
+    #[test]
+    fn gc_weak_values_are_cleared_once_unreachable() {
+        assert_output(
+            "let cache = {}
+            setmetatable(cache, {__mode = \"v\"})
+            cache.item = {1, 2, 3}
+            print(cache.item == nil)
+            var i = 0
+            while i < 2000 {
+                let junk = {i}
+                i = i + 1
+            }
+            print(cache.item == nil)",
+            &["false", "true"],
+        );
+    }
+
+    #[test]
+    fn gc_weak_keys_are_cleared_once_unreachable() {
+        assert_output(
+            "let registry = {}
+            setmetatable(registry, {__mode = \"k\"})
+            var k = {}
+            registry[k] = \"data\"
+            var count = 0
+            for key, val in pairs(registry) { count = count + 1 }
+            print(count)
+            k = nil
+            var i = 0
+            while i < 2000 {
+                let junk = {i}
+                i = i + 1
+            }
+            count = 0
+            for key, val in pairs(registry) { count = count + 1 }
+            print(count)",
+            &["1", "0"],
+        );
+    }
+
+    #[test]
+    fn gc_strong_table_is_unaffected_by_weak_sweep() {
+        assert_output(
+            "let cache = {}
+            cache.item = {1, 2, 3}
+            var i = 0
+            while i < 2000 {
+                let junk = {i}
+                i = i + 1
+            }
+            print(cache.item == nil)
+            print(cache.item[1])",
+            &["false", "1"],
+        );
+    }
+
+    #[test]
+    fn io_write_has_no_trailing_newline_or_separator() {
+        // io.write concatenates args directly, unlike print's tab-joining +
+        // trailing newline; each call surfaces as its own hook entry here.
+        assert_output(
+            "io.write(\"a\")
+            io.write(\"b\", \"c\")",
+            &["a", "bc"],
+        );
+    }
+
+    #[test]
+    fn os_time_and_clock_return_sane_values() {
+        assert_output(
+            "print(math.type(os.time()))
+            print(os.clock() >= 0)",
+            &["integer", "true"],
+        );
+    }
+
+    #[test]
+    fn os_getenv_returns_nil_for_unset_var() {
+        assert_output(
+            "print(os.getenv(\"UMBRA_DEFINITELY_UNSET_VAR_XYZ\"))",
+            &["nil"],
+        );
+    }
+
+    #[test]
+    fn os_date_from_script_with_explicit_epoch() {
+        assert_output(
+            "print(os.date(\"%Y-%m-%d\", 0))",
+            &["1970-01-01"],
+        );
+    }
+
+    #[test]
+    fn gc_auto_triggers_inside_a_call_free_tight_loop() {
+        // The GC/step-limit checks live in run_inner's fast (inner) dispatch
+        // loop, which handles simple instructions (arithmetic, table ops, Jmp)
+        // without ever returning to the outer loop unless a threshold is hit —
+        // a pure allocation loop with no function calls must still trigger
+        // automatic collection, not just calls/coroutine-resume boundaries.
+        use std::ffi::CString;
+        let U = api::umbra_newstate();
+        let src = CString::new(
+            "var i = 0
+            while i < 5000 {
+                let junk = {i, i, i}
+                i = i + 1
+            }"
+        ).unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+        let live = unsafe { api::umbra_gc_livecount(U) };
+        assert!(live < 5000, "expected auto-GC to keep live count well below total allocations, got {live}");
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_step_limit_bounds_a_runaway_script() {
+        // A real infinite loop: if the budget check were broken, this test
+        // would hang the whole test binary rather than fail cleanly.
+        use std::ffi::CString;
+        let U = api::umbra_newstate();
+        unsafe { api::umbra_set_step_limit(U, 1000) };
+        let src = CString::new("while true { }").unwrap();
+        let rc = unsafe { api::umbra_dostring(U, src.as_ptr()) };
+        assert_eq!(rc, 1);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_step_limit_zero_means_unlimited() {
+        use std::ffi::CString;
+        let U = api::umbra_newstate();
+        unsafe { api::umbra_set_step_limit(U, 0) };
+        let src = CString::new("var i = 0\nwhile i < 5000 { i = i + 1 }").unwrap();
+        let rc = unsafe { api::umbra_dostring(U, src.as_ptr()) };
+        assert_eq!(rc, 0);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn require_loads_compiles_and_caches_a_module() {
+        let mod_name = "umbra_test_require_module_xyz";
+        let path = format!("{mod_name}.umbra");
+        std::fs::write(&path, "let calls = 0\nfn get() { calls = calls + 1; return calls }\nreturn { get = get }").unwrap();
+
+        let result = run_capture(&format!(
+            "let m = require(\"{mod_name}\")
+            print(m.get())
+            print(m.get())
+            let m2 = require(\"{mod_name}\")
+            print(m2.get())"
+        ));
+
+        std::fs::remove_file(&path).ok();
+
+        // Cached: m2 is the SAME module table as m, so its internal `calls`
+        // state carries over rather than require() re-running the file.
+        assert_eq!(result.unwrap(), vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn require_missing_module_is_a_clean_error() {
+        assert!(run("require(\"umbra_test_definitely_missing_module_xyz\")").is_err());
+    }
+
+    #[test]
+    fn io_open_writes_then_reads_a_file() {
+        let path = "umbra_test_io_open_rw_xyz.txt";
+        let result = run_capture(&format!(
+            "let f = io.open(\"{path}\", \"w\")
+            f:write(\"line one\\n\")
+            f:write(\"line two\\n\")
+            f:close()
+            let g = io.open(\"{path}\", \"r\")
+            print(g:read())
+            print(g:read())
+            print(g:read())
+            g:close()"
+        ));
+        std::fs::remove_file(path).ok();
+        assert_eq!(result.unwrap(), vec!["line one", "line two", "nil"]);
+    }
+
+    #[test]
+    fn io_open_lines_iterates_each_line() {
+        let path = "umbra_test_io_open_lines_xyz.txt";
+        std::fs::write(path, "a\nb\nc\n").unwrap();
+        let result = run_capture(&format!(
+            "let f = io.open(\"{path}\", \"r\")
+            for line in f:lines() {{
+                print(line)
+            }}
+            f:close()"
+        ));
+        std::fs::remove_file(path).ok();
+        assert_eq!(result.unwrap(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn io_open_missing_file_returns_nil_and_error() {
+        assert_output(
+            "let f, err = io.open(\"umbra_test_io_open_missing_xyz.txt\", \"r\")
+            print(f)
+            print(err != nil)",
+            &["nil", "true"],
+        );
+    }
+
+    #[test]
+    fn io_open_read_after_close_is_an_error() {
+        let path = "umbra_test_io_open_closed_xyz.txt";
+        std::fs::write(path, "x").unwrap();
+        let result = run(&format!(
+            "let f = io.open(\"{path}\", \"r\")
+            f:close()
+            f:read()"
+        ));
+        std::fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn api_max_objects_bounds_unbounded_allocation() {
+        // A real infinite allocation loop: if the ceiling check were broken,
+        // this would hang/exhaust memory rather than fail cleanly.
+        use std::ffi::CString;
+        let U = api::umbra_newstate();
+        unsafe { api::umbra_set_max_objects(U, 500) };
+        // Each new table is kept reachable via `arr`, so these are genuinely
+        // live, not garbage the collector could just reclaim each cycle.
+        let src = CString::new(
+            "let arr = {}
+            var i = 0
+            while true {
+                arr[i] = {1, 2, 3}
+                i = i + 1
+            }"
+        ).unwrap();
+        let rc = unsafe { api::umbra_dostring(U, src.as_ptr()) };
+        assert_eq!(rc, 1);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_max_objects_zero_means_unlimited() {
+        use std::ffi::CString;
+        let U = api::umbra_newstate();
+        unsafe { api::umbra_set_max_objects(U, 0) };
+        let src = CString::new("var i = 0\nwhile i < 3000 { let junk = {i}\ni = i + 1 }").unwrap();
+        let rc = unsafe { api::umbra_dostring(U, src.as_ptr()) };
+        assert_eq!(rc, 0);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn compound_assign_arithmetic_ops() {
+        assert_output(
+            "var x = 10
+            x += 5   print(x)
+            x -= 3   print(x)
+            x *= 2   print(x)
+            x /= 4   print(x)
+            x = 17
+            x //= 5  print(x)
+            x %= 4   print(x)
+            x = 2
+            x ^= 8   print(x)",
+            &["15", "12", "24", "6", "3", "3", "256"],
+        );
+    }
+
+    #[test]
+    fn compound_assign_bitwise_and_shift_ops() {
+        assert_output(
+            "var x = 0xF0
+            x &= 0x3C  print(x)
+            x |= 0x01  print(x)
+            x ~= 0xFF  print(x)
+            x = 1
+            x <<= 4    print(x)
+            x >>= 2    print(x)",
+            &["48", "49", "206", "16", "4"],
+        );
+    }
+
+    #[test]
+    fn compound_assign_concat() {
+        assert_output(
+            "var s = \"a\"
+            s ..= \"b\"
+            s ..= \"c\"
+            print(s)",
+            &["abc"],
+        );
+    }
+
+    #[test]
+    fn compound_assign_on_field_and_index_targets() {
+        assert_output(
+            "let t = {count = 10}
+            t.count += 5
+            print(t.count)
+            let arr = {1, 2, 3}
+            arr[2] *= 10
+            print(arr[2])",
+            &["15", "20"],
+        );
+    }
+
+    #[test]
+    fn at_sign_is_the_comment_token() {
+        assert_output("print(1) @ this is a comment\nprint(2)", &["1", "2"]);
+    }
+
+    #[test]
+    fn minus_minus_is_decrement_not_a_comment() {
+        // The exact case flagged during implementation: with @ as the comment
+        // token, -- unambiguously means decrement, not "start of comment".
+        assert_output("var i = 5\ni--\nprint(i)", &["4"]);
+        assert_output("var a = 10\nvar b = a - -1\nprint(b)", &["11"]);
+    }
+
+    #[test]
+    fn postfix_increment_returns_old_value() {
+        assert_output(
+            "var i = 5
+            let old = i++
+            print(old)
+            print(i)",
+            &["5", "6"],
+        );
+    }
+
+    #[test]
+    fn prefix_increment_returns_new_value() {
+        assert_output(
+            "var i = 5
+            let new = ++i
+            print(new)
+            print(i)",
+            &["6", "6"],
+        );
+    }
+
+    #[test]
+    fn decrement_on_field_and_index_targets() {
+        assert_output(
+            "let t = {count = 10}
+            t.count--
+            print(t.count)
+            let arr = {1, 2, 3}
+            arr[1]++
+            print(arr[1])",
+            &["9", "2"],
+        );
+    }
+
+    #[test]
+    fn increment_as_a_mid_block_statement() {
+        // The actual parser bug found while implementing this: a bare expression
+        // statement is normally only valid at the tail of a block (implicit
+        // return); ++/-- needed the same Stmt-wrapping treatment as Call/MethodCall.
+        assert_output(
+            "var i = 0
+            i++
+            i++
+            print(i)
+            print(\"reached end\")",
+            &["2", "reached end"],
+        );
+    }
+
+    #[test]
+    fn ternary_basic_and_nested() {
+        assert_output("print(true ? \"a\" : \"b\")", &["a"]);
+        assert_output("print(false ? \"a\" : \"b\")", &["b"]);
+        assert_output("print(1 < 2 ? 10 : 20)", &["10"]);
+        // Right-associative: a ? b : (c ? d : e)
+        assert_output("print(false ? 1 : true ? 2 : 3)", &["2"]);
+    }
+
+    #[test]
+    fn ternary_fixes_the_and_or_falsy_footgun() {
+        // The classic Lua wart: `cond and a or b` breaks when `a` is falsy,
+        // silently falling through to `b`. A real ternary doesn't have this bug.
+        assert_output("print(true and false or \"fallback\")", &["fallback"]);
+        assert_output("print(true ? false : \"fallback\")", &["false"]);
+    }
+
+    #[test]
+    fn ternary_only_evaluates_the_taken_branch() {
+        assert_output(
+            "fn boom() { error(\"should not run\") }
+            print(true ? \"ok\" : boom())",
+            &["ok"],
+        );
+    }
+
+    #[test]
+    fn utf8_len_counts_codepoints_not_bytes() {
+        // "héllo" has 5 codepoints but 6 bytes (é is 2 bytes in UTF-8).
+        assert_output("print(utf8.len(\"h\\xc3\\xa9llo\"))", &["5"]);
+        assert_output("print(string.len(\"h\\xc3\\xa9llo\"))", &["6"]);
+    }
+
+    #[test]
+    fn utf8_char_and_codepoint_round_trip() {
+        assert_output(
+            "let s = utf8.char(104, 233, 108, 108, 111)
+            print(s)
+            print(utf8.codepoint(s, 1))
+            print(utf8.codepoint(s, 2))",
+            &["h\u{e9}llo", "104", "233"],
+        );
+    }
+
+    #[test]
+    fn utf8_codes_iterates_codepoints_with_byte_positions() {
+        assert_output(
+            "var out = \"\"
+            for pos, cp in utf8.codes(\"a\\xc3\\xa9b\") {
+                out = out .. pos .. \":\" .. cp .. \",\"
+            }
+            print(out)",
+            &["1:97,2:233,4:98,"],
+        );
+    }
+
+    #[test]
+    fn debug_traceback_via_xpcall_handler_shows_call_chain() {
+        assert_output(
+            "fn inner() { error(\"boom\") }
+            fn outer() { inner() }
+            let ok, tb = xpcall(outer, debug.traceback)
+            print(ok)
+            print(string.find(tb, \"stack traceback\") != nil)
+            let a, b = string.gsub(tb, \"\\n\", \"|\")
+            print(b >= 2)",
+            &["false", "true", "true"],
+        );
+    }
+
+    #[test]
+    fn debug_traceback_called_directly_still_works() {
+        assert_output(
+            "fn f() { return debug.traceback(\"hi\") }
+            let tb = f()
+            print(string.find(tb, \"^hi\") != nil)
+            print(string.find(tb, \"stack traceback\") != nil)",
+            &["true", "true"],
+        );
+    }
+
+    #[test]
+    fn os_date_matches_known_epoch_values() {
+        assert_eq!(vm::format_civil_time(0, "%Y-%m-%d %H:%M:%S"), "1970-01-01 00:00:00");
+        assert_eq!(vm::format_civil_time(1700000000, "%Y-%m-%d %H:%M:%S"), "2023-11-14 22:13:20");
+        assert_eq!(vm::format_civil_time(1000000000, "%Y-%m-%d %H:%M:%S"), "2001-09-09 01:46:40");
+    }
+
+    #[test]
+    fn vm_bigint_literals_survive_round_trip() {
+        // 2^47 is the smallest magnitude that overflows the 48-bit inline payload;
+        // i64::MAX/MIN can't be written as literals directly (see the mod-overflow
+        // test above), so MIN is built the same way: negate MAX, then subtract 1.
+        assert_output("print(9223372036854775807)", &["9223372036854775807"]);
+        assert_output("print(-9223372036854775807 - 1)", &["-9223372036854775808"]);
+    }
+
+    #[test]
+    fn vm_bigint_arithmetic_stays_correct() {
+        assert_output("print(9223372036854775807 - 1)", &["9223372036854775806"]);
+        // wrapping_mul overflow past i64::MAX wraps to i64::MIN, same convention Add/Sub already use.
+        assert_output("print(4611686018427387904 * 2)", &["-9223372036854775808"]);
+        assert_output("print(-(9223372036854775807))", &["-9223372036854775807"]);
+    }
+
+    #[test]
+    fn vm_bigint_equality_and_table_keys_are_by_value() {
+        // Two separately-computed bigints holding the same value must compare
+        // equal and hash to the same table key, not just alias the same pointer.
+        assert_output(
+            "let a = 9223372036854775807 - 0
+            let b = 9223372036854775806 + 1
+            print(a == b)
+            let t = {}
+            t[a] = \"first\"
+            t[b] = \"second\"
+            print(t[a])",
+            &["true", "second"],
+        );
+    }
+
+    #[test]
+    fn vm_math_maxinteger_mininteger_are_correct() {
+        assert_output("print(math.maxinteger)", &["9223372036854775807"]);
+        assert_output("print(math.mininteger)", &["-9223372036854775808"]);
+        assert_output("print(math.type(math.maxinteger))", &["integer"]);
+    }
+
+    #[test]
+    fn api_pushinteger_roundtrips_full_i64_range() {
+        let U = api::umbra_newstate();
+        unsafe { api::umbra_pushinteger(U, i64::MAX) };
+        assert_eq!(unsafe { api::umbra_tointeger(U, -1) }, i64::MAX);
+        unsafe { api::umbra_pushinteger(U, i64::MIN) };
+        assert_eq!(unsafe { api::umbra_tointeger(U, -1) }, i64::MIN);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn vm_idiv_floor_division() {
+        assert_output("print(7 // 2)", &["3"]);
+        assert_output("print(-7 // 2)", &["-4"]);
+        assert_output("print(7.5 // 2)", &["3"]);
+    }
+
+    #[test]
     fn vm_locals_and_assignment() {
         assert_output("let x = 5 let y = 3 print(x + y)", &["8"]);
         assert_output("var x = 1 x = x + 1 print(x)", &["2"]);
@@ -368,6 +1316,315 @@ mod tests {
     }
 
     #[test]
+    fn vm_close_attribute_calls_close_at_end_of_block() {
+        assert_output(
+            "if true {
+                let r <close> = {close = fn(self) { print(\"closed\") }}
+                print(\"inside\")
+            }
+            print(\"after\")",
+            &["inside", "closed", "after"],
+        );
+    }
+
+    #[test]
+    fn vm_close_attribute_runs_in_reverse_declaration_order() {
+        assert_output(
+            "if true {
+                let a <close> = {close = fn(self) { print(\"close a\") }}
+                let b <close> = {close = fn(self) { print(\"close b\") }}
+            }",
+            &["close b", "close a"],
+        );
+    }
+
+    #[test]
+    fn vm_close_attribute_works_with_var() {
+        assert_output(
+            "if true {
+                var r <close> = {close = fn(self) { print(\"closed\") }}
+                print(\"inside\")
+            }",
+            &["inside", "closed"],
+        );
+    }
+
+    #[test]
+    fn vm_plain_let_is_not_auto_closed() {
+        assert_output(
+            "if true {
+                let r = {close = fn(self) { print(\"should not run\") }}
+            }
+            print(\"after\")",
+            &["after"],
+        );
+    }
+
+    #[test]
+    fn vm_close_attribute_works_inside_while_loop_body() {
+        assert_output(
+            "var i = 0
+            while i < 2 {
+                let r <close> = {close = fn(self) { print(\"closed\") }}
+                i = i + 1
+            }
+            print(\"done\")",
+            &["closed", "closed", "done"],
+        );
+    }
+
+    #[test]
+    fn vm_close_attribute_works_when_also_captured_by_a_closure() {
+        // Regression: a <close> local that's also captured as an upvalue
+        // holds a box (see Local::boxed), but emit_closes used to look up
+        // "close" directly on the box itself instead of unboxing first.
+        assert_output(
+            "let r <close> = { tag = \"A\", close = fn(self) { print(\"closed\") } }
+            let peek = fn() { return r.tag }
+            print(peek())",
+            &["A", "closed"],
+        );
+    }
+
+    #[test]
+    fn vm_close_attribute_closes_real_file_handle() {
+        let path = "umbra_test_close_attr_io_xyz.txt";
+        let result = run_capture(&format!(
+            "if true {{
+                let f <close> = io.open(\"{path}\", \"w\")
+                f:write(\"data\")
+            }}
+            let g = io.open(\"{path}\", \"r\")
+            print(g:read())
+            g:close()"
+        ));
+        std::fs::remove_file(path).ok();
+        assert_eq!(result.unwrap(), vec!["data"]);
+    }
+
+    #[test]
+    fn stdlib_string_pack_unpack_roundtrips_integers() {
+        assert_output(
+            "let packed = string.pack(\"<i4\", 12345)
+            let n, pos = string.unpack(\"<i4\", packed)
+            print(n)
+            print(pos)",
+            &["12345", "5"],
+        );
+    }
+
+    #[test]
+    fn stdlib_string_pack_unpack_roundtrips_negative_integers() {
+        assert_output(
+            "let packed = string.pack(\"<i4\", -42)
+            let n = string.unpack(\"<i4\", packed)
+            print(n)",
+            &["-42"],
+        );
+    }
+
+    #[test]
+    fn stdlib_string_pack_respects_endianness() {
+        assert_output(
+            "let le = string.pack(\"<I2\", 1)
+            let be = string.pack(\">I2\", 1)
+            print(le)
+            print(be)",
+            &["0100", "0001"],
+        );
+    }
+
+    #[test]
+    fn stdlib_string_pack_unpack_roundtrips_double() {
+        assert_output(
+            "let packed = string.pack(\"d\", 3.5)
+            let f = string.unpack(\"d\", packed)
+            print(f)",
+            &["3.5"],
+        );
+    }
+
+    #[test]
+    fn stdlib_string_pack_unpack_roundtrips_length_prefixed_string() {
+        assert_output(
+            r#"let packed = string.pack("s1", "hi")
+            let s, pos = string.unpack("s1", packed)
+            print(s)
+            print(pos)"#,
+            &["hi", "4"],
+        );
+    }
+
+    #[test]
+    fn stdlib_string_pack_fixed_string_pads_with_zeros() {
+        assert_output(
+            r#"let packed = string.pack("c5", "ab")
+            print(#packed)"#,
+            &["10"],
+        );
+    }
+
+    #[test]
+    fn stdlib_string_pack_unpack_multiple_fields() {
+        assert_output(
+            r#"let packed = string.pack("<i4B", 300, 7)
+            let n, b, pos = string.unpack("<i4B", packed)
+            print(n)
+            print(b)
+            print(pos)"#,
+            &["300", "7", "6"],
+        );
+    }
+
+    #[test]
+    fn vm_switch_runs_matching_case() {
+        assert_output(
+            "let x = 2
+            switch x {
+                case 1 { print(\"one\") }
+                case 2 { print(\"two\") }
+                else { print(\"other\") }
+            }",
+            &["two"],
+        );
+    }
+
+    #[test]
+    fn vm_switch_falls_to_else_when_no_case_matches() {
+        assert_output(
+            "let x = 99
+            switch x {
+                case 1 { print(\"one\") }
+                case 2 { print(\"two\") }
+                else { print(\"other\") }
+            }",
+            &["other"],
+        );
+    }
+
+    #[test]
+    fn vm_switch_with_no_match_and_no_else_does_nothing() {
+        assert_output(
+            "let x = 99
+            switch x {
+                case 1 { print(\"one\") }
+            }
+            print(\"after\")",
+            &["after"],
+        );
+    }
+
+    #[test]
+    fn vm_switch_case_with_multiple_values_matches_any() {
+        assert_output(
+            "let x = 3
+            switch x {
+                case 1, 2, 3 { print(\"low\") }
+                else { print(\"high\") }
+            }",
+            &["low"],
+        );
+    }
+
+    #[test]
+    fn vm_switch_evaluates_subject_expr_only_once() {
+        assert_output(
+            "fn next() { print(\"called\"); return 2 }
+            switch next() {
+                case 1 { print(\"one\") }
+                case 2 { print(\"two\") }
+            }",
+            &["called", "two"],
+        );
+    }
+
+    #[test]
+    fn vm_string_interpolation_embeds_expr_value() {
+        assert_output(
+            r#"let name = "world"
+            print("hello ${name}!")"#,
+            &["hello world!"],
+        );
+    }
+
+    #[test]
+    fn vm_string_interpolation_coerces_numbers() {
+        assert_output(
+            r#"let a = 2
+            let b = 3
+            print("${a} + ${b} = ${a + b}")"#,
+            &["2 + 3 = 5"],
+        );
+    }
+
+    #[test]
+    fn vm_string_interpolation_handles_nested_braces_and_quotes() {
+        assert_output(
+            r#"fn f(x) { return x }
+            print("value: ${f({a = 1}).a}")
+            print("quoted: ${f("}")}")"#,
+            &["value: 1", "quoted: }"],
+        );
+    }
+
+    #[test]
+    fn vm_string_interpolation_empty_and_plain_still_work() {
+        assert_output(
+            r#"print("${""}")
+            print("plain string")"#,
+            &["", "plain string"],
+        );
+    }
+
+    #[test]
+    fn vm_table_destructure_binds_named_fields() {
+        assert_output(
+            "let point = {x = 1, y = 2}
+            let {x, y} = point
+            print(x)
+            print(y)",
+            &["1", "2"],
+        );
+    }
+
+    #[test]
+    fn vm_table_destructure_var_is_mutable() {
+        assert_output(
+            "let point = {x = 1}
+            var {x} = point
+            x = x + 1
+            print(x)",
+            &["2"],
+        );
+    }
+
+    #[test]
+    fn vm_table_destructure_missing_field_is_nil() {
+        assert_output(
+            "let point = {x = 1}
+            let {x, y} = point
+            print(x)
+            print(y)",
+            &["1", "nil"],
+        );
+    }
+
+    #[test]
+    fn vm_colon_method_def_implicitly_binds_self() {
+        assert_output(
+            "let T = {}
+            T.__index = T
+            fn T.new(x) { return setmetatable({x = x}, T) }
+            fn T:get() { return self.x }
+            fn T:add(n) { return self.x + n }
+            let t = T.new(42)
+            print(t:get())
+            print(t:add(8))",
+            &["42", "50"],
+        );
+    }
+
+    #[test]
     fn vm_closures() {
         assert_output(
             "let fn make() { let fn f(x) { return x * 2 } return f } let g = make() print(g(21))",
@@ -421,6 +1678,40 @@ mod tests {
     }
 
     #[test]
+    fn api_tostring_is_nul_terminated_for_c_hosts() {
+        // Read via CStr::from_ptr, exactly how a real C host would, rather than
+        // through any length umbra already knows internally.
+        use std::ffi::{CStr, CString};
+
+        let U = api::umbra_newstate();
+        let src = CString::new(r#"fn greet() { return "hello, umbra!" }"#).unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+
+        let name = CString::new("greet").unwrap();
+        unsafe { api::umbra_getglobal(U, name.as_ptr()) };
+        assert_eq!(unsafe { api::umbra_pcall(U, 0, 1) }, 0);
+
+        let ptr = unsafe { api::umbra_tostring(U, -1) };
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(s, "hello, umbra!");
+
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_pop_and_settop_clamp_extreme_indices() {
+        let U = api::umbra_newstate();
+        unsafe { api::umbra_pushnumber(U, 1.0) };
+        unsafe { api::umbra_pop(U, i32::MIN) }; // must not panic
+        assert!(unsafe { api::umbra_gettop(U) } > 0);
+
+        unsafe { api::umbra_settop(U, i32::MAX) }; // must not try to allocate ~17GB
+        assert!(unsafe { api::umbra_gettop(U) } as i64 <= 64 * 1024 * 1024 + 1);
+
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
     fn gc_collect_frees_dead_strings() {
         use std::ffi::CString;
 
@@ -438,6 +1729,33 @@ mod tests {
 
         let after = unsafe { api::umbra_gc_livecount(U) };
         assert!(after < before, "GC should have freed dead objects (before={before} after={after})");
+
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn gc_tracks_and_frees_stdlib_computed_strings() {
+        // string.upper (and tostring/string.format/table.concat/etc.) allocate via
+        // alloc_string_val, which historically never registered with the GC at all
+        // — a permanent leak. This proves the result is now actually tracked and,
+        // once unreachable, actually freed rather than living forever.
+        use std::ffi::CString;
+
+        let U = api::umbra_newstate();
+        let src = CString::new(r#"x = ("hello"):upper()"#).unwrap();
+
+        // Warm-up: interns any string constants ("hello", method-name lookup key)
+        // so the cache-hit path doesn't add to livecount on the next identical call —
+        // isolating what's left is purely the upper() result's own allocation.
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+        let before = unsafe { api::umbra_gc_livecount(U) };
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+        let after_alloc = unsafe { api::umbra_gc_livecount(U) };
+        assert!(after_alloc > before, "string.upper's result should be GC-tracked (before={before} after={after_alloc})");
+
+        unsafe { api::umbra_gc_collect(U) };
+        let after_collect = unsafe { api::umbra_gc_livecount(U) };
+        assert!(after_collect < after_alloc, "unreachable computed string should be freed");
 
         unsafe { api::umbra_close(U) };
     }
@@ -965,7 +2283,7 @@ print(add(5))
     }
 
     #[test]
-    fn upvalue_mutate_local_copy() {
+    fn upvalue_mutation_is_visible_to_the_enclosing_scope() {
         assert_output(
             r#"
 var x = 1
@@ -974,7 +2292,179 @@ inc()
 inc()
 print(x)
 "#,
-            &["1"],
+            &["3"],
+        );
+    }
+
+    #[test]
+    fn upvalue_mutation_is_shared_across_multiple_closures() {
+        assert_output(
+            r#"
+var x = 1
+let inc = fn() { x = x + 1 }
+let read = fn() { return x }
+inc()
+inc()
+print(read())
+"#,
+            &["3"],
+        );
+    }
+
+    #[test]
+    fn upvalue_each_outer_call_gets_independent_state() {
+        assert_output(
+            r#"
+fn make_counter() {
+    var n = 0
+    return fn() { n = n + 1; return n }
+}
+let c1 = make_counter()
+let c2 = make_counter()
+print(c1())
+print(c1())
+print(c2())
+"#,
+            &["1", "2", "1"],
+        );
+    }
+
+    #[test]
+    fn upvalue_two_levels_deep_still_shares_state() {
+        assert_output(
+            r#"
+fn outer() {
+    var n = 0
+    fn middle() {
+        return fn() { n = n + 1; return n }
+    }
+    return middle()
+}
+let inc = outer()
+print(inc())
+print(inc())
+"#,
+            &["1", "2"],
+        );
+    }
+
+    #[test]
+    fn upvalue_three_levels_deep_still_shares_state() {
+        assert_output(
+            r#"
+fn level1() {
+    var n = 0
+    fn level2() {
+        fn level3() {
+            return fn() { n = n + 1; return n }
+        }
+        return level3()
+    }
+    return level2()
+}
+let inc = level1()
+print(inc())
+print(inc())
+print(inc())
+"#,
+            &["1", "2", "3"],
+        );
+    }
+
+    #[test]
+    fn upvalue_local_func_recurses_via_upvalue_capture() {
+        // Side effect of the live outer-scope chain: a `let fn name(){}`
+        // (local function statement) can now legitimately capture itself as
+        // an upvalue for recursion, since the box it's registered under
+        // exists (empty) before the body compiles, and only gets filled in
+        // with the real closure afterward.
+        assert_output(
+            r#"
+fn make() {
+    let fn fact(n) {
+        if n <= 1 { return 1 }
+        return n * fact(n - 1)
+    }
+    return fact(5)
+}
+print(make())
+"#,
+            &["120"],
+        );
+    }
+
+    #[test]
+    fn upvalue_boxing_two_captured_params_dont_clobber_each_other() {
+        // Regression: box_in_place used to run param-by-param in the same
+        // loop that reserves param registers, so boxing param i's scratch
+        // register aliased param i+1's not-yet-reserved (but already
+        // populated by the calling convention) register, corrupting it
+        // before it was ever read.
+        assert_output(
+            r#"
+fn make(name, steps) {
+    return fn() {
+        for i = 1, steps {
+            print(name)
+            print(i)
+        }
+    }
+}
+let f = make("a", 3)
+f()
+"#,
+            &["a", "1", "a", "2", "a", "3"],
+        );
+    }
+
+    #[test]
+    fn upvalue_shared_state_survives_coroutine_yield_boundaries() {
+        assert_output(
+            r#"
+fn make_gen()
+{
+    var total = 0
+    let gen = coroutine.wrap(fn() {
+        var i = 0
+        while i < 3 {
+            i = i + 1
+            total = total + i
+            yield(total)
+        }
+    })
+    return { next = gen, get_total = fn() { return total } }
+}
+let g = make_gen()
+print(g.next())
+print(g.next())
+print(g.get_total())
+"#,
+            &["1", "3", "3"],
+        );
+    }
+
+    #[test]
+    fn upvalue_boxed_closures_survive_gc_collection() {
+        assert_output(
+            r#"
+fn make_counter()
+{
+    var n = 0
+    return fn() { n = n + 1; return n }
+}
+let counters = {}
+for i = 1, 20 {
+    counters[i] = make_counter()
+    let junk = {1, 2, 3, 4, 5}
+    let junk2 = {junk, junk, junk}
+}
+for i = 1, 20 {
+    for j = 1, i { counters[i]() }
+}
+print(counters[1]())
+print(counters[20]())
+"#,
+            &["2", "21"],
         );
     }
 

@@ -2,6 +2,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use crate::chunk::{Const, Op, Proto, ia, ib, ic, ibx, isbx, iop, is_rk, rk_idx};
 use crate::gc::Gc;
+use crate::pack;
+use crate::pattern;
 
 thread_local! {
     static PRINT_HOOK: std::cell::RefCell<Option<Box<dyn Fn(String)>>> = std::cell::RefCell::new(None);
@@ -9,6 +11,46 @@ thread_local! {
     static RNG: Cell<u64> = const { Cell::new(6364136223846793005) };
 }
 
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+// Days-since-epoch -> (year, month, day), Howard Hinnant's well-known
+// civil_from_days algorithm (proleptic Gregorian, valid for all i64 inputs).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> String {
+    let days = epoch_secs.div_euclid(86400);
+    let secs_of_day = epoch_secs.rem_euclid(86400);
+    let (year, month, day) = civil_from_days(days);
+    let (hour, min, sec) = (secs_of_day / 3600, (secs_of_day / 60) % 60, secs_of_day % 60);
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' { out.push(c); continue; }
+        match chars.next() {
+            Some('Y') => out.push_str(&year.to_string()),
+            Some('m') => out.push_str(&format!("{month:02}")),
+            Some('d') => out.push_str(&format!("{day:02}")),
+            Some('H') => out.push_str(&format!("{hour:02}")),
+            Some('M') => out.push_str(&format!("{min:02}")),
+            Some('S') => out.push_str(&format!("{sec:02}")),
+            Some('%') => out.push('%'),
+            Some(other) => { out.push('%'); out.push(other); }
+            None => out.push('%'),
+        }
+    }
+    out
+}
 
 use crate::value::Value;
 
@@ -1334,6 +1376,36 @@ impl Vm {
             })
         });
 
+        self.set_global_cfn("xpcall", |args| {
+            let fn_val = args.first().copied().unwrap_or(Value::nil());
+            let handler = args.get(1).copied().unwrap_or(Value::nil());
+            let call_args = if args.len() > 2 { args[2..].to_vec() } else { vec![] };
+            CURRENT_VM.with(|c| {
+                let vm_ptr = c.get();
+                if vm_ptr.is_null() {
+                    return Ok(vec![Value::bool(false), alloc_string_val("no VM context")]);
+                }
+                let vm = unsafe { &mut *vm_ptr };
+                match vm.call_value_isolated(fn_val, &call_args) {
+                    Ok(results) => {
+                        let mut ret = vec![Value::bool(true)];
+                        ret.extend(results);
+                        Ok(ret)
+                    }
+                    Err(e) => {
+                        let msg = vm.intern_pub(&e.to_string());
+                        // The handler runs even if it panics/errors itself: its own
+                        // failure shouldn't be worse than the error it's handling.
+                        let handled = vm.call_value_isolated(handler, &[msg])
+                            .unwrap_or_else(|_| vec![msg]);
+                        let mut ret = vec![Value::bool(false)];
+                        ret.extend(handled);
+                        Ok(ret)
+                    }
+                }
+            })
+        });
+
         // Deliberately real filesystem access — in tension with the sandboxing
         // hardening done elsewhere in this VM (allocation caps, step budget),
         // but consistent with the same call to add io/os. A host embedding
@@ -1794,23 +1866,149 @@ impl Vm {
         });
         let v_str_find = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.find")?;
-            if args.len() < 2 || !args[1].is_string() {
-                return Err(VmError::RuntimeError("string.find: string expected for pattern".into()));
-            }
-            let pat = unsafe { string_ref(args[1]) };
-            let init = if args.len() > 2 { int_from_val(args[2]) } else { 1 };
+            let pat = str_arg(args, 1, "string.find")?;
+            let init = args.get(2).map(|&v| int_from_val(v)).unwrap_or(1);
+            let plain = args.get(3).map(|&v| v.is_truthy()).unwrap_or(false);
             let start = lua_str_start(s.len(), init);
-            match s[start..].find(pat) {
-                None => Ok(vec![Value::nil()]),
-                Some(pos) => Ok(vec![
-                    Value::int((start + pos + 1) as i64),
-                    Value::int((start + pos + pat.len()) as i64),
-                ]),
+            if plain {
+                if start > s.len() { return Ok(vec![Value::nil()]); }
+                return match s[start..].find(pat) {
+                    None => Ok(vec![Value::nil()]),
+                    Some(pos) => Ok(vec![
+                        Value::int((start + pos + 1) as i64),
+                        Value::int((start + pos + pat.len()) as i64),
+                    ]),
+                };
             }
+            match pattern::find_from(s.as_bytes(), pat.as_bytes(), start) {
+                Ok(Some(m)) => {
+                    let mut ret = vec![Value::int(m.start as i64 + 1), Value::int(m.end as i64)];
+                    ret.extend(pattern_captures(s.as_bytes(), &m));
+                    Ok(ret)
+                }
+                Ok(None) => Ok(vec![Value::nil()]),
+                Err(e) => Err(VmError::RuntimeError(format!("string.find: {e}"))),
+            }
+        });
+        let v_str_match = self.make_cfn_val(|args| {
+            let s = str_arg(args, 0, "string.match")?;
+            let pat = str_arg(args, 1, "string.match")?;
+            let init = args.get(2).map(|&v| int_from_val(v)).unwrap_or(1);
+            let start = lua_str_start(s.len(), init);
+            match pattern::find_from(s.as_bytes(), pat.as_bytes(), start) {
+                Ok(Some(m)) => {
+                    if m.captures.is_empty() {
+                        Ok(vec![alloc_string_val(&String::from_utf8_lossy(&s.as_bytes()[m.start..m.end]))])
+                    } else {
+                        Ok(pattern_captures(s.as_bytes(), &m))
+                    }
+                }
+                Ok(None) => Ok(vec![Value::nil()]),
+                Err(e) => Err(VmError::RuntimeError(format!("string.match: {e}"))),
+            }
+        });
+        let v_str_gmatch = self.make_cfn_val(|args| {
+            let s = str_arg(args, 0, "string.gmatch")?.to_owned();
+            let pat = str_arg(args, 1, "string.gmatch")?.to_owned();
+            let pos = Cell::new(0usize);
+            let iter_val = CURRENT_VM.with(|c| {
+                let vm_ptr = c.get();
+                if vm_ptr.is_null() { return Value::nil(); }
+                unsafe { &mut *vm_ptr }.make_cfn_val(move |_args| {
+                    let sb = s.as_bytes();
+                    if pos.get() > sb.len() { return Ok(vec![Value::nil()]); }
+                    match pattern::find_from(sb, pat.as_bytes(), pos.get()) {
+                        Ok(Some(m)) => {
+                            // Empty match: step by one byte past it so the next
+                            // call makes forward progress instead of looping forever.
+                            pos.set(if m.end > m.start { m.end } else { m.end + 1 });
+                            if m.captures.is_empty() {
+                                Ok(vec![alloc_string_val(&String::from_utf8_lossy(&sb[m.start..m.end]))])
+                            } else {
+                                Ok(pattern_captures(sb, &m))
+                            }
+                        }
+                        Ok(None) => { pos.set(sb.len() + 1); Ok(vec![Value::nil()]) }
+                        Err(e) => Err(VmError::RuntimeError(format!("string.gmatch: {e}"))),
+                    }
+                })
+            });
+            Ok(vec![iter_val])
+        });
+        let v_str_gsub = self.make_cfn_val(|args| {
+            let s = str_arg(args, 0, "string.gsub")?;
+            let pat = str_arg(args, 1, "string.gsub")?;
+            let repl = args.get(2).copied().unwrap_or(Value::nil());
+            let max_n = args.get(3).map(|&v| int_from_val(v)).unwrap_or(i64::MAX);
+            let sb = s.as_bytes();
+            let mut out: Vec<u8> = Vec::new();
+            let mut pos = 0usize;
+            let mut count: i64 = 0;
+            while count < max_n && pos <= sb.len() {
+                let m = match pattern::find_from(sb, pat.as_bytes(), pos) {
+                    Ok(Some(m)) => m,
+                    Ok(None) => break,
+                    Err(e) => return Err(VmError::RuntimeError(format!("string.gsub: {e}"))),
+                };
+                out.extend_from_slice(&sb[pos..m.start]);
+                let whole = &sb[m.start..m.end];
+                match apply_gsub_repl(repl, sb, &m, whole)? {
+                    Some(bytes) => out.extend_from_slice(&bytes),
+                    None => out.extend_from_slice(whole),
+                }
+                count += 1;
+                pos = if m.end > m.start {
+                    m.end
+                } else {
+                    if m.end < sb.len() { out.push(sb[m.end]); }
+                    m.end + 1
+                };
+            }
+            if pos <= sb.len() { out.extend_from_slice(&sb[pos..]); }
+            Ok(vec![alloc_string_val(&String::from_utf8_lossy(&out)), Value::int(count)])
         });
         let v_str_format = self.make_cfn_val(|args| {
             let fmt = str_arg(args, 0, "string.format")?;
             string_format(fmt, if args.len() > 1 { &args[1..] } else { &[] })
+        });
+        // Umbra strings must be valid UTF-8 (string_ref uses from_utf8_unchecked),
+        // but packed binary data generally isn't, so the packed blob is hex-encoded
+        // rather than stored as raw bytes — a deliberate deviation from real Lua's
+        // string.pack, which returns the raw bytes directly. c/s string *fields*
+        // within the format are unaffected (they only ever hold real, already-valid
+        // Umbra string content) and round-trip as plain strings.
+        let v_str_pack = self.make_cfn_val(|args| {
+            let fmt = str_arg(args, 0, "string.pack")?;
+            let mut pvals = Vec::new();
+            for &v in args.get(1..).unwrap_or(&[]) {
+                let pv = if v.is_string() {
+                    pack::PackValue::Str(unsafe { string_ref(v) }.as_bytes().to_vec())
+                } else if v.is_int_like() {
+                    pack::PackValue::Int(v.as_int().unwrap())
+                } else if v.is_float() {
+                    pack::PackValue::Float(v.as_float().unwrap())
+                } else {
+                    return Err(VmError::RuntimeError("string.pack: unsupported argument type".into()));
+                };
+                pvals.push(pv);
+            }
+            let bytes = pack::pack(fmt, &pvals).map_err(VmError::RuntimeError)?;
+            Ok(vec![alloc_string_val(&bytes_to_hex(&bytes))])
+        });
+        let v_str_unpack = self.make_cfn_val(|args| {
+            let fmt = str_arg(args, 0, "string.unpack")?;
+            let hex = str_arg(args, 1, "string.unpack")?;
+            let bytes = hex_to_bytes(hex)
+                .ok_or_else(|| VmError::RuntimeError("string.unpack: invalid packed data".into()))?;
+            let start = args.get(2).map(|&v| int_from_val(v)).unwrap_or(1).max(1) as usize - 1;
+            let (vals, end_pos) = pack::unpack(fmt, &bytes, start).map_err(VmError::RuntimeError)?;
+            let mut out: Vec<Value> = vals.into_iter().map(|pv| match pv {
+                pack::PackValue::Int(n) => make_int_via_current_vm(n),
+                pack::PackValue::Float(f) => Value::float(f),
+                pack::PackValue::Str(s) => alloc_string_val(&String::from_utf8_lossy(&s)),
+            }).collect();
+            out.push(make_int_via_current_vm((end_pos + 1) as i64));
+            Ok(out)
         });
 
         {
@@ -1824,7 +2022,12 @@ impl Vm {
             let k = self.intern("byte");    st.raw_set(k, v_str_byte);
             let k = self.intern("char");    st.raw_set(k, v_str_char);
             let k = self.intern("find");    st.raw_set(k, v_str_find);
+            let k = self.intern("match");   st.raw_set(k, v_str_match);
+            let k = self.intern("gmatch");  st.raw_set(k, v_str_gmatch);
+            let k = self.intern("gsub");    st.raw_set(k, v_str_gsub);
             let k = self.intern("format");  st.raw_set(k, v_str_format);
+            let k = self.intern("pack");    st.raw_set(k, v_str_pack);
+            let k = self.intern("unpack");  st.raw_set(k, v_str_unpack);
         }
         let str_table_val = Value::table(str_table_ptr);
         self.string_lib = str_table_val;
@@ -2077,6 +2280,20 @@ impl Vm {
             unsafe { table_ref(t) }.array = arr;
             Ok(vec![])
         });
+        let v_tbl_pack = self.make_cfn_val(|args| {
+            let ptr = alloc_table_raw();
+            CURRENT_VM.with(|c| {
+                let vm_ptr = c.get();
+                if !vm_ptr.is_null() { unsafe { &mut *vm_ptr }.gc.register_table(ptr); }
+            });
+            let tbl = unsafe { &mut *(ptr as *mut Table) };
+            for (i, &v) in args.iter().enumerate() {
+                tbl.raw_set(make_int_via_current_vm(i as i64 + 1), v);
+            }
+            let n_val = make_int_via_current_vm(args.len() as i64);
+            tbl.raw_set(alloc_string_val("n"), n_val);
+            Ok(vec![Value::table(ptr)])
+        });
         let v_tbl_unpack = self.make_cfn_val(|args| {
             let t = args.first().copied().unwrap_or(Value::nil());
             if !t.is_table() { return Ok(vec![]); }
@@ -2118,11 +2335,332 @@ impl Vm {
             let k = self.intern("remove"); tt.raw_set(k, v_tbl_remove);
             let k = self.intern("concat"); tt.raw_set(k, v_tbl_concat);
             let k = self.intern("sort");   tt.raw_set(k, v_tbl_sort);
+            let k = self.intern("pack");   tt.raw_set(k, v_tbl_pack);
             let k = self.intern("unpack"); tt.raw_set(k, v_tbl_unpack);
             let k = self.intern("move");   tt.raw_set(k, v_tbl_move);
         }
         let k_table = self.intern("table");
         self.globals.raw_set(k_table, Value::table(tbl_table_ptr));
+
+        let io_table_ptr = alloc_table_raw();
+        self.gc.register_table(io_table_ptr);
+
+        let v_io_write = self.make_cfn_val(|args| {
+            let mut out = String::new();
+            for &v in args {
+                if v.is_string() { out.push_str(unsafe { string_ref(v) }); }
+                else if v.is_number() { out.push_str(&format!("{v}")); }
+                else { return Err(VmError::RuntimeError("io.write: string or number expected".into())); }
+            }
+            PRINT_HOOK.with(|h| {
+                match h.borrow().as_ref() {
+                    Some(f) => (f)(out),
+                    None => {
+                        use std::io::Write;
+                        print!("{out}");
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+            });
+            Ok(vec![])
+        });
+        let v_io_read = self.make_cfn_val(|args| {
+            let fmt = args.first().filter(|v| v.is_string())
+                .map(|&v| unsafe { string_ref(v) }.trim_start_matches('*').to_owned())
+                .unwrap_or_else(|| "l".to_owned());
+            use std::io::Read as _;
+            match fmt.as_str() {
+                "a" => {
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)
+                        .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+                    Ok(vec![alloc_string_val(&buf)])
+                }
+                "n" => {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)
+                        .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+                    let trimmed = line.trim();
+                    if let Ok(i) = trimmed.parse::<i64>() { Ok(vec![make_int_via_current_vm(i)]) }
+                    else if let Ok(f) = trimmed.parse::<f64>() { Ok(vec![Value::float(f)]) }
+                    else { Ok(vec![Value::nil()]) }
+                }
+                _ => {
+                    let mut line = String::new();
+                    let n = std::io::stdin().read_line(&mut line)
+                        .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+                    if n == 0 { return Ok(vec![Value::nil()]); }
+                    while line.ends_with('\n') || line.ends_with('\r') { line.pop(); }
+                    Ok(vec![alloc_string_val(&line)])
+                }
+            }
+        });
+        let v_io_open = self.make_cfn_val(|args| {
+            let path = str_arg(args, 0, "io.open")?.to_owned();
+            let mode = args.get(1).filter(|v| v.is_string())
+                .map(|&v| unsafe { string_ref(v) }.to_owned())
+                .unwrap_or_else(|| "r".to_owned());
+            let mode = mode.trim_end_matches('b');
+            let mut opts = std::fs::OpenOptions::new();
+            match mode {
+                "r"  => { opts.read(true); }
+                "w"  => { opts.write(true).create(true).truncate(true); }
+                "a"  => { opts.append(true).create(true); }
+                "r+" => { opts.read(true).write(true); }
+                "w+" => { opts.read(true).write(true).create(true).truncate(true); }
+                "a+" => { opts.read(true).append(true).create(true); }
+                _ => return Err(VmError::RuntimeError(format!("io.open: invalid mode '{mode}'"))),
+            }
+            let file = match opts.open(&path) {
+                Ok(f) => f,
+                Err(e) => return Ok(vec![Value::nil(), alloc_string_val(&format!("{path}: {e}"))]),
+            };
+            let file = std::rc::Rc::new(std::cell::RefCell::new(Some(file)));
+
+            let handle_val = CURRENT_VM.with(|c| -> Value {
+                let vm_ptr = c.get();
+                if vm_ptr.is_null() { return Value::nil(); }
+                let vm = unsafe { &mut *vm_ptr };
+
+                let f = file.clone();
+                let v_read = vm.make_cfn_val(move |args| {
+                    let mut guard = f.borrow_mut();
+                    let file = guard.as_mut()
+                        .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
+                    let fmt = args.get(1).filter(|v| v.is_string())
+                        .map(|&v| unsafe { string_ref(v) }.trim_start_matches('*').to_owned())
+                        .unwrap_or_else(|| "l".to_owned());
+                    match fmt.as_str() {
+                        "a" => {
+                            use std::io::Read;
+                            let mut buf = String::new();
+                            file.read_to_string(&mut buf)
+                                .map_err(|e| VmError::RuntimeError(format!("file:read: {e}")))?;
+                            Ok(vec![alloc_string_val(&buf)])
+                        }
+                        "n" => match read_line_from_file(file)? {
+                            None => Ok(vec![Value::nil()]),
+                            Some(l) => {
+                                let t = l.trim();
+                                if let Ok(i) = t.parse::<i64>() { Ok(vec![make_int_via_current_vm(i)]) }
+                                else if let Ok(fl) = t.parse::<f64>() { Ok(vec![Value::float(fl)]) }
+                                else { Ok(vec![Value::nil()]) }
+                            }
+                        },
+                        _ => match read_line_from_file(file)? {
+                            None => Ok(vec![Value::nil()]),
+                            Some(mut l) => {
+                                while l.ends_with('\n') || l.ends_with('\r') { l.pop(); }
+                                Ok(vec![alloc_string_val(&l)])
+                            }
+                        },
+                    }
+                });
+
+                let f = file.clone();
+                let v_write = vm.make_cfn_val(move |args| {
+                    let mut guard = f.borrow_mut();
+                    let file = guard.as_mut()
+                        .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
+                    use std::io::Write;
+                    let mut out = String::new();
+                    for &v in args.get(1..).unwrap_or(&[]) {
+                        if v.is_string() { out.push_str(unsafe { string_ref(v) }); }
+                        else if v.is_number() { out.push_str(&format!("{v}")); }
+                        else { return Err(VmError::RuntimeError("file:write: string or number expected".into())); }
+                    }
+                    file.write_all(out.as_bytes())
+                        .map_err(|e| VmError::RuntimeError(format!("file:write: {e}")))?;
+                    Ok(vec![])
+                });
+
+                let f = file.clone();
+                let v_close = vm.make_cfn_val(move |_args| {
+                    f.borrow_mut().take();
+                    Ok(vec![Value::bool(true)])
+                });
+
+                let f = file.clone();
+                let v_lines = vm.make_cfn_val(move |_args| {
+                    let f = f.clone();
+                    let iter_val = CURRENT_VM.with(|c| {
+                        let vm_ptr = c.get();
+                        if vm_ptr.is_null() { return Value::nil(); }
+                        unsafe { &mut *vm_ptr }.make_cfn_val(move |_args| {
+                            let mut guard = f.borrow_mut();
+                            let file = guard.as_mut()
+                                .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
+                            match read_line_from_file(file)? {
+                                None => Ok(vec![Value::nil()]),
+                                Some(mut l) => {
+                                    while l.ends_with('\n') || l.ends_with('\r') { l.pop(); }
+                                    Ok(vec![alloc_string_val(&l)])
+                                }
+                            }
+                        })
+                    });
+                    Ok(vec![iter_val])
+                });
+
+                let ft_ptr = alloc_table_raw();
+                vm.gc.register_table(ft_ptr);
+                let ft = unsafe { &mut *(ft_ptr as *mut Table) };
+                let k = vm.intern("read");  ft.raw_set(k, v_read);
+                let k = vm.intern("write"); ft.raw_set(k, v_write);
+                let k = vm.intern("close"); ft.raw_set(k, v_close);
+                let k = vm.intern("lines"); ft.raw_set(k, v_lines);
+                Value::table(ft_ptr)
+            });
+            Ok(vec![handle_val])
+        });
+        {
+            let iot = unsafe { &mut *(io_table_ptr as *mut Table) };
+            let k = self.intern("write"); iot.raw_set(k, v_io_write);
+            let k = self.intern("read");  iot.raw_set(k, v_io_read);
+            let k = self.intern("open");  iot.raw_set(k, v_io_open);
+        }
+        let k_io = self.intern("io");
+        self.globals.raw_set(k_io, Value::table(io_table_ptr));
+
+        let os_table_ptr = alloc_table_raw();
+        self.gc.register_table(os_table_ptr);
+
+        let v_os_time = self.make_cfn_val(|_args| {
+            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64).unwrap_or(0);
+            Ok(vec![make_int_via_current_vm(secs)])
+        });
+        let v_os_clock = self.make_cfn_val(|_args| {
+            let start = PROCESS_START.get_or_init(std::time::Instant::now);
+            Ok(vec![Value::float(start.elapsed().as_secs_f64())])
+        });
+        let v_os_getenv = self.make_cfn_val(|args| {
+            let name = str_arg(args, 0, "os.getenv")?;
+            match std::env::var(name) {
+                Ok(v) => Ok(vec![alloc_string_val(&v)]),
+                Err(_) => Ok(vec![Value::nil()]),
+            }
+        });
+        let v_os_date = self.make_cfn_val(|args| {
+            let fmt = args.first().filter(|v| v.is_string())
+                .map(|&v| unsafe { string_ref(v) }.to_owned())
+                .unwrap_or_else(|| "%Y-%m-%d %H:%M:%S".to_owned());
+            let secs = args.get(1).map(|&v| int_from_val(v)).unwrap_or_else(|| {
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64).unwrap_or(0)
+            });
+            Ok(vec![alloc_string_val(&format_civil_time(secs, &fmt))])
+        });
+        {
+            let ot = unsafe { &mut *(os_table_ptr as *mut Table) };
+            let k = self.intern("time");   ot.raw_set(k, v_os_time);
+            let k = self.intern("clock");  ot.raw_set(k, v_os_clock);
+            let k = self.intern("getenv"); ot.raw_set(k, v_os_getenv);
+            let k = self.intern("date");   ot.raw_set(k, v_os_date);
+        }
+        let k_os = self.intern("os");
+        self.globals.raw_set(k_os, Value::table(os_table_ptr));
+
+        let utf8_table_ptr = alloc_table_raw();
+        self.gc.register_table(utf8_table_ptr);
+
+        let v_utf8_char = self.make_cfn_val(|args| {
+            let mut s = String::new();
+            for &v in args {
+                let n = int_from_val(v);
+                let cp = u32::try_from(n).ok().and_then(char::from_u32)
+                    .ok_or_else(|| VmError::RuntimeError("utf8.char: value out of range".into()))?;
+                s.push(cp);
+            }
+            Ok(vec![alloc_string_val(&s)])
+        });
+        let v_utf8_len = self.make_cfn_val(|args| {
+            let s = str_arg(args, 0, "utf8.len")?;
+            let i = args.get(1).map(|&v| int_from_val(v)).unwrap_or(1);
+            let j = args.get(2).map(|&v| int_from_val(v)).unwrap_or(-1);
+            let start = lua_str_start(s.len(), i);
+            let end = lua_str_end(s.len(), j);
+            if start > end || !s.is_char_boundary(start) || !s.is_char_boundary(end) {
+                return Ok(vec![Value::nil(), Value::int(start as i64 + 1)]);
+            }
+            Ok(vec![make_int_via_current_vm(s[start..end].chars().count() as i64)])
+        });
+        let v_utf8_codepoint = self.make_cfn_val(|args| {
+            let s = str_arg(args, 0, "utf8.codepoint")?;
+            let i = args.get(1).map(|&v| int_from_val(v)).unwrap_or(1);
+            let j = args.get(2).map(|&v| int_from_val(v)).unwrap_or(i);
+            let start = lua_str_start(s.len(), i);
+            // i/j are start-of-character byte positions, not a byte range end —
+            // a multi-byte char's last byte can't be an exact "j" on its own.
+            let last_start = lua_str_start(s.len(), j);
+            if start > s.len() || !s.is_char_boundary(start) {
+                return Err(VmError::RuntimeError("utf8.codepoint: invalid byte position".into()));
+            }
+            let mut result = Vec::new();
+            for (off, ch) in s[start..].char_indices() {
+                if start + off > last_start { break; }
+                result.push(make_int_via_current_vm(ch as i64));
+            }
+            Ok(result)
+        });
+        let v_utf8_codes = self.make_cfn_val(|args| {
+            let s = str_arg(args, 0, "utf8.codes")?.to_owned();
+            let iter_val = CURRENT_VM.with(|c| {
+                let vm_ptr = c.get();
+                if vm_ptr.is_null() { return Value::nil(); }
+                unsafe { &mut *vm_ptr }.make_cfn_val(move |cargs| {
+                    let prev = cargs.get(1).map(|&v| int_from_val(v)).unwrap_or(0);
+                    let next_byte = if prev == 0 { 0usize } else {
+                        let p = (prev - 1) as usize;
+                        p + s[p..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+                    };
+                    match s[next_byte..].chars().next() {
+                        Some(ch) => Ok(vec![
+                            make_int_via_current_vm(next_byte as i64 + 1),
+                            make_int_via_current_vm(ch as i64),
+                        ]),
+                        None => Ok(vec![Value::nil()]),
+                    }
+                })
+            });
+            Ok(vec![iter_val, args.first().copied().unwrap_or(Value::nil()), Value::int(0)])
+        });
+        {
+            let ut = unsafe { &mut *(utf8_table_ptr as *mut Table) };
+            let k = self.intern("char");      ut.raw_set(k, v_utf8_char);
+            let k = self.intern("len");       ut.raw_set(k, v_utf8_len);
+            let k = self.intern("codepoint"); ut.raw_set(k, v_utf8_codepoint);
+            let k = self.intern("codes");     ut.raw_set(k, v_utf8_codes);
+        }
+        let k_utf8 = self.intern("utf8");
+        self.globals.raw_set(k_utf8, Value::table(utf8_table_ptr));
+
+        let debug_table_ptr = alloc_table_raw();
+        self.gc.register_table(debug_table_ptr);
+        let v_debug_traceback = self.make_cfn_val(|args| {
+            let msg = args.first().filter(|v| v.is_string())
+                .map(|&v| unsafe { string_ref(v) }.to_owned());
+            let full = CURRENT_VM.with(|c| {
+                let vm_ptr = c.get();
+                let tb = if vm_ptr.is_null() {
+                    String::new()
+                } else {
+                    let vm = unsafe { &mut *vm_ptr };
+                    vm.last_traceback.clone().unwrap_or_else(|| build_traceback(&vm.frames))
+                };
+                match &msg {
+                    Some(m) => format!("{m}\nstack traceback:\n{tb}"),
+                    None => format!("stack traceback:\n{tb}"),
+                }
+            });
+            Ok(vec![alloc_string_val(&full)])
+        });
+        {
+            let dt = unsafe { &mut *(debug_table_ptr as *mut Table) };
+            let k = self.intern("traceback"); dt.raw_set(k, v_debug_traceback);
+        }
+        let k_debug = self.intern("debug");
+        self.globals.raw_set(k_debug, Value::table(debug_table_ptr));
     }
 
     pub fn set_global_cfn(&mut self, name: &str, f: impl Fn(&[Value]) -> VmResult<Vec<Value>> + 'static) {
@@ -2226,6 +2764,90 @@ pub fn get_cfn_pub(v: Value) -> Option<&'static dyn Fn(&[Value]) -> VmResult<Vec
 }
 
 
+fn pattern_captures(subj: &[u8], m: &pattern::Match) -> Vec<Value> {
+    m.captures.iter().map(|c| match c {
+        pattern::Capture::Position(p) => make_int_via_current_vm(*p as i64),
+        pattern::Capture::Str(a, b) => alloc_string_val(&String::from_utf8_lossy(&subj[*a..*b])),
+    }).collect()
+}
+
+fn apply_gsub_repl(repl: Value, subj: &[u8], m: &pattern::Match, whole: &[u8]) -> VmResult<Option<Vec<u8>>> {
+    let cap_bytes = |i: usize| -> Vec<u8> {
+        if m.captures.is_empty() { return whole.to_vec(); }
+        match &m.captures[i] {
+            pattern::Capture::Str(a, b) => subj[*a..*b].to_vec(),
+            pattern::Capture::Position(p) => p.to_string().into_bytes(),
+        }
+    };
+    if repl.is_string() {
+        let rb = unsafe { string_ref(repl) }.as_bytes().to_vec();
+        let mut result = Vec::new();
+        let mut i = 0;
+        while i < rb.len() {
+            if rb[i] == b'%' && i + 1 < rb.len() {
+                let c = rb[i + 1];
+                if c == b'%' { result.push(b'%'); }
+                else if c == b'0' { result.extend_from_slice(whole); }
+                else if c.is_ascii_digit() {
+                    let idx = (c - b'1') as usize;
+                    if m.captures.is_empty() {
+                        if idx != 0 {
+                            return Err(VmError::RuntimeError("invalid capture index in replacement string".into()));
+                        }
+                        result.extend_from_slice(whole);
+                    } else {
+                        if idx >= m.captures.len() {
+                            return Err(VmError::RuntimeError("invalid capture index in replacement string".into()));
+                        }
+                        result.extend_from_slice(&cap_bytes(idx));
+                    }
+                } else {
+                    return Err(VmError::RuntimeError("invalid use of '%' in replacement string".into()));
+                }
+                i += 2;
+            } else {
+                result.push(rb[i]);
+                i += 1;
+            }
+        }
+        return Ok(Some(result));
+    }
+    if repl.is_table() {
+        let key = if m.captures.is_empty() {
+            alloc_string_val(&String::from_utf8_lossy(whole))
+        } else {
+            match &m.captures[0] {
+                pattern::Capture::Str(a, b) => alloc_string_val(&String::from_utf8_lossy(&subj[*a..*b])),
+                pattern::Capture::Position(p) => make_int_via_current_vm(*p as i64),
+            }
+        };
+        let v = unsafe { table_ref(repl) }.raw_get(key);
+        return gsub_result_value(v);
+    }
+    if get_cfn(repl).is_some() || get_proto_callable(repl).is_some() {
+        let call_args: Vec<Value> = if m.captures.is_empty() {
+            vec![alloc_string_val(&String::from_utf8_lossy(whole))]
+        } else {
+            pattern_captures(subj, m)
+        };
+        let result = CURRENT_VM.with(|c| {
+            let vm_ptr = c.get();
+            if vm_ptr.is_null() { return Err(VmError::RuntimeError("no VM context".into())); }
+            unsafe { &mut *vm_ptr }.call_value_isolated(repl, &call_args)
+        })?;
+        let v = result.into_iter().next().unwrap_or(Value::nil());
+        return gsub_result_value(v);
+    }
+    Err(VmError::RuntimeError("bad argument to 'gsub' (string/function/table expected)".into()))
+}
+
+fn gsub_result_value(v: Value) -> VmResult<Option<Vec<u8>>> {
+    if !v.is_truthy() { return Ok(None); }
+    if v.is_string() { return Ok(Some(unsafe { string_ref(v) }.as_bytes().to_vec())); }
+    if v.is_number() { return Ok(Some(format!("{v}").into_bytes())); }
+    Err(VmError::RuntimeError("invalid replacement value (a table/function must return a string/number/false/nil)".into()))
+}
+
 fn coerce_to_concat_str(v: Value) -> String {
     if v.is_string() { unsafe { string_ref(v) }.to_owned() }
     else if v.is_int_like() { v.as_int().unwrap().to_string() }
@@ -2326,6 +2948,45 @@ fn capture_yield_site(co: &mut Coroutine) {
             co.yield_nresults = if call_c == 0 { 255 } else { (call_c - 1) as u8 };
         }
     }
+}
+
+// No BufReader: the same File is shared (via Rc<RefCell<>>) between a file
+// handle's read/write closures, and buffering reads would desync an
+// interleaved read/write sequence on "r+"/"w+"/"a+" handles.
+fn read_line_from_file(file: &mut std::fs::File) -> VmResult<Option<String>> {
+    use std::io::Read;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match file.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                bytes.push(byte[0]);
+                if byte[0] == b'\n' { break; }
+            }
+            Err(e) => return Err(VmError::RuntimeError(format!("file:read: {e}"))),
+        }
+    }
+    if bytes.is_empty() { return Ok(None); }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes { s.push_str(&format!("{b:02x}")); }
+    s
+}
+
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) { return None; }
+    let sb = s.as_bytes();
+    let mut out = Vec::with_capacity(sb.len() / 2);
+    for chunk in sb.chunks(2) {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }
 
 fn str_arg<'a>(args: &'a [Value], idx: usize, fn_name: &'static str) -> VmResult<&'a str> {
