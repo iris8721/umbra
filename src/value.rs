@@ -9,6 +9,9 @@
 /// Floats that are not NaN pass through bit-for-bit unchanged.
 /// All heap pointers from Rust's allocator live in user-space
 /// (bit 47 = 0), so they fit cleanly in 48 bits with no masking loss.
+/// Integers outside INLINE_INT_MIN..=INLINE_INT_MAX don't fit the 48-bit
+/// payload; those are heap-boxed as a plain i64 under TAG_BIGINT instead
+/// (see Vm::make_int), so the full i64 range round-trips correctly.
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -25,6 +28,12 @@ const TAG_STRING:    u64 = 3;
 const TAG_USERDATA:  u64 = 4;
 const TAG_COROUTINE: u64 = 5;
 const TAG_CLOSURE:   u64 = 6;
+const TAG_BIGINT:    u64 = 7;
+
+// The 48-bit payload can't hold every i64: values outside this range are
+// heap-boxed as a plain `Box<i64>` (see Value::bigint) instead of truncated.
+pub const INLINE_INT_MIN: i64 = -(1i64 << 47);
+pub const INLINE_INT_MAX: i64 = (1i64 << 47) - 1;
 
 const MISC_NIL:   u64 = 0;
 const MISC_FALSE: u64 = 1;
@@ -44,10 +53,17 @@ impl Value {
         Self::tagged(TAG_MISC, if b { MISC_TRUE } else { MISC_FALSE })
     }
 
-    /// Stores only the low 48 bits; `as_int` sign-extends on the way back out.
+    /// Fast inline path — only valid for INLINE_INT_MIN..=INLINE_INT_MAX;
+    /// callers with an arbitrary i64 must use a GC-aware bigint-boxing
+    /// constructor instead (see Vm::make_int) or values silently truncate.
     #[inline(always)]
     pub fn int(n: i64) -> Self {
         Self::tagged(TAG_INT, n as u64)
+    }
+
+    #[inline(always)]
+    pub fn bigint(ptr: *mut u8) -> Self {
+        Self::tagged(TAG_BIGINT, ptr as u64)
     }
 
     #[inline(always)]
@@ -99,9 +115,16 @@ impl Value {
     #[inline(always)]
     pub fn is_int(self)       -> bool { self.is_nan_boxed() && self.tag() == TAG_INT }
     #[inline(always)]
+    pub fn is_bigint(self)    -> bool { self.is_nan_boxed() && self.tag() == TAG_BIGINT }
+    /// True for either integer representation — almost always what callers
+    /// outside this module actually want ("is this logically an integer"),
+    /// as opposed to is_int() which only means "uses the fast inline form".
+    #[inline(always)]
+    pub fn is_int_like(self)  -> bool { self.is_int() || self.is_bigint() }
+    #[inline(always)]
     pub fn is_float(self)     -> bool { !self.is_nan_boxed() }
     #[inline(always)]
-    pub fn is_number(self)    -> bool { self.is_int() || self.is_float() }
+    pub fn is_number(self)    -> bool { self.is_int_like() || self.is_float() }
     #[inline(always)]
     pub fn is_table(self)     -> bool { self.is_nan_boxed() && self.tag() == TAG_TABLE }
     #[inline(always)]
@@ -129,9 +152,15 @@ impl Value {
 
     #[inline(always)]
     pub fn as_int(self) -> Option<i64> {
-        if !self.is_int() { return None; }
-        let raw = (self.0 & PAYLOAD_MASK) as i64;
-        Some((raw << 16) >> 16)
+        if self.is_int() {
+            let raw = (self.0 & PAYLOAD_MASK) as i64;
+            return Some((raw << 16) >> 16);
+        }
+        if self.is_bigint() {
+            let ptr = (self.0 & PAYLOAD_MASK) as *const i64;
+            return Some(unsafe { *ptr });
+        }
+        None
     }
 
     #[inline(always)]
@@ -144,6 +173,12 @@ impl Value {
     pub fn to_float(self) -> Option<f64> {
         if self.is_float() { return Some(f64::from_bits(self.0)); }
         self.as_int().map(|n| n as f64)
+    }
+
+    #[inline(always)]
+    pub fn as_bigint(self) -> Option<*mut u8> {
+        if !self.is_bigint() { return None; }
+        Some((self.0 & PAYLOAD_MASK) as *mut u8)
     }
 
     #[inline(always)]
@@ -185,7 +220,7 @@ impl Value {
     pub fn type_name(self) -> &'static str {
         if self.is_nil()       { "nil" }
         else if self.is_bool() { "boolean" }
-        else if self.is_int()  { "integer" }
+        else if self.is_int_like() { "integer" }
         else if self.is_float(){ "float" }
         else if self.is_string(){ "string" }
         else if self.is_table()  { "table" }
@@ -197,7 +232,8 @@ impl Value {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        match (self.is_int(), other.is_int(), self.is_float(), other.is_float()) {
+        match (self.is_int_like(), other.is_int_like(), self.is_float(), other.is_float()) {
+            (true, true, _, _) => self.as_int().unwrap() == other.as_int().unwrap(),
             (true, false, _, true) => {
                 let n = self.as_int().unwrap();
                 let f = other.as_float().unwrap();
@@ -219,7 +255,7 @@ impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_nil()        { write!(f, "nil") }
         else if self.is_bool()  { write!(f, "{}", (self.0 & PAYLOAD_MASK) == MISC_TRUE) }
-        else if self.is_int()   { write!(f, "{}i", self.as_int().unwrap()) }
+        else if self.is_int_like() { write!(f, "{}i", self.as_int().unwrap()) }
         else if self.is_float() { write!(f, "{}f", self.as_float().unwrap()) }
         else if self.is_string()    { write!(f, "string({:x})", self.0 & PAYLOAD_MASK) }
         else if self.is_table()     { write!(f, "table({:x})", self.0 & PAYLOAD_MASK) }
@@ -234,7 +270,7 @@ impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_nil()        { write!(f, "nil") }
         else if self.is_bool()  { write!(f, "{}", (self.0 & PAYLOAD_MASK) == MISC_TRUE) }
-        else if self.is_int()   { write!(f, "{}", self.as_int().unwrap()) }
+        else if self.is_int_like() { write!(f, "{}", self.as_int().unwrap()) }
         else if self.is_float() { write!(f, "{}", self.as_float().unwrap()) }
         else { write!(f, "{}", self.type_name()) }
     }

@@ -9,25 +9,67 @@ thread_local! {
     static RNG: Cell<u64> = const { Cell::new(6364136223846793005) };
 }
 
+
 use crate::value::Value;
 
-#[repr(C)]
+// Caps any single allocation a script can request (string.rep/format, table
+// range ops) — an allocator failure on an oversized request aborts the
+// process unconditionally and can't be caught, unlike a normal panic.
+pub(crate) const MAX_ALLOC_LEN: usize = 64 * 1024 * 1024;
+
+// bytes[..len] is valid UTF-8; bytes[len] == 0. The trailing NUL makes
+// as_c_ptr() safe to hand to a C host expecting a NUL-terminated string
+// (a plain Rust String's buffer has no such guarantee).
 pub struct RtString {
-    pub hash: u64,
     pub len: usize,
+    bytes: Box<[u8]>,
+}
+
+impl RtString {
+    pub fn as_c_ptr(&self) -> *const u8 { self.bytes.as_ptr() }
 }
 
 fn alloc_string_raw(s: &str) -> *mut u8 {
-    Box::into_raw(Box::new(s.to_owned())) as *mut u8
+    let mut bytes = Vec::with_capacity(s.len() + 1);
+    bytes.extend_from_slice(s.as_bytes());
+    bytes.push(0);
+    let rt = RtString { len: s.len(), bytes: bytes.into_boxed_slice() };
+    Box::into_raw(Box::new(rt)) as *mut u8
 }
 
+// GC-registered but not interned/deduplicated by content like Vm::intern —
+// computed/throwaway strings shouldn't pay a cache lookup+clone every call.
 fn alloc_string_val(s: &str) -> Value {
-    Value::string(alloc_string_raw(s))
+    CURRENT_VM.with(|c| {
+        let ptr = c.get();
+        if ptr.is_null() { return Value::string(alloc_string_raw(s)); }
+        let vm = unsafe { &mut *ptr };
+        let raw = alloc_string_raw(s);
+        vm.gc.register_string(raw);
+        Value::string(raw)
+    })
 }
 
-unsafe fn string_ref<'a>(v: Value) -> &'a str {
-    let ptr = v.as_string().unwrap() as *mut String;
-    unsafe { &*ptr }
+fn alloc_bigint_raw(n: i64) -> *mut u8 {
+    Box::into_raw(Box::new(n)) as *mut u8
+}
+
+// For plain cfn closures with no direct &mut Vm; falls back to the truncating
+// fast path only if there's truly no VM context, which shouldn't happen
+// while a script is running.
+fn make_int_via_current_vm(n: i64) -> Value {
+    CURRENT_VM.with(|c| {
+        let ptr = c.get();
+        if ptr.is_null() { Value::int(n) } else { unsafe { &mut *ptr }.make_int(n) }
+    })
+}
+
+pub(crate) unsafe fn string_ref<'a>(v: Value) -> &'a str {
+    let ptr = v.as_string().unwrap() as *mut RtString;
+    unsafe {
+        let rt = &*ptr;
+        std::str::from_utf8_unchecked(&rt.bytes[..rt.len])
+    }
 }
 
 pub struct Table {
@@ -47,7 +89,7 @@ pub enum TableKey {
 impl TableKey {
     fn from_value(v: Value) -> Option<Self> {
         if v.is_nil() { return None; }
-        if v.is_int() { return Some(TableKey::Int(v.as_int().unwrap())); }
+        if v.is_int_like() { return Some(TableKey::Int(v.as_int().unwrap())); }
         if v.is_float() {
             let f = v.as_float().unwrap();
             let i = f as i64;
@@ -158,6 +200,35 @@ pub struct Vm {
     pub coroutines: Vec<*mut Coroutine>,
     pub owned_protos: Vec<Box<crate::chunk::Proto>>,
     pub string_lib: Value,
+    // Set after a caught panic; further execution is refused rather than risk
+    // UB from continuing on possibly-inconsistent GC/register/frame state.
+    pub poisoned: bool,
+    // Captured when an error is first enriched (frames still intact), so
+    // debug.traceback can report it later even after the stack has unwound.
+    pub last_traceback: Option<String>,
+    // Host-set instruction budget for bounding a runaway script; 0 = unlimited.
+    // Not script-settable — only the embedder (via the C API) controls this.
+    pub step_limit: u64,
+    pub step_count: u64,
+    pub loaded_modules: HashMap<String, Value>,
+}
+
+// Function names aren't tracked in Proto, so entries are line-only (innermost
+// first) rather than real Lua's "in function 'foo'" — still shows the call
+// chain, just not by name.
+fn build_traceback(frames: &[Frame]) -> String {
+    frames.iter().enumerate().rev().map(|(i, f)| {
+        let proto = unsafe { &*f.proto };
+        let line = proto.lines.get(f.pc.saturating_sub(1)).copied().unwrap_or(0);
+        let where_ = if i == 0 { "in main chunk" } else { "in function" };
+        format!("\tline {line}: {where_}")
+    }).collect::<Vec<_>>().join("\n")
+}
+
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() { return (*s).to_owned(); }
+    if let Some(s) = payload.downcast_ref::<String>() { return s.clone(); }
+    "unknown panic".to_owned()
 }
 
 impl Drop for Vm {
@@ -204,6 +275,11 @@ impl Vm {
             coroutines: Vec::new(),
             owned_protos: Vec::new(),
             string_lib: Value::nil(),
+            poisoned: false,
+            last_traceback: None,
+            step_limit: 0,
+            step_count: 0,
+            loaded_modules: HashMap::new(),
         };
         vm.register_stdlib();
         vm
@@ -220,16 +296,37 @@ impl Vm {
         v
     }
 
-    pub fn gc_collect(&mut self) {
-        // Root scan is bounded to registers within active frames — stale slots
-        // above the live stack top would otherwise keep dead values reachable.
+    /// The only correct way to box an arbitrary i64: Value::int() alone
+    /// truncates anything outside INLINE_INT_MIN..=INLINE_INT_MAX.
+    pub fn make_int(&mut self, n: i64) -> Value {
+        if (crate::value::INLINE_INT_MIN..=crate::value::INLINE_INT_MAX).contains(&n) {
+            return Value::int(n);
+        }
+        let ptr = alloc_bigint_raw(n);
+        self.gc.register_bigint(ptr);
+        Value::bigint(ptr)
+    }
+
+    // resume() swaps a coroutine's regs into self.regs for its run, so the live
+    // state at any moment is split between self.regs and every other coroutine's
+    // parked regs — missing the latter frees values a suspended coroutine still holds.
+    fn gc_roots(&self) -> Vec<Value> {
         let reg_top = self.frames.iter().map(|f| {
             f.base + unsafe { &*f.proto }.max_regs as usize
         }).max().unwrap_or(0).min(self.regs.len());
-        let active_regs: Vec<Value> = self.regs[..reg_top].to_vec();
-        let glob_vals: Vec<Value> = self.globals.hash.values().copied().collect();
-        let roots = active_regs.into_iter().chain(glob_vals.into_iter());
-        self.gc.collect(roots, &mut self.string_cache);
+        let mut roots: Vec<Value> = self.regs[..reg_top].to_vec();
+        roots.extend(self.globals.hash.values().copied());
+        for &ptr in &self.coroutines {
+            let co = unsafe { &*ptr };
+            roots.extend(co.regs.iter().copied());
+            roots.push(co.fn_val);
+        }
+        roots
+    }
+
+    pub fn gc_collect(&mut self) {
+        let roots = self.gc_roots();
+        self.gc.collect(roots.into_iter(), &mut self.string_cache);
 
         let finalizers = std::mem::take(&mut self.gc.pending_finalizers);
         if !finalizers.is_empty() {
@@ -242,10 +339,8 @@ impl Vm {
                 }
                 let _ = self.call_value_isolated(gc_fn, &[tbl_val]);
             }
-            let regs2 = self.regs.clone();
-            let glob2: Vec<Value> = self.globals.hash.values().copied().collect();
-            let roots2 = regs2.into_iter().chain(glob2.into_iter());
-            self.gc.collect(roots2, &mut self.string_cache);
+            let roots2 = self.gc_roots();
+            self.gc.collect(roots2.into_iter(), &mut self.string_cache);
         }
     }
 
@@ -254,8 +349,17 @@ impl Vm {
     // registers; the scratch base must be computed before frames are saved,
     // since saving swaps `self.frames` out to empty.
     pub fn call_value_isolated(&mut self, fn_val: Value, args: &[Value]) -> VmResult<Vec<Value>> {
+        if self.poisoned {
+            return Err(VmError::RuntimeError("VM is poisoned by a previous internal error".into()));
+        }
         if let Some(cfn) = get_cfn(fn_val) {
-            return cfn(args);
+            return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cfn(args))) {
+                Ok(r) => r,
+                Err(payload) => {
+                    self.poisoned = true;
+                    Err(VmError::RuntimeError(format!("internal error (panic): {}", panic_message(&*payload))))
+                }
+            };
         }
         if let Some(cp) = get_proto_callable(fn_val) {
             let scratch_base = self.frames.iter().map(|f| {
@@ -271,8 +375,18 @@ impl Vm {
                 self.frames = saved_frames;
                 return Err(e);
             }
-            let run_result = self.run_inner();
+            let run_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner())) {
+                Ok(r) => r,
+                Err(payload) => {
+                    self.poisoned = true;
+                    self.frames = saved_frames;
+                    return Err(VmError::RuntimeError(format!("internal error (panic): {}", panic_message(&*payload))));
+                }
+            };
             let results = std::mem::take(&mut self.top_level_results);
+            // Enriched before restoring frames: the failing frame (with the line
+            // table needed) is only reachable through self.frames up to this point.
+            let run_result = run_result.map_err(|e| self.enrich_error_line(e));
             self.frames = saved_frames;
             run_result?;
             Ok(results)
@@ -426,7 +540,7 @@ impl Vm {
         match &proto.consts[idx] {
             Const::Nil       => Value::nil(),
             Const::Bool(b)   => Value::bool(*b),
-            Const::Int(n)    => Value::int(*n),
+            Const::Int(n)    => self.make_int(*n),
             Const::Float(f)  => Value::float(*f),
             Const::Str(s)    => self.intern(s),
         }
@@ -445,6 +559,27 @@ impl Vm {
         self.owned_protos.push(boxed);
         self.push_frame(ptr, std::ptr::null_mut(), 0, 0, 0, 1)?;
         self.run()
+    }
+
+    // Like exec_owned, but safe to call while other frames are already on the
+    // stack (e.g. require() invoked from a running script): exec_owned's own
+    // base=0 frame would otherwise collide with the caller's real frames, and
+    // Op::Return's base_save - caller_base arithmetic underflows. Saves and
+    // restores self.frames the same way call_value_isolated does.
+    pub fn exec_owned_isolated(&mut self, proto: crate::chunk::Proto) -> VmResult<Vec<Value>> {
+        let saved_frames = std::mem::take(&mut self.frames);
+        let boxed = Box::new(proto);
+        let ptr: *const Proto = &*boxed;
+        self.owned_protos.push(boxed);
+        if let Err(e) = self.push_frame(ptr, std::ptr::null_mut(), 0, 0, 0, 1) {
+            self.frames = saved_frames;
+            return Err(e);
+        }
+        let run_result = self.run();
+        let results = std::mem::take(&mut self.top_level_results);
+        self.frames = saved_frames;
+        run_result?;
+        Ok(results)
     }
 
     pub fn exec_call(&mut self, proto_ptr: *const Proto, args: &[Value]) -> VmResult<Vec<Value>> {
@@ -476,12 +611,62 @@ impl Vm {
     }
 
     pub fn run(&mut self) -> VmResult<()> {
+        if self.poisoned {
+            return Err(VmError::RuntimeError("VM is poisoned by a previous internal error".into()));
+        }
         CURRENT_VM.with(|c| c.set(self as *mut Vm));
-        self.run_inner()
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner())) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(self.enrich_error_line(e)),
+            Err(payload) => {
+                self.poisoned = true;
+                Err(VmError::RuntimeError(format!("internal error (panic): {}", panic_message(&*payload))))
+            }
+        }
+    }
+
+    // Idempotent via the prefix check, so re-enrichment at an outer
+    // call_value_isolated/run layer, as an error propagates through nested
+    // calls, is a no-op rather than stacking "line N: line M: ...".
+    fn enrich_error_line(&mut self, e: VmError) -> VmError {
+        if let VmError::RuntimeError(msg) = &e {
+            if !msg.starts_with("line ") {
+                self.last_traceback = Some(build_traceback(&self.frames));
+                if let Some(frame) = self.frames.last() {
+                    let proto = unsafe { &*frame.proto };
+                    let pc = frame.pc.saturating_sub(1);
+                    if let Some(&line) = proto.lines.get(pc) {
+                        return VmError::RuntimeError(format!("line {line}: {msg}"));
+                    }
+                }
+            }
+        }
+        e
     }
 
     pub fn run_inner(&mut self) -> VmResult<()> {
         'outer: loop {
+            // Checked here (before `frame` becomes a raw pointer into self.frames)
+            // rather than inside the inner dispatch loop, so gc_collect()'s &mut
+            // self (which can itself mutate self.frames, running __gc finalizers)
+            // never aliases a live &mut Frame. The inner loop below only lands
+            // back here — via `continue 'outer` — once a threshold is actually
+            // due; most instructions never leave the fast path at all.
+            if self.gc.should_collect() { self.gc_collect(); }
+
+            // >= not >: once live_count reaches max_objects with nothing left to
+            // collect, a script can never complete another allocation anyway (the
+            // fast path keeps bouncing back here before the allocating instruction
+            // ever runs) — using > would get stuck retrying forever instead of
+            // ever reporting the error.
+            if self.gc.max_objects != 0 && self.gc.live_count() >= self.gc.max_objects {
+                return Err(VmError::RuntimeError("memory limit exceeded".into()));
+            }
+
+            if self.step_limit != 0 && self.step_count > self.step_limit {
+                return Err(VmError::RuntimeError("instruction budget exceeded".into()));
+            }
+
             let frame = self.frames.last_mut().unwrap() as *mut Frame;
             let frame = unsafe { &mut *frame };
             let proto = unsafe { &*frame.proto };
@@ -501,8 +686,8 @@ impl Vm {
                     let bv = RK!($b);
                     let cv = RK!($c);
                     if bv.is_number() && cv.is_number() {
-                        let res = if bv.is_int() && cv.is_int() {
-                            Value::int($int_op(bv.as_int().unwrap(), cv.as_int().unwrap()))
+                        let res = if bv.is_int_like() && cv.is_int_like() {
+                            self.make_int($int_op(bv.as_int().unwrap(), cv.as_int().unwrap()))
                         } else {
                             Value::float($float_op(bv.to_float().unwrap(), cv.to_float().unwrap()))
                         };
@@ -523,6 +708,15 @@ impl Vm {
 
             loop {
                 if frame.pc >= proto.code.len() { break; }
+
+                // Cheap per-instruction counting only; the actual gc_collect()/
+                // budget-error handling happens back at 'outer's top, where it's
+                // safe to mutate self.frames (frame/proto aren't held past this point).
+                self.step_count += 1;
+                if self.gc.should_collect() || (self.step_limit != 0 && self.step_count > self.step_limit) {
+                    continue 'outer;
+                }
+
                 let instr = proto.code[frame.pc];
                 frame.pc += 1;
                 let a  = ia(instr);
@@ -564,10 +758,10 @@ impl Vm {
                         }
                     }
                     Op::IDiv => arith_op!(a, b, c,
-                        |x: i64, y: i64| if y == 0 { 0 } else { x.div_euclid(y) },
+                        |x: i64, y: i64| if y == 0 { 0 } else { x.wrapping_div_euclid(y) },
                         |x: f64, y: f64| (x / y).floor(), "__idiv"),
                     Op::Mod  => arith_op!(a, b, c,
-                        |x: i64, y: i64| if y == 0 { 0 } else { x.rem_euclid(y) },
+                        |x: i64, y: i64| if y == 0 { 0 } else { x.wrapping_rem_euclid(y) },
                         |x: f64, y: f64| x - (x / y).floor() * y, "__mod"),
                     Op::Pow  => {
                         let bv = RK!(b); let cv = RK!(c);
@@ -587,8 +781,9 @@ impl Vm {
                     }
                     Op::Unm => {
                         let v = R!(b);
-                        if v.is_int() {
-                            R!(a) = Value::int(-v.as_int().unwrap());
+                        if v.is_int_like() {
+                            let n = self.make_int(v.as_int().unwrap().wrapping_neg());
+                            R!(a) = n;
                         } else if v.is_float() {
                             R!(a) = Value::float(-v.as_float().unwrap());
                         } else {
@@ -604,27 +799,33 @@ impl Vm {
                     }
                     Op::BAnd => {
                         let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
-                        R!(a) = Value::int(bv & cv);
+                        let res = self.make_int(bv & cv);
+                        R!(a) = res;
                     }
                     Op::BOr  => {
                         let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
-                        R!(a) = Value::int(bv | cv);
+                        let res = self.make_int(bv | cv);
+                        R!(a) = res;
                     }
                     Op::BXor => {
                         let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
-                        R!(a) = Value::int(bv ^ cv);
+                        let res = self.make_int(bv ^ cv);
+                        R!(a) = res;
                     }
                     Op::Shl  => {
                         let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
-                        R!(a) = Value::int(bv.wrapping_shl(cv as u32));
+                        let res = self.make_int(bv.wrapping_shl(cv as u32));
+                        R!(a) = res;
                     }
                     Op::Shr  => {
                         let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
-                        R!(a) = Value::int(((bv as u64).wrapping_shr(cv as u32)) as i64);
+                        let res = self.make_int(((bv as u64).wrapping_shr(cv as u32)) as i64);
+                        R!(a) = res;
                     }
                     Op::BNot => {
                         let v = int_val(R!(b))?;
-                        R!(a) = Value::int(!v);
+                        let res = self.make_int(!v);
+                        R!(a) = res;
                     }
                     Op::Not  => R!(a) = Value::bool(!R!(b).is_truthy()),
                     Op::Len  => {
@@ -1047,10 +1248,12 @@ impl Vm {
 
         self.set_global_cfn("tonumber", |args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int() || v.is_float() { return Ok(vec![v]); }
+            if v.is_int_like() || v.is_float() { return Ok(vec![v]); }
             if v.is_string() {
                 let s = unsafe { string_ref(v) };
-                if let Ok(n) = s.trim().parse::<i64>() { return Ok(vec![Value::int(n)]); }
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    return Ok(vec![make_int_via_current_vm(n)]);
+                }
                 if let Ok(f) = s.trim().parse::<f64>() { return Ok(vec![Value::float(f)]); }
             }
             Ok(vec![Value::nil()])
@@ -1077,6 +1280,13 @@ impl Vm {
             let s = if msg.is_string() { unsafe { string_ref(msg) }.to_owned() }
                     else { format!("{msg}") };
             Err(VmError::RuntimeError(s))
+        });
+
+        // Test-only hook to exercise the panic-catching path in call_value_isolated
+        // without needing a real bug; never registered in a non-test build.
+        #[cfg(test)]
+        self.set_global_cfn("__debug_panic", |_args| {
+            panic!("__debug_panic: deliberate test panic");
         });
 
         self.set_global_cfn("pcall", |args| {
@@ -1495,7 +1705,12 @@ impl Vm {
                 .map(|&v| unsafe { string_ref(v) }.to_owned())
                 .unwrap_or_default();
             if n <= 0 { return Ok(vec![alloc_string_val("")]); }
-            let parts: Vec<&str> = std::iter::repeat(s).take(n as usize).collect();
+            let n = n as usize;
+            let total = n.saturating_mul(s.len() + sep.len());
+            if total > MAX_ALLOC_LEN {
+                return Err(VmError::RuntimeError("string.rep: result too large".into()));
+            }
+            let parts: Vec<&str> = std::iter::repeat(s).take(n).collect();
             Ok(vec![alloc_string_val(&parts.join(&sep))])
         });
         let v_str_upper = self.make_cfn_val(|args| {
@@ -1570,19 +1785,19 @@ impl Vm {
 
         let v_math_floor = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int() { return Ok(vec![v]); }
+            if v.is_int_like() { return Ok(vec![v]); }
             let f = v.as_float().ok_or_else(|| VmError::RuntimeError("math.floor: number expected".into()))?;
-            Ok(vec![Value::int(f.floor() as i64)])
+            Ok(vec![make_int_via_current_vm(f.floor() as i64)])
         });
         let v_math_ceil = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int() { return Ok(vec![v]); }
+            if v.is_int_like() { return Ok(vec![v]); }
             let f = v.as_float().ok_or_else(|| VmError::RuntimeError("math.ceil: number expected".into()))?;
-            Ok(vec![Value::int(f.ceil() as i64)])
+            Ok(vec![make_int_via_current_vm(f.ceil() as i64)])
         });
         let v_math_abs = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int() { return Ok(vec![Value::int(v.as_int().unwrap().wrapping_abs())]); }
+            if v.is_int_like() { return Ok(vec![make_int_via_current_vm(v.as_int().unwrap().wrapping_abs())]); }
             let f = v.as_float().ok_or_else(|| VmError::RuntimeError("math.abs: number expected".into()))?;
             Ok(vec![Value::float(f.abs())])
         });
@@ -1595,7 +1810,7 @@ impl Vm {
             if args.is_empty() { return Err(VmError::RuntimeError("math.max: at least one arg required".into())); }
             let mut best = args[0];
             for &v in &args[1..] {
-                let better = if best.is_int() && v.is_int() {
+                let better = if best.is_int_like() && v.is_int_like() {
                     best.as_int().unwrap() < v.as_int().unwrap()
                 } else {
                     best.to_float().unwrap_or(f64::NEG_INFINITY) < v.to_float().unwrap_or(f64::NEG_INFINITY)
@@ -1608,7 +1823,7 @@ impl Vm {
             if args.is_empty() { return Err(VmError::RuntimeError("math.min: at least one arg required".into())); }
             let mut best = args[0];
             for &v in &args[1..] {
-                let better = if best.is_int() && v.is_int() {
+                let better = if best.is_int_like() && v.is_int_like() {
                     best.as_int().unwrap() > v.as_int().unwrap()
                 } else {
                     best.to_float().unwrap_or(f64::INFINITY) > v.to_float().unwrap_or(f64::INFINITY)
@@ -1649,17 +1864,17 @@ impl Vm {
         });
         let v_math_type = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int()   { return Ok(vec![alloc_string_val("integer")]); }
+            if v.is_int_like() { return Ok(vec![alloc_string_val("integer")]); }
             if v.is_float() { return Ok(vec![alloc_string_val("float")]); }
             Ok(vec![Value::bool(false)])
         });
         let v_math_tointeger = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int() { return Ok(vec![v]); }
+            if v.is_int_like() { return Ok(vec![v]); }
             if v.is_float() {
                 let f = v.as_float().unwrap();
                 let i = f as i64;
-                if i as f64 == f { return Ok(vec![Value::int(i)]); }
+                if i as f64 == f { return Ok(vec![make_int_via_current_vm(i)]); }
             }
             Ok(vec![Value::nil()])
         });
@@ -1670,7 +1885,7 @@ impl Vm {
                 1 => {
                     let m = int_from_val(args[0]);
                     if m < 1 { return Err(VmError::RuntimeError("math.random: interval is empty".into())); }
-                    Ok(vec![Value::int(1 + (r % m as u64) as i64)])
+                    Ok(vec![make_int_via_current_vm(1 + (r % m as u64) as i64)])
                 }
                 _ => {
                     let lo = int_from_val(args[0]);
@@ -1680,7 +1895,7 @@ impl Vm {
                     if range > u64::MAX as i128 {
                         return Err(VmError::RuntimeError("math.random: range too large".into()));
                     }
-                    Ok(vec![Value::int(lo + (r % range as u64) as i64)])
+                    Ok(vec![make_int_via_current_vm(lo + (r % range as u64) as i64)])
                 }
             }
         });
@@ -1693,8 +1908,8 @@ impl Vm {
             let mt = unsafe { &mut *(math_table_ptr as *mut Table) };
             let k = self.intern("pi");          mt.raw_set(k, Value::float(std::f64::consts::PI));
             let k = self.intern("huge");        mt.raw_set(k, Value::float(f64::INFINITY));
-            let k = self.intern("maxinteger");  mt.raw_set(k, Value::int(i64::MAX));
-            let k = self.intern("mininteger");  mt.raw_set(k, Value::int(i64::MIN));
+            let k = self.intern("maxinteger");  let v = self.make_int(i64::MAX); mt.raw_set(k, v);
+            let k = self.intern("mininteger");  let v = self.make_int(i64::MIN); mt.raw_set(k, v);
             let k = self.intern("floor");       mt.raw_set(k, v_math_floor);
             let k = self.intern("ceil");        mt.raw_set(k, v_math_ceil);
             let k = self.intern("abs");         mt.raw_set(k, v_math_abs);
@@ -1730,6 +1945,9 @@ impl Vm {
                 3 => {
                     let pos = int_from_val(args[1]);
                     let n   = tbl.length();
+                    if pos < 1 || pos > n + 1 {
+                        return Err(VmError::RuntimeError("table.insert: position out of bounds".into()));
+                    }
                     for i in (pos..=n).rev() {
                         let elem = tbl.raw_get(Value::int(i));
                         tbl.raw_set(Value::int(i + 1), elem);
@@ -1765,9 +1983,12 @@ impl Vm {
             let n = tbl.length();
             let i = args.get(2).map(|&v| int_from_val(v)).unwrap_or(1);
             let j = args.get(3).map(|&v| int_from_val(v)).unwrap_or(n);
+            if checked_range_len(i, j).is_none() {
+                return Err(VmError::RuntimeError("table.concat: range too large".into()));
+            }
             let mut parts: Vec<String> = Vec::new();
             for k in i..=j {
-                let v = tbl.raw_get(Value::int(k));
+                let v = tbl.raw_get(make_int_via_current_vm(k));
                 let s = if v.is_string() { unsafe { string_ref(v) }.to_owned() }
                         else if v.is_number() { coerce_to_concat_str(v) }
                         else { return Err(VmError::RuntimeError("table.concat: invalid value (not string or number)".into())); };
@@ -1812,7 +2033,10 @@ impl Vm {
             let n = tbl.length();
             let i = args.get(1).map(|&v| int_from_val(v)).unwrap_or(1);
             let j = args.get(2).map(|&v| int_from_val(v)).unwrap_or(n);
-            Ok((i..=j).map(|k| tbl.raw_get(Value::int(k))).collect())
+            if checked_range_len(i, j).is_none() {
+                return Err(VmError::RuntimeError("table.unpack: range too large".into()));
+            }
+            Ok((i..=j).map(|k| tbl.raw_get(make_int_via_current_vm(k))).collect())
         });
         let v_tbl_move = self.make_cfn_val(|args| {
             let a1 = args.first().copied().unwrap_or(Value::nil());
@@ -1822,12 +2046,16 @@ impl Vm {
             let t  = int_from_val(args.get(3).copied().unwrap_or(Value::int(1)));
             let a2 = args.get(4).copied().filter(|v| v.is_table()).unwrap_or(a1);
             if e >= f {
+                if checked_range_len(f, e).is_none() {
+                    return Err(VmError::RuntimeError("table.move: range too large".into()));
+                }
                 let vals: Vec<Value> = (f..=e)
-                    .map(|k| unsafe { (*(a1.as_table().unwrap() as *const Table)).raw_get(Value::int(k)) })
+                    .map(|k| unsafe { (*(a1.as_table().unwrap() as *const Table)).raw_get(make_int_via_current_vm(k)) })
                     .collect();
                 let dst = unsafe { table_ref(a2) };
                 for (idx, v) in vals.into_iter().enumerate() {
-                    dst.raw_set(Value::int(t + idx as i64), v);
+                    let key = make_int_via_current_vm(t + idx as i64);
+                    dst.raw_set(key, v);
                 }
             }
             Ok(vec![a2])
@@ -1861,6 +2089,23 @@ impl Vm {
     }
 
     pub fn intern_pub(&mut self, s: &str) -> Value { self.intern(s) }
+
+    /// Host-only: bounds how many bytecode instructions a script may execute
+    /// before erroring out, resetting the count. 0 means unlimited. There is
+    /// deliberately no script-facing way to read or change this — a sandboxed
+    /// script shouldn't be able to lift its own leash.
+    pub fn set_step_limit(&mut self, limit: u64) {
+        self.step_limit = limit;
+        self.step_count = 0;
+    }
+
+    /// Host-only hard ceiling on live GC-tracked objects (0 = unlimited).
+    /// Unlike gc_setstep (which just tunes when a collection is attempted),
+    /// exceeding this after a collection is a real error: the script has more
+    /// live data than the host is willing to let it hold.
+    pub fn set_max_objects(&mut self, limit: usize) {
+        self.gc.max_objects = limit;
+    }
 
     pub fn call_cfn(v: Value, args: &[Value]) -> Option<VmResult<Vec<Value>>> {
         get_cfn(v).map(|f| f(args))
@@ -1932,7 +2177,7 @@ pub fn get_cfn_pub(v: Value) -> Option<&'static dyn Fn(&[Value]) -> VmResult<Vec
 
 fn coerce_to_concat_str(v: Value) -> String {
     if v.is_string() { unsafe { string_ref(v) }.to_owned() }
-    else if v.is_int() { v.as_int().unwrap().to_string() }
+    else if v.is_int_like() { v.as_int().unwrap().to_string() }
     else { v.as_float().unwrap().to_string() }
 }
 
@@ -1946,14 +2191,14 @@ fn int_val(v: Value) -> VmResult<i64> {
 enum Num { Int(i64), Float(f64) }
 
 fn to_number(v: Value) -> VmResult<Num> {
-    if v.is_int()   { return Ok(Num::Int(v.as_int().unwrap())); }
+    if v.is_int_like() { return Ok(Num::Int(v.as_int().unwrap())); }
     if v.is_float() { return Ok(Num::Float(v.as_float().unwrap())); }
     Err(VmError::RuntimeError(format!("'for' limit must be a number, got {}", v.type_name())))
 }
 
 fn num_add(a: Num, b: Num) -> Value {
     match (a, b) {
-        (Num::Int(x), Num::Int(y)) => Value::int(x.wrapping_add(y)),
+        (Num::Int(x), Num::Int(y)) => make_int_via_current_vm(x.wrapping_add(y)),
         (Num::Float(x), Num::Float(y)) => Value::float(x + y),
         (Num::Int(x), Num::Float(y)) => Value::float(x as f64 + y),
         (Num::Float(x), Num::Int(y)) => Value::float(x + y as f64),
@@ -1962,7 +2207,7 @@ fn num_add(a: Num, b: Num) -> Value {
 
 fn num_sub(a: Num, b: Num) -> Value {
     match (a, b) {
-        (Num::Int(x), Num::Int(y)) => Value::int(x.wrapping_sub(y)),
+        (Num::Int(x), Num::Int(y)) => make_int_via_current_vm(x.wrapping_sub(y)),
         (Num::Float(x), Num::Float(y)) => Value::float(x - y),
         (Num::Int(x), Num::Float(y)) => Value::float(x as f64 - y),
         (Num::Float(x), Num::Int(y)) => Value::float(x - y as f64),
@@ -1983,12 +2228,15 @@ fn num_is_positive(n: Num) -> bool {
 }
 
 fn values_equal(a: Value, b: Value) -> bool {
-    if a.is_int() && b.is_float() {
+    if a.is_int_like() && b.is_int_like() {
+        return a.as_int().unwrap() == b.as_int().unwrap();
+    }
+    if a.is_int_like() && b.is_float() {
         let n = a.as_int().unwrap();
         let f = b.as_float().unwrap();
         return (n as f64 == f) && (f as i64 == n);
     }
-    if a.is_float() && b.is_int() {
+    if a.is_float() && b.is_int_like() {
         let f = a.as_float().unwrap();
         let n = b.as_int().unwrap();
         return (n as f64 == f) && (f as i64 == n);
@@ -2000,7 +2248,7 @@ fn values_equal(a: Value, b: Value) -> bool {
 }
 
 fn value_lt(a: Value, b: Value) -> VmResult<bool> {
-    if a.is_int() && b.is_int() { return Ok(a.as_int().unwrap() < b.as_int().unwrap()); }
+    if a.is_int_like() && b.is_int_like() { return Ok(a.as_int().unwrap() < b.as_int().unwrap()); }
     if let (Some(af), Some(bf)) = (a.to_float(), b.to_float()) { return Ok(af < bf); }
     if a.is_string() && b.is_string() {
         return Ok(unsafe { string_ref(a) } < unsafe { string_ref(b) });
@@ -2009,7 +2257,7 @@ fn value_lt(a: Value, b: Value) -> VmResult<bool> {
 }
 
 fn value_le(a: Value, b: Value) -> VmResult<bool> {
-    if a.is_int() && b.is_int() { return Ok(a.as_int().unwrap() <= b.as_int().unwrap()); }
+    if a.is_int_like() && b.is_int_like() { return Ok(a.as_int().unwrap() <= b.as_int().unwrap()); }
     if let (Some(af), Some(bf)) = (a.to_float(), b.to_float()) { return Ok(af <= bf); }
     if a.is_string() && b.is_string() {
         return Ok(unsafe { string_ref(a) } <= unsafe { string_ref(b) });
@@ -2038,6 +2286,14 @@ fn str_arg<'a>(args: &'a [Value], idx: usize, fn_name: &'static str) -> VmResult
 
 fn int_from_val(v: Value) -> i64 {
     v.as_int().or_else(|| v.as_float().map(|f| f as i64)).unwrap_or(0)
+}
+
+// i64::MIN..=i64::MAX overflows i64 arithmetic directly, so the length is
+// computed in i128; returns None if the (inclusive) range exceeds MAX_ALLOC_LEN.
+fn checked_range_len(lo: i64, hi: i64) -> Option<usize> {
+    if hi < lo { return Some(0); }
+    let len = (hi as i128) - (lo as i128) + 1;
+    if len > MAX_ALLOC_LEN as i128 { None } else { Some(len as usize) }
 }
 
 fn lua_str_start(len: usize, i: i64) -> usize {
@@ -2105,7 +2361,7 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
         }
         let mut width = 0usize;
         while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-            width = width * 10 + (bytes[pos] - b'0') as usize;
+            width = (width.saturating_mul(10) + (bytes[pos] - b'0') as usize).min(MAX_ALLOC_LEN);
             pos += 1;
         }
         let mut prec: Option<usize> = None;
@@ -2113,7 +2369,7 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
             pos += 1;
             let mut p = 0usize;
             while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-                p = p * 10 + (bytes[pos] - b'0') as usize;
+                p = (p.saturating_mul(10) + (bytes[pos] - b'0') as usize).min(MAX_ALLOC_LEN);
                 pos += 1;
             }
             prec = Some(p);

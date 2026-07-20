@@ -65,6 +65,12 @@ void umbra_register(umbra_State *U, const char *name, umbra_CFunction f);
 void   umbra_gc_collect(umbra_State *U);
 /** Set the object-count threshold that triggers automatic collection (default 1024). */
 void   umbra_gc_setstep(umbra_State *U, size_t threshold);
+/** Bounds how many bytecode instructions a script may run before erroring
+    out (0 = unlimited); host-only, resets the count. */
+void   umbra_set_step_limit(umbra_State *U, uint64_t limit);
+/** Host-only hard ceiling on live GC-tracked objects (0 = unlimited); exceeding
+    it after a collection attempt is a real error. */
+void   umbra_set_max_objects(umbra_State *U, size_t limit);
 /** Returns the number of live GC-tracked objects. */
 size_t umbra_gc_livecount(const umbra_State *U);
 

@@ -67,7 +67,9 @@ pub unsafe extern "C" fn umbra_gettop(U: *const UmbraState) -> c_int {
 pub unsafe extern "C" fn umbra_settop(U: *mut UmbraState, idx: c_int) {
     let s = unsafe { &mut *U };
     if idx >= 0 {
-        s.stack.resize(s.api_base + idx as usize, Value::nil());
+        // Clamped: an extreme idx would otherwise force a multi-GB allocation abort.
+        let new_len = (s.api_base + idx as usize).min(s.api_base + crate::vm::MAX_ALLOC_LEN);
+        s.stack.resize(new_len, Value::nil());
     } else {
         let new_len = (s.stack.len() as isize + idx as isize).max(s.api_base as isize) as usize;
         s.stack.truncate(new_len);
@@ -76,7 +78,9 @@ pub unsafe extern "C" fn umbra_settop(U: *mut UmbraState, idx: c_int) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pop(U: *mut UmbraState, n: c_int) {
-    unsafe { umbra_settop(U, -n - 1); }
+    // -n - 1 overflows i32 directly when n == i32::MIN; compute in i64 instead.
+    let idx = ((-(n as i64)) - 1).clamp(c_int::MIN as i64, c_int::MAX as i64) as c_int;
+    unsafe { umbra_settop(U, idx); }
 }
 
 #[unsafe(no_mangle)]
@@ -91,7 +95,9 @@ pub unsafe extern "C" fn umbra_pushnumber(U: *mut UmbraState, n: c_double) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pushinteger(U: *mut UmbraState, n: i64) {
-    unsafe { (*U).stack.push(Value::int(n)); }
+    let state = unsafe { &mut *U };
+    let v = state.vm.make_int(n);
+    state.stack.push(v);
 }
 
 #[unsafe(no_mangle)]
@@ -113,7 +119,7 @@ pub unsafe extern "C" fn umbra_type(U: *const UmbraState, idx: c_int) -> c_int {
     let v = unsafe { (*U).get(idx) };
     if v.is_nil()    { return 0; }
     if v.is_bool()   { return 1; }
-    if v.is_int()    { return 2; }
+    if v.is_int_like() { return 2; }
     if v.is_float()  { return 3; }
     if v.is_string() { return 4; }
     if v.is_table()  { return 5; }
@@ -123,7 +129,7 @@ pub unsafe extern "C" fn umbra_type(U: *const UmbraState, idx: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_isnumber(U: *const UmbraState, idx: c_int) -> c_int {
     let v = unsafe { (*U).get(idx) };
-    (v.is_int() || v.is_float()) as c_int
+    (v.is_int_like() || v.is_float()) as c_int
 }
 
 #[unsafe(no_mangle)]
@@ -146,14 +152,14 @@ pub unsafe extern "C" fn umbra_isfunction(U: *const UmbraState, idx: c_int) -> c
 pub unsafe extern "C" fn umbra_tonumber(U: *const UmbraState, idx: c_int) -> c_double {
     let v = unsafe { (*U).get(idx) };
     if v.is_float() { v.as_float().unwrap() }
-    else if v.is_int() { v.as_int().unwrap() as c_double }
+    else if v.is_int_like() { v.as_int().unwrap() as c_double }
     else { 0.0 }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_tointeger(U: *const UmbraState, idx: c_int) -> i64 {
     let v = unsafe { (*U).get(idx) };
-    if v.is_int() { v.as_int().unwrap() }
+    if v.is_int_like() { v.as_int().unwrap() }
     else if v.is_float() { v.as_float().unwrap() as i64 }
     else { 0 }
 }
@@ -165,12 +171,14 @@ pub unsafe extern "C" fn umbra_toboolean(U: *const UmbraState, idx: c_int) -> c_
 
 // Safety: the returned pointer aliases the interned string's heap allocation
 // and is only valid as long as that string stays reachable (i.e. pre-GC).
+// RtString's trailing NUL makes this safe as a C string, modulo the usual
+// caveat that an embedded NUL in the Umbra string itself would truncate it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_tostring(U: *const UmbraState, idx: c_int) -> *const c_char {
     let v = unsafe { (*U).get(idx) };
     if v.is_string() {
-        let ptr = v.as_string().unwrap() as *const String;
-        unsafe { (*ptr).as_ptr() as *const c_char }
+        let ptr = v.as_string().unwrap() as *const crate::vm::RtString;
+        unsafe { (*ptr).as_c_ptr() as *const c_char }
     } else {
         std::ptr::null()
     }
@@ -195,11 +203,26 @@ pub unsafe extern "C" fn umbra_setglobal(U: *mut UmbraState, name: *const c_char
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_dostring(U: *mut UmbraState, src: *const c_char) -> c_int {
     let state = unsafe { &mut *U };
+    if state.vm.poisoned {
+        let v = state.vm.intern_pub("umbra_dostring: VM is poisoned by a previous internal error");
+        state.stack.push(v);
+        return UmbraStatus::RuntimeError as c_int;
+    }
     let rs = unsafe { CStr::from_ptr(src) }.to_string_lossy();
-    match crate::run_with_vm(rs.as_ref(), &mut state.vm) {
-        Ok(()) => UmbraStatus::Ok as c_int,
-        Err(e) => {
+    // An unwind must never reach this extern "C" boundary uncaught.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::run_with_vm(rs.as_ref(), &mut state.vm)
+    }));
+    match outcome {
+        Ok(Ok(())) => UmbraStatus::Ok as c_int,
+        Ok(Err(e)) => {
             let v = state.vm.intern_pub(&e);
+            state.stack.push(v);
+            UmbraStatus::RuntimeError as c_int
+        }
+        Err(payload) => {
+            state.vm.poisoned = true;
+            let v = state.vm.intern_pub(&format!("internal error (panic): {}", crate::vm::panic_message(&*payload)));
             state.stack.push(v);
             UmbraStatus::RuntimeError as c_int
         }
@@ -211,6 +234,11 @@ pub unsafe extern "C" fn umbra_dostring(U: *mut UmbraState, src: *const c_char) 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pcall(U: *mut UmbraState, nargs: c_int, nres: c_int) -> c_int {
     let state = unsafe { &mut *U };
+    if state.vm.poisoned {
+        let v = state.vm.intern_pub("umbra_pcall: VM is poisoned by a previous internal error");
+        state.stack.push(v);
+        return UmbraStatus::RuntimeError as c_int;
+    }
     let nargs = nargs as usize;
     let stack_top = state.stack.len();
     if stack_top < nargs + 1 {
@@ -222,7 +250,16 @@ pub unsafe extern "C" fn umbra_pcall(U: *mut UmbraState, nargs: c_int, nres: c_i
     let fn_val = state.stack[fn_idx];
     let args: Vec<Value> = state.stack.drain(fn_idx..).skip(1).collect();
 
-    let result: VmResult<Vec<Value>> = call_value(state, fn_val, &args);
+    // An unwind must never reach this extern "C" boundary uncaught.
+    let result: VmResult<Vec<Value>> = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        call_value(state, fn_val, &args)
+    })) {
+        Ok(r) => r,
+        Err(payload) => {
+            state.vm.poisoned = true;
+            Err(VmError::RuntimeError(format!("internal error (panic): {}", crate::vm::panic_message(&*payload))))
+        }
+    };
     match result {
         Ok(results) => {
             let fill = if nres < 0 { results.len() } else { nres as usize };
@@ -240,9 +277,15 @@ pub unsafe extern "C" fn umbra_pcall(U: *mut UmbraState, nargs: c_int, nres: c_i
 }
 
 fn call_value(state: &mut UmbraState, fn_val: Value, args: &[Value]) -> VmResult<Vec<Value>> {
-    use crate::vm::get_cfn_pub;
+    use crate::vm::{get_cfn_pub, panic_message};
     if let Some(cfn) = get_cfn_pub(fn_val) {
-        return cfn(args);
+        return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cfn(args))) {
+            Ok(r) => r,
+            Err(payload) => {
+                state.vm.poisoned = true;
+                Err(VmError::RuntimeError(format!("internal error (panic): {}", panic_message(&*payload))))
+            }
+        };
     }
     if let Some(proto_ptr) = get_closure(fn_val) {
         return state.vm.exec_call(proto_ptr, args);
@@ -258,6 +301,22 @@ pub unsafe extern "C" fn umbra_gc_collect(U: *mut UmbraState) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_gc_setstep(U: *mut UmbraState, threshold: usize) {
     unsafe { (*U).vm.gc.threshold = threshold; }
+}
+
+/// Bounds how many bytecode instructions a script may run before erroring
+/// out (0 = unlimited); host-only, resets the count. Call before dostring/
+/// pcall-ing a script you don't fully trust to terminate.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn umbra_set_step_limit(U: *mut UmbraState, limit: u64) {
+    unsafe { (*U).vm.set_step_limit(limit); }
+}
+
+/// Host-only hard ceiling on live GC-tracked objects (0 = unlimited); exceeding
+/// it after a collection attempt is a real error, unlike umbra_gc_setstep
+/// which only tunes when collection is attempted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn umbra_set_max_objects(U: *mut UmbraState, limit: usize) {
+    unsafe { (*U).vm.set_max_objects(limit); }
 }
 
 #[unsafe(no_mangle)]
