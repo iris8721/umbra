@@ -1277,8 +1277,30 @@ impl Vm {
 
         self.set_global_cfn("error", |args| {
             let msg = args.first().copied().unwrap_or(Value::nil());
+            let level = args.get(1).map(|v| v.as_int().unwrap_or(1)).unwrap_or(1);
             let s = if msg.is_string() { unsafe { string_ref(msg) }.to_owned() }
                     else { format!("{msg}") };
+            // level 1 (default) is handled by the generic enrich_error_line pass,
+            // which already prefixes using the innermost frame. level >= 2 means
+            // attribute the error to an outer caller's frame instead, so prepend
+            // the line here — enrich_error_line skips messages that already start
+            // with "line " and leaves this alone.
+            if level >= 2 {
+                let prefixed = CURRENT_VM.with(|c| {
+                    let vm_ptr = c.get();
+                    if vm_ptr.is_null() { return s.clone(); }
+                    let vm = unsafe { &*vm_ptr };
+                    match vm.frames.len().checked_sub(level as usize).and_then(|i| vm.frames.get(i)) {
+                        Some(frame) => {
+                            let proto = unsafe { &*frame.proto };
+                            let line = proto.lines.get(frame.pc.saturating_sub(1)).copied().unwrap_or(0);
+                            format!("line {line}: {s}")
+                        }
+                        None => s.clone(),
+                    }
+                });
+                return Err(VmError::RuntimeError(prefixed));
+            }
             Err(VmError::RuntimeError(s))
         });
 
