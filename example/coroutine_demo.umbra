@@ -1,0 +1,50 @@
+let fib = coroutine.wrap(fn() {
+    var a, b = 0, 1
+    while true {
+        yield(a)
+        let tmp = a + b
+        a = b
+        b = tmp
+    }
+})
+
+print("[fib]    first 12:")
+var line = "  "
+for i = 1, 12 {
+    if i > 1 { line = line .. "  " }
+    line = line .. tostring(fib())
+}
+print(line)
+
+let acc = coroutine.wrap(fn() {
+    var sum = 0
+    while true {
+        let n = yield(sum)
+        sum = sum + n
+    }
+})
+
+acc()
+print("[acc]    running sum:")
+let vals = {10, 3, 7, 20, 5}
+for i = 1, 5 {
+    let total = acc(vals[i])
+    print(string.format("  add %2d  →  total = %d", vals[i], total))
+}
+
+fn make_counter(start, step) {
+    return coroutine.wrap(fn() {
+        var n = start
+        while true {
+            yield(n)
+            n = n + step
+        }
+    })
+}
+
+let evens = make_counter(0, 2)
+let odds  = make_counter(1, 2)
+print("[interleave] evens and odds:")
+for i = 1, 6 {
+    print(string.format("  even=%-4d  odd=%d", evens(), odds()))
+}
