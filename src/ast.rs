@@ -28,6 +28,11 @@ pub enum Expr {
 
     Function(FuncBody),
     Table(TableConstructor),
+
+    Ternary { cond: Box<Expr>, then: Box<Expr>, else_: Box<Expr>, line: u32 },
+    // delta is always +1/-1 (from ++ / --); prefix distinguishes ++i (yields
+    // the new value) from i++ (yields the old value) — full C-style semantics.
+    IncrDecr { target: Box<Expr>, delta: i64, prefix: bool, line: u32 },
 }
 
 impl Expr {
@@ -43,6 +48,8 @@ impl Expr {
             Expr::MethodCall(m) => m.line,
             Expr::Function(f) => f.line,
             Expr::Table(t) => t.line,
+            Expr::Ternary { line, .. } => *line,
+            Expr::IncrDecr { line, .. } => *line,
         }
     }
 }
@@ -117,9 +124,12 @@ pub struct Block {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Assign   { targets: Vec<Expr>, values: Vec<Expr>, line: u32 },
-    Local    { mutable: bool, names: Vec<String>, values: Vec<Expr>, line: u32 },
+    // closes[i] is true if names[i] was declared with a <close> attribute.
+    Local    { mutable: bool, names: Vec<String>, closes: Vec<bool>, values: Vec<Expr>, line: u32 },
+    Destructure { mutable: bool, fields: Vec<String>, value: Expr, line: u32 },
     Do       { body: Block, line: u32 },
     While    { cond: Expr, body: Block, line: u32 },
+    RepeatUntil { body: Block, cond: Expr, line: u32 },
     If       { cond: Expr, then: Block, elseifs: Vec<(Expr, Block)>, else_: Option<Block>, line: u32 },
     ForNum   { var: String, start: Expr, limit: Expr, step: Option<Expr>, body: Block, line: u32 },
     ForIn    { vars: Vec<String>, iters: Vec<Expr>, body: Block, line: u32 },
@@ -127,7 +137,14 @@ pub enum Stmt {
     LocalFunc { name: String, body: FuncBody, line: u32 },
     Call     (CallExpr),
     MethodCall(MethodCallExpr),
+    // For expressions used as statements purely for their side effect (currently
+    // just ++/--); the value is discarded, unlike Call/MethodCall which can also
+    // appear in value position and get their own dedicated Expr variants already.
+    ExprStmt (Expr),
     Break    (u32),
+    Continue (u32),
+    Goto     (String, u32),
+    Label    (String, u32),
 }
 
 #[derive(Debug, Clone)]

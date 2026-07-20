@@ -1,13 +1,27 @@
 #[derive(Debug, Clone, PartialEq)]
+pub enum InterpPart {
+    Str(String),
+    // Raw source text of a ${...} embedded expression, parsed lazily by the
+    // parser rather than here, so the lexer doesn't need to know about Expr.
+    Expr(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Int(i64),
     Float(f64),
     String(String),
+    InterpString(Vec<InterpPart>),
     Ident(String),
 
     And,
     Break,
+    Case,
+    Continue,
     Else,
+    Goto,
+    Repeat,
+    Until,
     False,
     Fn,
     For,
@@ -18,6 +32,7 @@ pub enum TokenKind {
     Not,
     Or,
     Return,
+    Switch,
     True,
     Var,
     While,
@@ -27,9 +42,11 @@ pub enum TokenKind {
     Minus,
     Star,
     Slash,
+    SlashSlash,
     Percent,
     Caret,
     Hash,
+    Question,
     Amp,
     Tilde,
     Pipe,
@@ -42,6 +59,21 @@ pub enum TokenKind {
     Lt,
     Gt,
     Assign,
+    PlusEq,
+    MinusEq,
+    PlusPlus,
+    MinusMinus,
+    StarEq,
+    SlashEq,
+    SlashSlashEq,
+    PercentEq,
+    CaretEq,
+    AmpEq,
+    PipeEq,
+    TildeEq,
+    LtLtEq,
+    GtGtEq,
+    DotDotEq,
     LParen,
     RParen,
     LBrace,
@@ -100,8 +132,8 @@ impl<'src> Lexer<'src> {
             while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
                 self.advance();
             }
-            if self.peek() == Some(b'/') && self.peek2() == Some(b'/') {
-                self.advance(); self.advance();
+            if self.peek() == Some(b'@') {
+                self.advance();
                 while !matches!(self.peek(), Some(b'\n') | None) { self.advance(); }
                 continue;
             }
@@ -127,22 +159,6 @@ impl<'src> Lexer<'src> {
         let mut level = 0usize;
         while self.src.get(i) == Some(&b'=') { level += 1; i += 1; }
         if self.src.get(i) == Some(&b'[') { level as i32 } else { -1 }
-    }
-
-    fn skip_long_string(&mut self, level: usize) {
-        for _ in 0..level { self.advance(); }
-        self.advance();
-        loop {
-            match self.advance() {
-                None => break,
-                Some(b']') => {
-                    let mut n = 0;
-                    while self.peek() == Some(b'=') { self.advance(); n += 1; }
-                    if n == level && self.peek() == Some(b']') { self.advance(); break; }
-                }
-                _ => {}
-            }
-        }
     }
 
     fn read_long_string(&mut self, level: usize) -> String {
@@ -173,12 +189,50 @@ impl<'src> Lexer<'src> {
         String::from_utf8_lossy(&out).into_owned()
     }
 
-    fn read_string(&mut self, delim: u8) -> Result<String, LexError> {
+    // Consumes up to (and including) the '}' that closes a ${...} embedded
+    // expression, skipping over any nested string literal's own braces so a
+    // `}` inside e.g. "${f(\"}\")}" doesn't end the interpolation early.
+    fn read_interp_expr_src(&mut self) -> Result<String, LexError> {
+        let start = self.pos;
+        let mut depth: i32 = 1;
+        loop {
+            match self.advance() {
+                None => return Err(LexError::UnterminatedString(self.line)),
+                Some(b'{') => depth += 1,
+                Some(b'}') => {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                }
+                Some(q @ (b'"' | b'\'')) => loop {
+                    match self.advance() {
+                        None | Some(b'\n') => return Err(LexError::UnterminatedString(self.line)),
+                        Some(b'\\') => { self.advance(); }
+                        Some(b) if b == q => break,
+                        Some(_) => {}
+                    }
+                },
+                Some(_) => {}
+            }
+        }
+        let end = self.pos - 1;
+        Ok(String::from_utf8_lossy(&self.src[start..end]).into_owned())
+    }
+
+    fn read_string(&mut self, delim: u8) -> Result<TokenKind, LexError> {
         let mut out = Vec::new();
+        let mut parts: Vec<InterpPart> = Vec::new();
+        let mut has_interp = false;
         loop {
             match self.advance() {
                 None | Some(b'\n') => return Err(LexError::UnterminatedString(self.line)),
                 Some(b) if b == delim => break,
+                Some(b'$') if self.peek() == Some(b'{') => {
+                    self.advance();
+                    has_interp = true;
+                    parts.push(InterpPart::Str(String::from_utf8_lossy(&out).into_owned()));
+                    out.clear();
+                    parts.push(InterpPart::Expr(self.read_interp_expr_src()?));
+                }
                 Some(b'\\') => {
                     match self.advance() {
                         Some(b'a')  => out.push(7),
@@ -217,7 +271,12 @@ impl<'src> Lexer<'src> {
                 Some(b) => out.push(b),
             }
         }
-        Ok(String::from_utf8_lossy(&out).into_owned())
+        if has_interp {
+            parts.push(InterpPart::Str(String::from_utf8_lossy(&out).into_owned()));
+            Ok(TokenKind::InterpString(parts))
+        } else {
+            Ok(TokenKind::String(String::from_utf8_lossy(&out).into_owned()))
+        }
     }
 
     fn read_number(&mut self, first: u8) -> Result<TokenKind, LexError> {
@@ -267,13 +326,15 @@ impl<'src> Lexer<'src> {
         };
 
         let kind = match b {
-            b'+' => TokenKind::Plus,
-            b'*' => TokenKind::Star,
-            b'%' => TokenKind::Percent,
-            b'^' => TokenKind::Caret,
+            b'+' => if self.eat(b'+') { TokenKind::PlusPlus }
+                    else if self.eat(b'=') { TokenKind::PlusEq } else { TokenKind::Plus },
+            b'*' => if self.eat(b'=') { TokenKind::StarEq } else { TokenKind::Star },
+            b'%' => if self.eat(b'=') { TokenKind::PercentEq } else { TokenKind::Percent },
+            b'^' => if self.eat(b'=') { TokenKind::CaretEq } else { TokenKind::Caret },
             b'#' => TokenKind::Hash,
-            b'&' => TokenKind::Amp,
-            b'|' => TokenKind::Pipe,
+            b'?' => TokenKind::Question,
+            b'&' => if self.eat(b'=') { TokenKind::AmpEq } else { TokenKind::Amp },
+            b'|' => if self.eat(b'=') { TokenKind::PipeEq } else { TokenKind::Pipe },
             b'(' => TokenKind::LParen,
             b')' => TokenKind::RParen,
             b'{' => TokenKind::LBrace,
@@ -281,23 +342,30 @@ impl<'src> Lexer<'src> {
             b']' => TokenKind::RBracket,
             b';' => TokenKind::Semicolon,
             b',' => TokenKind::Comma,
-            b'-' => TokenKind::Minus,
-            b'/' => TokenKind::Slash,
-            b'~' => TokenKind::Tilde,
+            b'-' => if self.eat(b'-') { TokenKind::MinusMinus }
+                    else if self.eat(b'=') { TokenKind::MinusEq } else { TokenKind::Minus },
+            b'/' => if self.eat(b'/') {
+                        if self.eat(b'=') { TokenKind::SlashSlashEq } else { TokenKind::SlashSlash }
+                    } else if self.eat(b'=') { TokenKind::SlashEq } else { TokenKind::Slash },
+            b'~' => if self.eat(b'=') { TokenKind::TildeEq } else { TokenKind::Tilde },
             b'!' => if self.eat(b'=') { TokenKind::BangEq }
                     else { return Err(LexError::UnexpectedChar('!', line)) },
-            b'<' => if self.eat(b'<') { TokenKind::LtLt }
-                    else if self.eat(b'=') { TokenKind::LtEq }
+            b'<' => if self.eat(b'<') {
+                        if self.eat(b'=') { TokenKind::LtLtEq } else { TokenKind::LtLt }
+                    } else if self.eat(b'=') { TokenKind::LtEq }
                     else { TokenKind::Lt },
-            b'>' => if self.eat(b'>') { TokenKind::GtGt }
-                    else if self.eat(b'=') { TokenKind::GtEq }
+            b'>' => if self.eat(b'>') {
+                        if self.eat(b'=') { TokenKind::GtGtEq } else { TokenKind::GtGt }
+                    } else if self.eat(b'=') { TokenKind::GtEq }
                     else { TokenKind::Gt },
             b'=' => if self.eat(b'=') { TokenKind::Eq } else { TokenKind::Assign },
             b':' => if self.eat(b':') { TokenKind::ColonColon } else { TokenKind::Colon },
             b'.' => {
                 if self.peek() == Some(b'.') {
                     self.advance();
-                    if self.eat(b'.') { TokenKind::DotDotDot } else { TokenKind::DotDot }
+                    if self.eat(b'.') { TokenKind::DotDotDot }
+                    else if self.eat(b'=') { TokenKind::DotDotEq }
+                    else { TokenKind::DotDot }
                 } else if matches!(self.peek(), Some(b'0'..=b'9')) {
                     self.read_number(b'0')?
                 } else {
@@ -312,7 +380,7 @@ impl<'src> Lexer<'src> {
                     TokenKind::LBracket
                 }
             }
-            b'\'' | b'"' => TokenKind::String(self.read_string(b)?),
+            b'\'' | b'"' => self.read_string(b)?,
             b'0'..=b'9' => self.read_number(b)?,
             b if b.is_ascii_alphabetic() || b == b'_' => {
                 let start = self.pos - 1;
@@ -343,20 +411,26 @@ impl<'src> Lexer<'src> {
 
 fn keyword_or_ident(s: &str) -> TokenKind {
     match s {
-        "and"    => TokenKind::And,
-        "break"  => TokenKind::Break,
+        "and"      => TokenKind::And,
+        "break"    => TokenKind::Break,
+        "case"     => TokenKind::Case,
+        "continue" => TokenKind::Continue,
         "else"   => TokenKind::Else,
         "false"  => TokenKind::False,
         "fn"     => TokenKind::Fn,
         "for"    => TokenKind::For,
+        "goto"   => TokenKind::Goto,
         "if"     => TokenKind::If,
         "in"     => TokenKind::In,
         "let"    => TokenKind::Let,
         "none"   => TokenKind::None,
         "not"    => TokenKind::Not,
         "or"     => TokenKind::Or,
+        "repeat" => TokenKind::Repeat,
         "return" => TokenKind::Return,
+        "switch" => TokenKind::Switch,
         "true"   => TokenKind::True,
+        "until"  => TokenKind::Until,
         "var"    => TokenKind::Var,
         "while"  => TokenKind::While,
         "yield"  => TokenKind::Yield,

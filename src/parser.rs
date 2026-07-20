@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::lexer::{LexError, Lexer, Token, TokenKind};
+use crate::lexer::{InterpPart, LexError, Lexer, Token, TokenKind};
 
 #[derive(Debug, Clone)]
 pub enum ParseError {
@@ -24,6 +24,16 @@ impl std::fmt::Display for ParseError {
 
 type PResult<T> = Result<T, ParseError>;
 
+fn build_case_cond(subject: &Expr, mut values: Vec<Expr>, line: u32) -> Expr {
+    let first = values.remove(0);
+    let mut cond = Expr::Binop { op: Binop::Eq, lhs: Box::new(subject.clone()), rhs: Box::new(first), line };
+    for v in values {
+        let eq = Expr::Binop { op: Binop::Eq, lhs: Box::new(subject.clone()), rhs: Box::new(v), line };
+        cond = Expr::Binop { op: Binop::Or, lhs: Box::new(cond), rhs: Box::new(eq), line };
+    }
+    cond
+}
+
 enum StmtResult {
     Stmt(Stmt),
     Expr(Expr),
@@ -34,13 +44,14 @@ pub struct Parser<'src> {
     current: Token,
     lookahead: Option<Token>,
     errors: Vec<ParseError>,
+    switch_counter: u32,
 }
 
 impl<'src> Parser<'src> {
     pub fn new(src: &'src str) -> PResult<Self> {
         let mut lexer = Lexer::new(src);
         let current = lexer.next_token()?;
-        Ok(Self { lexer, current, lookahead: None, errors: Vec::new() })
+        Ok(Self { lexer, current, lookahead: None, errors: Vec::new(), switch_counter: 0 })
     }
 
     fn peek(&self) -> &TokenKind { &self.current.kind }
@@ -199,13 +210,36 @@ impl<'src> Parser<'src> {
                 self.advance()?;
                 Ok(StmtResult::Stmt(Stmt::Break(line)))
             }
+            TokenKind::Continue => {
+                self.advance()?;
+                Ok(StmtResult::Stmt(Stmt::Continue(line)))
+            }
             TokenKind::While => {
                 self.advance()?;
                 let cond = self.parse_expr()?;
                 let body = self.parse_braced_block()?;
                 Ok(StmtResult::Stmt(Stmt::While { cond, body, line }))
             }
-            TokenKind::If  => Ok(StmtResult::Stmt(self.parse_if()?)),
+            TokenKind::Repeat => {
+                self.advance()?;
+                let body = self.parse_braced_block()?;
+                self.expect(&TokenKind::Until, "'until'")?;
+                let cond = self.parse_expr()?;
+                Ok(StmtResult::Stmt(Stmt::RepeatUntil { body, cond, line }))
+            }
+            TokenKind::Goto => {
+                self.advance()?;
+                let name = self.expect_ident()?;
+                Ok(StmtResult::Stmt(Stmt::Goto(name, line)))
+            }
+            TokenKind::ColonColon => {
+                self.advance()?;
+                let name = self.expect_ident()?;
+                self.expect(&TokenKind::ColonColon, "'::'")?;
+                Ok(StmtResult::Stmt(Stmt::Label(name, line)))
+            }
+            TokenKind::If     => Ok(StmtResult::Stmt(self.parse_if()?)),
+            TokenKind::Switch => Ok(StmtResult::Stmt(self.parse_switch()?)),
             TokenKind::For => Ok(StmtResult::Stmt(self.parse_for()?)),
             TokenKind::Fn  => Ok(StmtResult::Stmt(self.parse_fn_stmt(line)?)),
             TokenKind::Let => {
@@ -220,6 +254,20 @@ impl<'src> Parser<'src> {
                 let expr = self.parse_expr()?;
                 if matches!(self.peek(), TokenKind::Assign | TokenKind::Comma) {
                     Ok(StmtResult::Stmt(self.parse_assign(expr, line)?))
+                } else if let Some(op) = self.compound_assign_op() {
+                    self.advance()?;
+                    let rhs = self.parse_expr()?;
+                    // Simplification shared with ++/--: a Field/Index target's own
+                    // subexpressions (e.g. an Index key) are evaluated twice — once
+                    // reading the current value, once writing the result back.
+                    let value = if op == Binop::Concat {
+                        Expr::Concat { parts: vec![expr.clone(), rhs], line }
+                    } else {
+                        Expr::Binop { op, lhs: Box::new(expr.clone()), rhs: Box::new(rhs), line }
+                    };
+                    Ok(StmtResult::Stmt(Stmt::Assign { targets: vec![expr], values: vec![value], line }))
+                } else if matches!(expr, Expr::IncrDecr { .. }) {
+                    Ok(StmtResult::Stmt(Stmt::ExprStmt(expr)))
                 } else {
                     match expr {
                         Expr::Call(c)       => Ok(StmtResult::Stmt(Stmt::Call(c))),
@@ -256,6 +304,54 @@ impl<'src> Parser<'src> {
         Ok(Stmt::If { cond, then, elseifs, else_, line })
     }
 
+    // Desugars at parse time into `do { let __switch_N = subject; if ... }`
+    // over existing AST nodes, so the compiler needs no new support at all.
+    // Cases never fall through (each is a mutually exclusive if/elseif arm).
+    fn parse_switch(&mut self) -> PResult<Stmt> {
+        let line = self.line();
+        self.expect(&TokenKind::Switch, "'switch'")?;
+        let subject = self.parse_expr()?;
+        self.expect(&TokenKind::LBrace, "'{'")?;
+
+        let mut arms: Vec<(Vec<Expr>, Block)> = Vec::new();
+        while self.check(&TokenKind::Case) {
+            self.advance()?;
+            let mut values = vec![self.parse_expr()?];
+            while self.eat(&TokenKind::Comma)? {
+                values.push(self.parse_expr()?);
+            }
+            let body = self.parse_braced_block()?;
+            arms.push((values, body));
+        }
+        let else_block = if self.eat(&TokenKind::Else)? {
+            Some(self.parse_braced_block()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::RBrace, "'}'")?;
+
+        self.switch_counter += 1;
+        let tmp = format!("__switch_{}", self.switch_counter);
+        let tmp_ident = Expr::Ident(Ident { name: tmp.clone(), line });
+
+        let mut acc: Option<Stmt> = else_block.map(|body| Stmt::Do { body, line });
+        for (values, body) in arms.into_iter().rev() {
+            let cond = build_case_cond(&tmp_ident, values, line);
+            let else_ = acc.map(|s| Block { stmts: vec![s], ret: None, line });
+            acc = Some(Stmt::If { cond, then: body, elseifs: vec![], else_, line });
+        }
+
+        let mut stmts = vec![Stmt::Local {
+            mutable: false,
+            names: vec![tmp],
+            closes: vec![false],
+            values: vec![subject],
+            line,
+        }];
+        stmts.extend(acc);
+        Ok(Stmt::Do { body: Block { stmts, ret: None, line }, line })
+    }
+
     fn parse_for(&mut self) -> PResult<Stmt> {
         let line = self.line();
         self.expect(&TokenKind::For, "'for'")?;
@@ -282,7 +378,13 @@ impl<'src> Parser<'src> {
     fn parse_fn_stmt(&mut self, line: u32) -> PResult<Stmt> {
         self.advance()?;
         let name = self.parse_funcname()?;
-        let body = self.parse_funcbody()?;
+        let mut body = self.parse_funcbody()?;
+        // fn Table:method(...) implicitly receives the receiver as `self`,
+        // matching how obj:method(...) call sites already pass it as the
+        // first argument.
+        if name.method.is_some() {
+            body.params.insert(0, "self".to_string());
+        }
         Ok(Stmt::FuncDef { name, body, line })
     }
 
@@ -293,13 +395,41 @@ impl<'src> Parser<'src> {
             let body = self.parse_funcbody()?;
             return Ok(Stmt::LocalFunc { name, body, line });
         }
+        if self.check(&TokenKind::LBrace) {
+            self.advance()?;
+            let mut fields = Vec::new();
+            fields.push(self.expect_ident()?);
+            while self.eat(&TokenKind::Comma)? {
+                fields.push(self.expect_ident()?);
+            }
+            self.expect(&TokenKind::RBrace, "'}'")?;
+            self.expect(&TokenKind::Assign, "'='")?;
+            let value = self.parse_expr()?;
+            return Ok(Stmt::Destructure { mutable, fields, value, line });
+        }
         let mut names = Vec::new();
+        let mut closes = Vec::new();
         names.push(self.expect_ident()?);
+        closes.push(self.parse_close_attr()?);
         while self.eat(&TokenKind::Comma)? {
             names.push(self.expect_ident()?);
+            closes.push(self.parse_close_attr()?);
         }
         let values = if self.eat(&TokenKind::Assign)? { self.parse_exprlist()? } else { vec![] };
-        Ok(Stmt::Local { mutable, names, values, line })
+        Ok(Stmt::Local { mutable, names, closes, values, line })
+    }
+
+    // <close> after a binding name; the only variable attribute this
+    // language supports (no <const>, unlike real Lua 5.4).
+    fn parse_close_attr(&mut self) -> PResult<bool> {
+        if !self.check(&TokenKind::Lt) { return Ok(false); }
+        self.advance()?;
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::Gt, "'>'")?;
+        if name != "close" {
+            return Err(ParseError::Expected { what: "'close' (only variable attribute supported)", line: self.line() });
+        }
+        Ok(true)
     }
 
     fn parse_assign(&mut self, first: Expr, line: u32) -> PResult<Stmt> {
@@ -394,12 +524,28 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_expr(&mut self) -> PResult<Expr> {
-        self.parse_pratt(0)
+        let cond = self.parse_pratt(0)?;
+        if self.check(&TokenKind::Question) {
+            let line = self.line();
+            self.advance()?;
+            let then_e = self.parse_expr()?;
+            self.expect(&TokenKind::Colon, "':'")?;
+            let else_e = self.parse_expr()?; // right-associative: a ? b : c ? d : e
+            return Ok(Expr::Ternary {
+                cond: Box::new(cond), then: Box::new(then_e), else_: Box::new(else_e), line,
+            });
+        }
+        Ok(cond)
     }
 
     fn parse_pratt(&mut self, min_bp: u8) -> PResult<Expr> {
         let line = self.line();
-        let mut lhs = if let Some((op, rbp)) = self.unary_op() {
+        let mut lhs = if matches!(self.peek(), TokenKind::PlusPlus | TokenKind::MinusMinus) {
+            let delta = if matches!(self.peek(), TokenKind::PlusPlus) { 1 } else { -1 };
+            self.advance()?;
+            let target = self.parse_suffixed_expr()?;
+            Expr::IncrDecr { target: Box::new(target), delta, prefix: true, line }
+        } else if let Some((op, rbp)) = self.unary_op() {
             self.advance()?;
             let operand = self.parse_pratt(rbp)?;
             Expr::Unop { op, operand: Box::new(operand), line }
@@ -428,6 +574,25 @@ impl<'src> Parser<'src> {
             }
         }
         Ok(lhs)
+    }
+
+    fn compound_assign_op(&self) -> Option<Binop> {
+        match self.peek() {
+            TokenKind::PlusEq       => Some(Binop::Add),
+            TokenKind::MinusEq      => Some(Binop::Sub),
+            TokenKind::StarEq       => Some(Binop::Mul),
+            TokenKind::SlashEq      => Some(Binop::Div),
+            TokenKind::SlashSlashEq => Some(Binop::IDiv),
+            TokenKind::PercentEq    => Some(Binop::Mod),
+            TokenKind::CaretEq      => Some(Binop::Pow),
+            TokenKind::AmpEq        => Some(Binop::BAnd),
+            TokenKind::PipeEq       => Some(Binop::BOr),
+            TokenKind::TildeEq      => Some(Binop::BXor),
+            TokenKind::LtLtEq       => Some(Binop::Shl),
+            TokenKind::GtGtEq       => Some(Binop::Shr),
+            TokenKind::DotDotEq     => Some(Binop::Concat),
+            _ => None,
+        }
     }
 
     fn unary_op(&self) -> Option<(Unop, u8)> {
@@ -459,23 +624,49 @@ impl<'src> Parser<'src> {
             TokenKind::Plus    => Some((Binop::Add,   15, 16)),
             TokenKind::Minus   => Some((Binop::Sub,   15, 16)),
             TokenKind::Star    => Some((Binop::Mul,   17, 18)),
-            TokenKind::Slash   => Some((Binop::Div,   17, 18)),
-            TokenKind::Percent => Some((Binop::Mod,   17, 18)),
+            TokenKind::Slash      => Some((Binop::Div,  17, 18)),
+            TokenKind::SlashSlash => Some((Binop::IDiv, 17, 18)),
+            TokenKind::Percent    => Some((Binop::Mod,  17, 18)),
             TokenKind::Caret   => Some((Binop::Pow,   20, 19)), // lbp > rbp: right-associative
             _ => None,
         }
+    }
+
+    // Builds "a${expr}b" into Expr::Concat["a", expr, "b"], reusing the
+    // existing .. concatenation semantics (including its number->string
+    // coercion) rather than inventing separate stringification rules. Each
+    // ${...} is parsed as its own isolated expression, so a syntax error
+    // inside one reports line 1 relative to the embedded snippet, not the
+    // real file line — a known limitation of not tracking source offsets.
+    fn build_interp_expr(&mut self, parts: Vec<InterpPart>, line: u32) -> PResult<Expr> {
+        let mut out = Vec::new();
+        for part in parts {
+            match part {
+                InterpPart::Str(s) => {
+                    if !s.is_empty() { out.push(Expr::String(s, line)); }
+                }
+                InterpPart::Expr(src) => {
+                    let mut sub = Parser::new(&src)?;
+                    out.push(sub.parse_expr()?);
+                }
+            }
+        }
+        if out.is_empty() { out.push(Expr::String(String::new(), line)); }
+        Ok(Expr::Concat { parts: out, line })
     }
 
     fn parse_simple_expr(&mut self) -> PResult<Expr> {
         let line = self.line();
         match self.peek() {
             TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::String(_)
+            | TokenKind::InterpString(_)
             | TokenKind::None | TokenKind::True | TokenKind::False
             | TokenKind::DotDotDot => {
                 match self.advance()?.kind {
                     TokenKind::Int(n)    => Ok(Expr::Int(n, line)),
                     TokenKind::Float(f)  => Ok(Expr::Float(f, line)),
                     TokenKind::String(s) => Ok(Expr::String(s, line)),
+                    TokenKind::InterpString(parts) => self.build_interp_expr(parts, line),
                     TokenKind::None      => Ok(Expr::Nil(line)),
                     TokenKind::True      => Ok(Expr::True(line)),
                     TokenKind::False     => Ok(Expr::False(line)),
@@ -517,6 +708,12 @@ impl<'src> Parser<'src> {
                 TokenKind::LParen | TokenKind::String(_) => {
                     let args = self.parse_args()?;
                     e = Expr::Call(CallExpr { callee: Box::new(e), args, line });
+                }
+                TokenKind::PlusPlus | TokenKind::MinusMinus => {
+                    let delta = if matches!(self.peek(), TokenKind::PlusPlus) { 1 } else { -1 };
+                    self.advance()?;
+                    e = Expr::IncrDecr { target: Box::new(e), delta, prefix: false, line };
+                    break;
                 }
                 _ => break,
             }

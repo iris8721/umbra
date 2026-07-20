@@ -20,6 +20,111 @@ fn err(msg: impl Into<String>, line: u32) -> CompileError {
     CompileError { msg: msg.into(), line }
 }
 
+// Collects every identifier name referenced anywhere inside a nested
+// function (at any depth) within this body — an over-approximation of
+// "names this function's closures might capture as upvalues": it isn't
+// scope-precise (a same-named local declared fresh inside a nested closure
+// still gets counted), but over-boxing a name that's never actually
+// captured only costs an extra indirection, never correctness. Boxing
+// itself is a separate decision, made where each Local is declared.
+fn collect_captured_names(body: &FuncBody) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    scan_block(&body.body, false, &mut out);
+    out
+}
+
+fn scan_block(block: &Block, in_closure: bool, out: &mut std::collections::HashSet<String>) {
+    for stmt in &block.stmts { scan_stmt(stmt, in_closure, out); }
+    if let Some(ret) = &block.ret {
+        for e in ret { scan_expr(e, in_closure, out); }
+    }
+}
+
+fn scan_funcbody(body: &FuncBody, out: &mut std::collections::HashSet<String>) {
+    scan_block(&body.body, true, out);
+}
+
+fn scan_stmt(stmt: &Stmt, in_closure: bool, out: &mut std::collections::HashSet<String>) {
+    match stmt {
+        Stmt::Assign { targets, values, .. } => {
+            for e in targets { scan_expr(e, in_closure, out); }
+            for e in values { scan_expr(e, in_closure, out); }
+        }
+        Stmt::Local { values, .. } => for e in values { scan_expr(e, in_closure, out); },
+        Stmt::Destructure { value, .. } => scan_expr(value, in_closure, out),
+        Stmt::Do { body, .. } => scan_block(body, in_closure, out),
+        Stmt::While { cond, body, .. } => { scan_expr(cond, in_closure, out); scan_block(body, in_closure, out); }
+        Stmt::RepeatUntil { body, cond, .. } => { scan_block(body, in_closure, out); scan_expr(cond, in_closure, out); }
+        Stmt::If { cond, then, elseifs, else_, .. } => {
+            scan_expr(cond, in_closure, out);
+            scan_block(then, in_closure, out);
+            for (c, b) in elseifs { scan_expr(c, in_closure, out); scan_block(b, in_closure, out); }
+            if let Some(b) = else_ { scan_block(b, in_closure, out); }
+        }
+        Stmt::ForNum { start, limit, step, body, .. } => {
+            scan_expr(start, in_closure, out);
+            scan_expr(limit, in_closure, out);
+            if let Some(s) = step { scan_expr(s, in_closure, out); }
+            scan_block(body, in_closure, out);
+        }
+        Stmt::ForIn { iters, body, .. } => {
+            for e in iters { scan_expr(e, in_closure, out); }
+            scan_block(body, in_closure, out);
+        }
+        Stmt::FuncDef { body, .. } => scan_funcbody(body, out),
+        Stmt::LocalFunc { body, .. } => scan_funcbody(body, out),
+        Stmt::Call(c) => scan_call(c, in_closure, out),
+        Stmt::MethodCall(m) => scan_methodcall(m, in_closure, out),
+        Stmt::ExprStmt(e) => scan_expr(e, in_closure, out),
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Goto(_, _) | Stmt::Label(_, _) => {}
+    }
+}
+
+fn scan_call(c: &CallExpr, in_closure: bool, out: &mut std::collections::HashSet<String>) {
+    scan_expr(&c.callee, in_closure, out);
+    scan_args(&c.args, in_closure, out);
+}
+
+fn scan_methodcall(m: &MethodCallExpr, in_closure: bool, out: &mut std::collections::HashSet<String>) {
+    scan_expr(&m.receiver, in_closure, out);
+    scan_args(&m.args, in_closure, out);
+}
+
+fn scan_args(args: &Args, in_closure: bool, out: &mut std::collections::HashSet<String>) {
+    if let Args::Exprs(exprs) = args {
+        for e in exprs { scan_expr(e, in_closure, out); }
+    }
+}
+
+fn scan_expr(expr: &Expr, in_closure: bool, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Nil(_) | Expr::True(_) | Expr::False(_) | Expr::Int(_, _) | Expr::Float(_, _)
+        | Expr::String(_, _) | Expr::Vararg(_) => {}
+        Expr::Ident(id) => { if in_closure { out.insert(id.name.clone()); } }
+        Expr::Index { table, key, .. } => { scan_expr(table, in_closure, out); scan_expr(key, in_closure, out); }
+        Expr::Field { table, .. } => scan_expr(table, in_closure, out),
+        Expr::Unop { operand, .. } => scan_expr(operand, in_closure, out),
+        Expr::Binop { lhs, rhs, .. } => { scan_expr(lhs, in_closure, out); scan_expr(rhs, in_closure, out); }
+        Expr::Concat { parts, .. } => for e in parts { scan_expr(e, in_closure, out); },
+        Expr::Call(c) => scan_call(c, in_closure, out),
+        Expr::MethodCall(m) => scan_methodcall(m, in_closure, out),
+        Expr::Function(body) => scan_funcbody(body, out),
+        Expr::Table(tc) => for f in &tc.fields {
+            match f {
+                TableField::Indexed { key, val } => { scan_expr(key, in_closure, out); scan_expr(val, in_closure, out); }
+                TableField::Named { val, .. } => scan_expr(val, in_closure, out),
+                TableField::Positional(e) => scan_expr(e, in_closure, out),
+            }
+        },
+        Expr::Ternary { cond, then, else_, .. } => {
+            scan_expr(cond, in_closure, out);
+            scan_expr(then, in_closure, out);
+            scan_expr(else_, in_closure, out);
+        }
+        Expr::IncrDecr { target, .. } => scan_expr(target, in_closure, out),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 enum ExprKind {
@@ -53,6 +158,14 @@ struct Local {
     name: String,
     reg: u8,
     mutable: bool,
+    close: bool,
+    // If true, `reg` holds a 1-element table (a heap cell) wrapping the real
+    // value instead of the value itself, so every closure that captures this
+    // local as an upvalue shares the same cell — a plain copy-by-value
+    // upvalue (what non-boxed locals use) can't support a mutation made
+    // inside one closure being visible to another closure or the outer
+    // scope, since each copy would be independent. See box_in_place.
+    boxed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,33 +173,45 @@ struct UpvalInfo {
     name: String,
     in_stack: bool,
     outer_idx: u8,
-}
-
-#[derive(Clone)]
-struct OuterScope {
-    locals: Vec<Local>,
-    upvals: Vec<UpvalInfo>,
+    boxed: bool,
 }
 
 struct LoopScope {
     break_jumps: Vec<usize>,
+    continue_jumps: Vec<usize>,
 }
 
 struct FnComp {
     proto: Proto,
     locals: Vec<Local>,
     upvals: Vec<UpvalInfo>,
-    outer_scope: Option<OuterScope>,
+    // Raw pointer to the enclosing function's still-being-compiled FnComp
+    // (compile_fn recurses synchronously, so it's genuinely alive for the
+    // whole time this one is), not an owned snapshot — so resolve_upval can
+    // walk the *entire* live chain (see its doc) rather than being stuck
+    // once the immediate parent's own locals/upvals don't have the name.
+    outer_scope: Option<*mut FnComp>,
     free_reg: u8,
     loops: Vec<LoopScope>,
     line: u32,
+    labels: std::collections::HashMap<String, usize>,
+    pending_gotos: Vec<(String, usize, u32)>,
+    // Names any nested closure in this function references — see
+    // collect_captured_names. Consulted when a local/param is declared to
+    // decide whether it needs boxing.
+    captured: std::collections::HashSet<String>,
 }
 
 impl FnComp {
-    fn new(source: Option<String>, outer: Option<OuterScope>) -> Self {
+    fn new(source: Option<String>, outer: Option<*mut FnComp>, captured: std::collections::HashSet<String>) -> Self {
         let mut proto = Proto::new();
         proto.source = source;
-        Self { proto, locals: Vec::new(), upvals: Vec::new(), outer_scope: outer, free_reg: 0, loops: Vec::new(), line: 1 }
+        Self {
+            proto, locals: Vec::new(), upvals: Vec::new(), outer_scope: outer,
+            free_reg: 0, loops: Vec::new(), line: 1,
+            labels: std::collections::HashMap::new(), pending_gotos: Vec::new(),
+            captured,
+        }
     }
 
     fn alloc_reg(&mut self) -> CResult<u8> {
@@ -118,14 +243,41 @@ impl FnComp {
         else { Err(err("too many constants", self.line)) }
     }
 
-    fn resolve_local(&self, name: &str) -> Option<u8> {
-        self.locals.iter().rev().find(|l| l.name == name).map(|l| l.reg)
+    // Returns (register, boxed).
+    fn resolve_local(&self, name: &str) -> Option<(u8, bool)> {
+        self.locals.iter().rev().find(|l| l.name == name).map(|l| (l.reg, l.boxed))
     }
 
     fn push_local(&mut self, name: String, mutable: bool) -> CResult<u8> {
+        let boxed = self.captured.contains(&name);
         let r = self.alloc_reg()?;
-        self.locals.push(Local { name, reg: r, mutable });
+        self.locals.push(Local { name, reg: r, mutable, close: false, boxed });
         Ok(r)
+    }
+
+    // Wraps the value currently sitting in `reg` into a fresh 1-element
+    // table and leaves that table (the "box") in reg instead — see the
+    // `boxed` field doc on Local.
+    fn box_in_place(&mut self, reg: u8) -> CResult<()> {
+        let box_reg = self.alloc_reg()?;
+        self.emit(enc_abc(Op::NewTable, box_reg, 0, 0));
+        let key = self.rk_const(Const::Int(1))? as u8;
+        self.emit(enc_abc(Op::SetTable, box_reg, key, reg));
+        self.emit_move(reg, box_reg);
+        self.free_reg_to(box_reg);
+        Ok(())
+    }
+
+    fn unbox_into(&mut self, dst: u8, box_reg: u8) -> CResult<()> {
+        let key = self.rk_const(Const::Int(1))? as u8;
+        self.emit(enc_abc(Op::GetTable, dst, box_reg, key));
+        Ok(())
+    }
+
+    fn set_boxed(&mut self, box_reg: u8, src: u8) -> CResult<()> {
+        let key = self.rk_const(Const::Int(1))? as u8;
+        self.emit(enc_abc(Op::SetTable, box_reg, key, src));
+        Ok(())
     }
 
     fn locals_top(&self) -> usize { self.locals.len() }
@@ -136,20 +288,60 @@ impl FnComp {
         self.free_reg = new_free;
     }
 
-    fn resolve_upval(&mut self, name: &str) -> Option<u8> {
+    // Emits `local:close()` calls (LIFO) for any <close> locals in
+    // locals[from_top..], meant to run right before a block's locals are
+    // truncated at from_top. Covers only the natural (fall-through) end of
+    // the scope a <close> local was declared in — break/continue/return (or
+    // an error) all skip these calls, since (unlike real Lua's __close)
+    // there's no unwind-time hook to catch those exits here.
+    fn emit_closes(&mut self, from_top: usize) -> CResult<()> {
+        let closers: Vec<(u8, bool)> = self.locals[from_top..].iter()
+            .filter(|l| l.close)
+            .map(|l| (l.reg, l.boxed))
+            .collect();
+        for (reg, boxed) in closers.into_iter().rev() {
+            // A <close> local that's also captured by a nested closure holds
+            // a box (see the `boxed` field), not the resource itself — unbox
+            // first so `close` is looked up on the real value.
+            let value_reg = if boxed {
+                let dst = self.free_reg;
+                self.unbox_into(dst, reg)?;
+                dst
+            } else {
+                reg
+            };
+            let fn_reg = self.free_reg.max(value_reg + 1);
+            let fki = (self.const_str("close") | RK_BIT) as u8;
+            self.emit(enc_abc(Op::GetTable, fn_reg, value_reg, fki));
+            self.emit_move(fn_reg + 1, value_reg);
+            self.emit(enc_abc(Op::Call, fn_reg, 2, 1));
+            if self.proto.max_regs < fn_reg + 2 { self.proto.max_regs = fn_reg + 2; }
+        }
+        Ok(())
+    }
+
+    // Returns (upvalue index, boxed). Recurses through the *live* chain of
+    // enclosing FnComps (via outer_scope), not just one level: if the
+    // immediate parent doesn't have `name` either, this asks the parent to
+    // resolve it too (which may itself recurse further up and, as a side
+    // effect, gain its own new upvalue entry for `name`) — so a doubly (or
+    // more) nested closure can still reach a name that no function in
+    // between ever references directly.
+    fn resolve_upval(&mut self, name: &str) -> Option<(u8, bool)> {
         if let Some(i) = self.upvals.iter().position(|u| u.name == name) {
-            return Some(i as u8);
+            return Some((i as u8, self.upvals[i].boxed));
         }
-        let outer = self.outer_scope.as_ref()?;
-        if let Some(loc) = outer.locals.iter().rev().find(|l| l.name == name).cloned() {
+        let outer_ptr = self.outer_scope?;
+        let outer = unsafe { &mut *outer_ptr };
+        if let Some((reg, boxed)) = outer.resolve_local(name) {
             let idx = self.upvals.len() as u8;
-            self.upvals.push(UpvalInfo { name: name.to_owned(), in_stack: true, outer_idx: loc.reg });
-            return Some(idx);
+            self.upvals.push(UpvalInfo { name: name.to_owned(), in_stack: true, outer_idx: reg, boxed });
+            return Some((idx, boxed));
         }
-        if let Some(pos) = outer.upvals.iter().position(|u| u.name == name) {
+        if let Some((outer_uv_idx, boxed)) = outer.resolve_upval(name) {
             let idx = self.upvals.len() as u8;
-            self.upvals.push(UpvalInfo { name: name.to_owned(), in_stack: false, outer_idx: pos as u8 });
-            return Some(idx);
+            self.upvals.push(UpvalInfo { name: name.to_owned(), in_stack: false, outer_idx: outer_uv_idx, boxed });
+            return Some((idx, boxed));
         }
         None
     }
@@ -251,7 +443,12 @@ impl FnComp {
             self.compile_stmt(stmt)?;
         }
         if let Some(ret) = &block.ret {
+            // Op::Return exits the function right here, so any close calls
+            // emitted after it would be unreachable bytecode — a `return` at
+            // the tail of a scope skips <close> cleanup, same as break/continue.
             self.compile_return(ret, block.line)?;
+        } else {
+            self.emit_closes(locals_top)?;
         }
         self.pop_locals_to(locals_top);
         self.free_reg_to(reg_top);
@@ -286,7 +483,7 @@ impl FnComp {
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> CResult<()> {
         match stmt {
-            Stmt::Local { mutable, names, values, line } => {
+            Stmt::Local { mutable, names, closes, values, line } => {
                 self.line = *line;
                 let base = self.free_reg;
                 let nv = values.len();
@@ -326,9 +523,28 @@ impl FnComp {
                     self.emit_load_nil(dst);
                 }
                 for (i, name) in names.iter().enumerate() {
-                    self.locals.push(Local { name: name.clone(), reg: base + i as u8, mutable: *mutable });
+                    let boxed = self.captured.contains(name);
+                    self.locals.push(Local { name: name.clone(), reg: base + i as u8, mutable: *mutable, close: closes[i], boxed });
                 }
                 if self.free_reg < base + nn as u8 { self.free_reg = base + nn as u8; }
+                if self.proto.max_regs < self.free_reg { self.proto.max_regs = self.free_reg; }
+                for (i, name) in names.iter().enumerate() {
+                    if self.captured.contains(name) { self.box_in_place(base + i as u8)?; }
+                }
+            }
+
+            Stmt::Destructure { mutable, fields, value, line } => {
+                self.line = *line;
+                let ve = self.compile_expr(value)?;
+                let vr = self.to_reg(ve, None)?;
+                for name in fields {
+                    let dst = self.alloc_reg()?;
+                    let fki = (self.const_str(name) | RK_BIT) as u8;
+                    self.emit(enc_abc(Op::GetTable, dst, vr, fki));
+                    let boxed = self.captured.contains(name);
+                    self.locals.push(Local { name: name.clone(), reg: dst, mutable: *mutable, close: false, boxed });
+                    if boxed { self.box_in_place(dst)?; }
+                }
                 if self.proto.max_regs < self.free_reg { self.proto.max_regs = self.free_reg; }
             }
 
@@ -391,9 +607,14 @@ impl FnComp {
                 let exit_jump = self.proto.emit_jump(*line);
                 self.free_reg_to(cond_reg);
 
-                self.loops.push(LoopScope { break_jumps: Vec::new() });
+                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new() });
                 self.compile_block(body)?;
                 let scope = self.loops.pop().unwrap();
+
+                // continue jumps straight to the backedge — same target the loop's
+                // own fallthrough uses, so it re-checks cond exactly like a normal iteration.
+                let back_pos = self.pc();
+                for cj in scope.continue_jumps { self.proto.patch_jump(cj, back_pos); }
 
                 let back = loop_top as i32 - self.pc() as i32 - 1;
                 self.emit(enc_asbx(Op::Jmp, 0, back));
@@ -402,6 +623,36 @@ impl FnComp {
                 for bj in scope.break_jumps {
                     self.proto.patch_jump(bj, here);
                 }
+            }
+
+            Stmt::RepeatUntil { body, cond, line } => {
+                self.line = *line;
+                let loop_top = self.pc();
+                let reg_top = self.free_reg;
+                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new() });
+                let locals_top = self.locals_top();
+                for stmt in &body.stmts { self.compile_stmt(stmt)?; }
+                if let Some(r) = &body.ret { self.compile_return(r, body.line)?; }
+
+                // cond is compiled before popping the body's locals — Lua's repeat-until
+                // scoping rule lets `until` see locals the body just declared.
+                let cond_pos = self.pc();
+                let cond_reg = self.free_reg;
+                let e = self.compile_expr(cond)?;
+                let r = self.to_reg(e, Some(cond_reg))?;
+                if self.free_reg <= r { self.free_reg = r + 1; }
+                self.emit(enc_abc(Op::Test, r as u8, 0, 0));
+                let back = loop_top as i32 - self.pc() as i32 - 1;
+                self.emit(enc_asbx(Op::Jmp, 0, back));
+
+                self.emit_closes(locals_top)?;
+                self.pop_locals_to(locals_top);
+                self.free_reg_to(reg_top);
+                let scope = self.loops.pop().unwrap();
+
+                let here = self.pc();
+                for cj in scope.continue_jumps { self.proto.patch_jump(cj, cond_pos); }
+                for bj in scope.break_jumps { self.proto.patch_jump(bj, here); }
             }
 
             Stmt::If { cond, then, elseifs, else_, line } => {
@@ -459,19 +710,30 @@ impl FnComp {
 
                 let loop_top = self.pc();
                 let lv_reg = base + 3;
-                self.locals.push(Local { name: var.clone(), reg: lv_reg, mutable: true });
+                // Never boxed: ForPrep/ForLoop write the raw counter into lv_reg
+                // directly every iteration, which would stomp a box placed here.
+                // A closure capturing the loop variable shares one variable across
+                // all iterations — the classic pre-5.4-Lua for-loop-capture wart,
+                // not something this fix attempts to solve.
+                self.locals.push(Local { name: var.clone(), reg: lv_reg, mutable: true, close: false, boxed: false });
                 let locals_save = self.locals.len() - 1;
 
-                self.loops.push(LoopScope { break_jumps: Vec::new() });
+                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new() });
                 let inner_locals = self.locals_top();
                 for stmt in &body.stmts {
                     self.compile_stmt(stmt)?;
                 }
                 if let Some(r) = &body.ret {
                     self.compile_return(r, body.line)?;
+                } else {
+                    self.emit_closes(inner_locals)?;
                 }
                 self.pop_locals_to(inner_locals);
                 let scope = self.loops.pop().unwrap();
+
+                // continue jumps to the ForLoop step/condition-check itself.
+                let step_pos = self.pc();
+                for cj in scope.continue_jumps { self.proto.patch_jump(cj, step_pos); }
 
                 let back = loop_top as i32 - self.pc() as i32 - 1;
                 self.emit(enc_asbx(Op::ForLoop, base as u8, back));
@@ -496,7 +758,18 @@ impl FnComp {
                     let it0 = iters[0].clone();
                     match it0 {
                         Expr::Call(ref c) => { self.compile_call(c, base, 3)?; }
-                        Expr::MethodCall(ref m) => { self.compile_method_call(m, base, 3)?; }
+                        Expr::MethodCall(ref m) => {
+                            // compile_method_call writes the receiver at its own `base`
+                            // and results starting at `base+1` (see its Expr::MethodCall
+                            // callsite), unlike compile_call which writes results at
+                            // `base` itself — so give it a scratch base past our
+                            // reserved iter/state/control block and move them down.
+                            let call_base = self.alloc_reg()?;
+                            self.compile_method_call(m, call_base, 3)?;
+                            self.emit_move(base, call_base + 1);
+                            self.emit_move(base + 1, call_base + 2);
+                            self.emit_move(base + 2, call_base + 3);
+                        }
                         _ => {
                             let e = self.compile_expr(&it0)?;
                             self.to_reg(e, Some(base))?;
@@ -518,16 +791,22 @@ impl FnComp {
                 let loop_top = self.pc();
 
                 let lv_base = self.locals_top();
+                // Never boxed, same reasoning as ForNum: TForCall overwrites these
+                // registers directly every iteration.
                 for (i, v) in vars.iter().enumerate() {
-                    self.locals.push(Local { name: v.clone(), reg: base + 4 + i as u8, mutable: true });
+                    self.locals.push(Local { name: v.clone(), reg: base + 4 + i as u8, mutable: true, close: false, boxed: false });
                 }
 
-                self.loops.push(LoopScope { break_jumps: Vec::new() });
+                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new() });
                 let inner_locals = self.locals_top();
                 for s in &body.stmts { self.compile_stmt(s)?; }
-                if let Some(r) = &body.ret { self.compile_return(r, body.line)?; }
+                if let Some(r) = &body.ret { self.compile_return(r, body.line)?; } else { self.emit_closes(inner_locals)?; }
                 self.pop_locals_to(inner_locals);
                 let scope = self.loops.pop().unwrap();
+
+                // continue jumps to the TForCall/TForLoop pair that advances the iterator.
+                let advance_pos = self.pc();
+                for cj in scope.continue_jumps { self.proto.patch_jump(cj, advance_pos); }
 
                 self.proto.patch_jump_here(loop_jmp);
                 self.emit(enc_abc(Op::TForCall, base as u8, 0, vars.len() as u8));
@@ -542,7 +821,7 @@ impl FnComp {
 
             Stmt::FuncDef { name, body, line } => {
                 self.line = *line;
-                let outer = Some(OuterScope { locals: self.locals.clone(), upvals: self.upvals.clone() });
+                let outer = Some(self as *mut FnComp);
                 let proto = compile_fn(body, self.proto.source.clone(), outer)?;
                 let pi = self.proto.protos.len();
                 self.proto.protos.push(proto);
@@ -556,8 +835,11 @@ impl FnComp {
                 } else {
                     let ki = self.const_str(&name.parts[0]);
                     let base_r = self.alloc_reg()?;
-                    if let Some(lr) = self.resolve_local(&name.parts[0]) {
-                        self.emit_move(base_r, lr);
+                    if let Some((lr, boxed)) = self.resolve_local(&name.parts[0]) {
+                        if boxed { self.unbox_into(base_r, lr)?; } else { self.emit_move(base_r, lr); }
+                    } else if let Some((uv, boxed)) = self.resolve_upval(&name.parts[0]) {
+                        self.emit(enc_abc(Op::GetUpval, base_r, uv, 0));
+                        if boxed { self.unbox_into(base_r, base_r)?; }
                     } else {
                         self.emit(enc_abx(Op::GetGlobal, base_r, ki as u16));
                     }
@@ -580,20 +862,44 @@ impl FnComp {
 
             Stmt::LocalFunc { name, body, line } => {
                 self.line = *line;
-                // Snapshot before pushing the function's own name so it can't
-                // accidentally capture itself as an upvalue (would be nil at creation time).
-                let outer = Some(OuterScope { locals: self.locals.clone(), upvals: self.upvals.clone() });
-                let r = self.push_local(name.clone(), true)?;
+                // outer_scope is a live pointer back to this FnComp, so a
+                // self-recursive call inside body needs "name" registered as
+                // a local *before* compiling body, so resolve_upval can find
+                // it. That's only safe because of boxing: an empty box is
+                // created up front and registered now, body captures that
+                // box by reference if it self-recurses, and only afterward
+                // does the actual closure value get written into the box —
+                // so the recursive call sees a real closure once it runs,
+                // never the empty placeholder. Without boxing (the `else`
+                // arm) there's no such placeholder to capture, so a
+                // non-recursive LocalFunc just gets Closure written directly.
+                let outer = Some(self as *mut FnComp);
+                let r = self.alloc_reg()?;
+                let boxed = self.captured.contains(name);
+                if boxed { self.emit(enc_abc(Op::NewTable, r, 0, 0)); }
+                self.locals.push(Local { name: name.clone(), reg: r, mutable: true, close: false, boxed });
                 let proto = compile_fn(body, self.proto.source.clone(), outer)?;
                 let pi = self.proto.protos.len();
                 self.proto.protos.push(proto);
-                self.emit(enc_abx(Op::Closure, r, pi as u16));
+                if boxed {
+                    let tmp = self.alloc_reg()?;
+                    self.emit(enc_abx(Op::Closure, tmp, pi as u16));
+                    self.set_boxed(r, tmp)?;
+                    self.free_reg_to(tmp);
+                } else {
+                    self.emit(enc_abx(Op::Closure, r, pi as u16));
+                }
             }
 
             Stmt::Call(c) => {
                 self.line = c.line;
                 let base = self.free_reg;
                 self.compile_call(c, base, 0)?;
+                self.free_reg_to(base);
+            }
+            Stmt::ExprStmt(e) => {
+                let base = self.free_reg;
+                self.compile_expr(e)?;
                 self.free_reg_to(base);
             }
 
@@ -613,6 +919,27 @@ impl FnComp {
                     return Err(err("'break' outside loop", *line));
                 }
             }
+            Stmt::Continue(line) => {
+                self.line = *line;
+                let j = self.proto.emit_jump(*line);
+                if let Some(scope) = self.loops.last_mut() {
+                    scope.continue_jumps.push(j);
+                } else {
+                    return Err(err("'continue' outside loop", *line));
+                }
+            }
+            Stmt::Goto(name, line) => {
+                self.line = *line;
+                let j = self.proto.emit_jump(*line);
+                self.pending_gotos.push((name.clone(), j, *line));
+            }
+            Stmt::Label(name, line) => {
+                self.line = *line;
+                if self.labels.contains_key(name) {
+                    return Err(err(format!("label '{name}' already defined in this function"), *line));
+                }
+                self.labels.insert(name.clone(), self.pc());
+            }
         }
         Ok(())
     }
@@ -628,9 +955,20 @@ impl FnComp {
                             id.line,
                         ));
                     }
-                    if loc.reg != src { self.emit_move(loc.reg, src); }
-                } else if let Some(uv_idx) = self.resolve_upval(&id.name) {
-                    self.emit(enc_abc(Op::SetUpval, src, uv_idx, 0));
+                    if loc.boxed {
+                        self.set_boxed(loc.reg, src)?;
+                    } else if loc.reg != src {
+                        self.emit_move(loc.reg, src);
+                    }
+                } else if let Some((uv_idx, boxed)) = self.resolve_upval(&id.name) {
+                    if boxed {
+                        let tmp = self.alloc_reg()?;
+                        self.emit(enc_abc(Op::GetUpval, tmp, uv_idx, 0));
+                        self.set_boxed(tmp, src)?;
+                        self.free_reg_to(tmp);
+                    } else {
+                        self.emit(enc_abc(Op::SetUpval, src, uv_idx, 0));
+                    }
                 } else {
                     let ki = self.const_str(&id.name);
                     self.emit(enc_abx(Op::SetGlobal, src, ki as u16));
@@ -674,10 +1012,24 @@ impl FnComp {
                 Ok(Expr2 { kind: ExprKind::K(ki), line })
             }
             Expr::Ident(id) => {
-                if let Some(r) = self.resolve_local(&id.name) {
-                    Ok(Expr2 { kind: ExprKind::Reg(r), line })
-                } else if let Some(uv) = self.resolve_upval(&id.name) {
-                    Ok(Expr2 { kind: ExprKind::Upval(uv), line })
+                if let Some((r, boxed)) = self.resolve_local(&id.name) {
+                    if boxed {
+                        let dst = self.alloc_reg()?;
+                        self.unbox_into(dst, r)?;
+                        Ok(Expr2::reg(dst, line))
+                    } else {
+                        Ok(Expr2 { kind: ExprKind::Reg(r), line })
+                    }
+                } else if let Some((uv, boxed)) = self.resolve_upval(&id.name) {
+                    if boxed {
+                        let tmp = self.alloc_reg()?;
+                        self.emit(enc_abc(Op::GetUpval, tmp, uv, 0));
+                        let dst = self.alloc_reg()?;
+                        self.unbox_into(dst, tmp)?;
+                        Ok(Expr2::reg(dst, line))
+                    } else {
+                        Ok(Expr2 { kind: ExprKind::Upval(uv), line })
+                    }
                 } else {
                     let ki = self.const_str(&id.name);
                     Ok(Expr2 { kind: ExprKind::Global(ki), line })
@@ -727,7 +1079,7 @@ impl FnComp {
                 Ok(Expr2::reg(dst, *line))
             }
             Expr::Function(body) => {
-                let outer = Some(OuterScope { locals: self.locals.clone(), upvals: self.upvals.clone() });
+                let outer = Some(self as *mut FnComp);
                 let proto = compile_fn(body, self.proto.source.clone(), outer)?;
                 let pi = self.proto.protos.len();
                 self.proto.protos.push(proto);
@@ -773,6 +1125,55 @@ impl FnComp {
                 let base = self.free_reg;
                 self.compile_method_call(m, base, 1)?;
                 Ok(Expr2::reg(base + 1, m.line))
+            }
+            Expr::Ternary { cond, then, else_, line } => {
+                self.line = *line;
+                let base = self.free_reg;
+                let ce = self.compile_expr(cond)?;
+                let cr = self.to_reg(ce, Some(base))?;
+                if self.free_reg <= cr { self.free_reg = cr + 1; }
+                self.emit(enc_abc(Op::Test, cr, 0, 0));
+                let else_jump = self.proto.emit_jump(*line);
+                self.free_reg_to(base);
+
+                let dst = base;
+                let te = self.compile_expr(then)?;
+                let tr = self.to_reg(te, Some(dst))?;
+                if tr != dst { self.emit_move(dst, tr); }
+                self.free_reg = dst + 1;
+                let end_jump = self.proto.emit_jump(*line);
+
+                self.proto.patch_jump_here(else_jump);
+                self.free_reg = dst;
+                let ee = self.compile_expr(else_)?;
+                let er = self.to_reg(ee, Some(dst))?;
+                if er != dst { self.emit_move(dst, er); }
+                self.free_reg = dst + 1;
+
+                self.proto.patch_jump_here(end_jump);
+                Ok(Expr2::reg(dst, *line))
+            }
+            Expr::IncrDecr { target, delta, prefix, line } => {
+                self.line = *line;
+                let base = self.free_reg;
+                let te = self.compile_expr(target)?;
+                let old_reg = self.to_reg(te, Some(base))?;
+                if self.free_reg <= old_reg { self.free_reg = old_reg + 1; }
+
+                let one = self.to_rk(Expr2 { kind: ExprKind::IntK(1), line: *line })?;
+                let new_reg = self.alloc_reg()?;
+                let vm_op = if *delta >= 0 { Op::Add } else { Op::Sub };
+                self.emit(enc_abc(vm_op, new_reg, old_reg, one as u8));
+
+                // Re-evaluates target's own subexpressions (e.g. an Index's key)
+                // a second time for the write-back — a double-evaluation that only
+                // matters if that subexpression has side effects, same simplification
+                // already accepted for compound assignment.
+                self.assign_target(target, new_reg)?;
+
+                let result_reg = if *prefix { new_reg } else { old_reg };
+                self.free_reg = new_reg + 1;
+                Ok(Expr2::reg(result_reg, *line))
             }
         }
     }
@@ -983,16 +1384,34 @@ impl FnComp {
     }
 }
 
-fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<OuterScope>) -> CResult<Proto> {
-    let mut fc = FnComp::new(source, outer);
+fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp>) -> CResult<Proto> {
+    let captured = collect_captured_names(body);
+    let mut fc = FnComp::new(source, outer, captured);
     fc.proto.params = body.params.len() as u8;
     fc.proto.is_vararg = body.vararg;
 
+    // Two passes: the calling convention places every argument into its
+    // register before the function body runs at all, so free_reg must
+    // reflect all of them before any box_in_place scratch allocation — boxing
+    // param i while param i+1's register is still "unclaimed" from the
+    // compiler's perspective would let the scratch table clobber param i+1's
+    // live incoming value.
+    let mut param_regs = Vec::with_capacity(body.params.len());
     for p in &body.params {
-        fc.push_local(p.clone(), true)?;
+        param_regs.push(fc.push_local(p.clone(), true)?);
+    }
+    for (p, r) in body.params.iter().zip(param_regs) {
+        if fc.captured.contains(p) { fc.box_in_place(r)?; }
     }
 
     fc.compile_block(&body.body)?;
+
+    for (name, jump_idx, line) in &fc.pending_gotos {
+        match fc.labels.get(name) {
+            Some(&target) => fc.proto.patch_jump(*jump_idx, target),
+            None => return Err(err(format!("no visible label '{name}' for goto"), *line)),
+        }
+    }
 
     fc.proto.upvals = fc.upvals.iter().map(|u| {
         crate::chunk::UpvalDesc { name: u.name.clone(), in_stack: u.in_stack, idx: u.outer_idx }
