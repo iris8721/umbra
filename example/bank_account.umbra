@@ -1,0 +1,64 @@
+let Account = {}
+Account.__index = Account
+
+fn Account.new(owner, balance) {
+    return setmetatable({owner = owner, balance = balance or 0, log = {}}, Account)
+}
+
+fn Account:deposit(amount) {
+    if amount <= 0 { error("deposit amount must be positive") }
+    self.balance = self.balance + amount
+    table.insert(self.log, "deposit ${amount}")
+}
+
+fn Account:withdraw(amount) {
+    if amount <= 0 { error("withdraw amount must be positive") }
+    if amount > self.balance { error("insufficient funds") }
+    self.balance = self.balance - amount
+    table.insert(self.log, "withdraw ${amount}")
+}
+
+fn Account:transfer(to, amount) {
+    self:withdraw(amount)
+    to:deposit(amount)
+    table.insert(self.log, "transfer ${amount} to ${to.owner}")
+}
+
+fn Account:statement() {
+    print("--- ${self.owner} ---")
+    for i, entry in ipairs(self.log) {
+        print("  ${entry}")
+    }
+    print(string.format("  balance: %.2f", self.balance))
+}
+
+let SavingsAccount = setmetatable({}, {__index = Account})
+SavingsAccount.__index = SavingsAccount
+
+fn SavingsAccount.new(owner, balance, rate) {
+    let acc = Account.new(owner, balance)
+    acc.rate = rate
+    return setmetatable(acc, SavingsAccount)
+}
+
+fn SavingsAccount:apply_interest() {
+    let interest = self.balance * self.rate
+    self:deposit(interest)
+    table.insert(self.log, "interest at ${self.rate * 100}%")
+}
+
+let alice = Account.new("Alice", 100)
+let bob = SavingsAccount.new("Bob", 500, 0.05)
+
+alice:deposit(50)
+alice:withdraw(30)
+alice:transfer(bob, 20)
+bob:apply_interest()
+
+alice:statement()
+bob:statement()
+
+let ok, err = pcall(fn() { alice:withdraw(10000) })
+if not ok {
+    print("transfer rejected: ${err}")
+}

@@ -1,0 +1,35 @@
+fn make_task(name, steps) {
+    return coroutine.create(fn() {
+        for i = 1, steps {
+            print("${name}: step ${i}/${steps}")
+            yield()
+        }
+        return "${name} done"
+    })
+}
+
+let tasks = {
+    {name = "download", co = make_task("download", 3)},
+    {name = "render",   co = make_task("render", 2)},
+    {name = "compress",  co = make_task("compress", 4)},
+}
+
+var remaining = #tasks
+while remaining > 0 {
+    for i, t in ipairs(tasks) {
+        if coroutine.status(t.co) == "suspended" {
+            let ok, result = coroutine.resume(t.co)
+            if not ok {
+                print("${t.name} failed: ${result}")
+                remaining = remaining - 1
+            } else {
+                switch coroutine.status(t.co) {
+                    case "dead" {
+                        print("${t.name}: ${result}")
+                        remaining = remaining - 1
+                    }
+                }
+            }
+        }
+    }
+}

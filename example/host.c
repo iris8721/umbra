@@ -37,7 +37,7 @@ static char *read_file(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    const char *path = argc > 1 ? argv[1] : "stdlib_demo.umbra";
+    const char *path = argc > 1 ? argv[1] : "word_count.umbra";
 
     char *src = read_file(path);
     if (!src) {

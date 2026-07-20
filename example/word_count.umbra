@@ -1,0 +1,39 @@
+let sample_path = "sample.txt"
+
+fn write_sample() {
+    let f <close> = io.open(sample_path, "w")
+    f:write("the quick brown fox jumps over the lazy dog\n")
+    f:write("the dog barks at the fox but the fox runs away\n")
+    f:write("the quick fox and the lazy dog become friends\n")
+}
+
+fn count_words(path) {
+    let counts = {}
+    let f <close> = io.open(path, "r")
+    for line in f:lines() {
+        for word in string.gmatch(line, "%a+") {
+            let w = string.lower(word)
+            counts[w] = (counts[w] or 0) + 1
+        }
+    }
+    return counts
+}
+
+write_sample()
+let counts = count_words(sample_path)
+
+let words = {}
+for word, n in pairs(counts) {
+    table.insert(words, {word = word, count = n})
+}
+table.sort(words, fn(a, b) {
+    if a.count != b.count { return a.count > b.count }
+    return a.word < b.word
+})
+
+print("top words in ${sample_path}:")
+let shown = math.min(5, #words)
+for i = 1, shown {
+    let entry = words[i]
+    print(string.format("  %-8s %d", entry.word, entry.count))
+}
