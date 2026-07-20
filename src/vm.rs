@@ -1334,6 +1334,35 @@ impl Vm {
             })
         });
 
+        // Deliberately real filesystem access — in tension with the sandboxing
+        // hardening done elsewhere in this VM (allocation caps, step budget),
+        // but consistent with the same call to add io/os. A host embedding
+        // this VM for untrusted scripts should not expose `require` to them.
+        self.set_global_cfn("require", |args| {
+            let name = str_arg(args, 0, "require")?.to_owned();
+            CURRENT_VM.with(|c| {
+                let vm_ptr = c.get();
+                if vm_ptr.is_null() { return Err(VmError::RuntimeError("no VM context".into())); }
+                let vm = unsafe { &mut *vm_ptr };
+                if let Some(&cached) = vm.loaded_modules.get(&name) {
+                    return Ok(vec![cached]);
+                }
+                let path = format!("{}.umbra", name.replace('.', "/"));
+                let src = std::fs::read_to_string(&path)
+                    .map_err(|e| VmError::RuntimeError(format!("require: cannot open '{path}': {e}")))?;
+                let (block, parse_errs) = crate::parse(&src);
+                if let Some(e) = parse_errs.first() {
+                    return Err(VmError::RuntimeError(format!("require: {path}: {e}")));
+                }
+                let proto = crate::compile(block, Some(path.clone()))
+                    .map_err(|e| VmError::RuntimeError(format!("require: {path}: {e}")))?;
+                let results = vm.exec_owned_isolated(proto)?;
+                let result = results.first().copied().unwrap_or(Value::bool(true));
+                vm.loaded_modules.insert(name, result);
+                Ok(vec![result])
+            })
+        });
+
         {
             let iter_val = self.make_cfn_val(|args| {
                 let tbl = args.first().copied().unwrap_or(Value::nil());
