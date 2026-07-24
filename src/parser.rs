@@ -173,6 +173,17 @@ impl<'src> Parser<'src> {
                     Err(e) => self.record(e),
                 }
                 let _ = self.eat(&TokenKind::Semicolon);
+                let at_end = if stop_at_brace {
+                    matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof)
+                } else {
+                    matches!(self.peek(), TokenKind::Eof)
+                };
+                if !at_end {
+                    self.record(ParseError::Expected {
+                        what: "end of block after 'return'",
+                        line: self.line(),
+                    });
+                }
                 break;
             }
 
@@ -189,7 +200,15 @@ impl<'src> Parser<'src> {
                     }
                     break;
                 }
-                Err(e) => { self.record(e); self.sync_to_stmt(); }
+                Err(e) => {
+                    self.record(e);
+                    // A stray `}`/`else` is a sync point sync_to_stmt won't
+                    // step over; skip it here or the loop never advances.
+                    let stray = matches!(self.peek(), TokenKind::Else)
+                        || (!stop_at_brace && matches!(self.peek(), TokenKind::RBrace));
+                    if stray { let _ = self.advance(); }
+                    self.sync_to_stmt();
+                }
             }
         }
         Block { stmts, ret, line }
@@ -597,10 +616,10 @@ impl<'src> Parser<'src> {
 
     fn unary_op(&self) -> Option<(Unop, u8)> {
         match self.peek() {
-            TokenKind::Minus => Some((Unop::Neg,  18)),
-            TokenKind::Not   => Some((Unop::Not,  18)),
-            TokenKind::Hash  => Some((Unop::Len,  18)),
-            TokenKind::Tilde => Some((Unop::BNot, 18)),
+            TokenKind::Minus => Some((Unop::Neg,  20)),
+            TokenKind::Not   => Some((Unop::Not,  20)),
+            TokenKind::Hash  => Some((Unop::Len,  20)),
+            TokenKind::Tilde => Some((Unop::BNot, 20)),
             _ => None,
         }
     }
@@ -616,18 +635,18 @@ impl<'src> Parser<'src> {
             TokenKind::BangEq  => Some((Binop::Ne,     5,  6)),
             TokenKind::Eq      => Some((Binop::Eq,     5,  6)),
             TokenKind::Pipe    => Some((Binop::BOr,    7,  8)),
-            TokenKind::Tilde   => Some((Binop::BXor,   7,  8)),
-            TokenKind::Amp     => Some((Binop::BAnd,   9, 10)),
-            TokenKind::LtLt    => Some((Binop::Shl,   11, 12)),
-            TokenKind::GtGt    => Some((Binop::Shr,   11, 12)),
-            TokenKind::DotDot  => Some((Binop::Concat, 14, 13)), // lbp > rbp: right-associative
-            TokenKind::Plus    => Some((Binop::Add,   15, 16)),
-            TokenKind::Minus   => Some((Binop::Sub,   15, 16)),
-            TokenKind::Star    => Some((Binop::Mul,   17, 18)),
-            TokenKind::Slash      => Some((Binop::Div,  17, 18)),
-            TokenKind::SlashSlash => Some((Binop::IDiv, 17, 18)),
-            TokenKind::Percent    => Some((Binop::Mod,  17, 18)),
-            TokenKind::Caret   => Some((Binop::Pow,   20, 19)), // lbp > rbp: right-associative
+            TokenKind::Tilde   => Some((Binop::BXor,   9, 10)),
+            TokenKind::Amp     => Some((Binop::BAnd,  11, 12)),
+            TokenKind::LtLt    => Some((Binop::Shl,   13, 14)),
+            TokenKind::GtGt    => Some((Binop::Shr,   13, 14)),
+            TokenKind::DotDot  => Some((Binop::Concat, 16, 15)), // lbp > rbp: right-associative
+            TokenKind::Plus    => Some((Binop::Add,   17, 18)),
+            TokenKind::Minus   => Some((Binop::Sub,   17, 18)),
+            TokenKind::Star    => Some((Binop::Mul,   19, 20)),
+            TokenKind::Slash      => Some((Binop::Div,  19, 20)),
+            TokenKind::SlashSlash => Some((Binop::IDiv, 19, 20)),
+            TokenKind::Percent    => Some((Binop::Mod,  19, 20)),
+            TokenKind::Caret   => Some((Binop::Pow,   22, 21)), // lbp > rbp: right-associative
             _ => None,
         }
     }

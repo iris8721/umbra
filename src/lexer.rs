@@ -161,7 +161,8 @@ impl<'src> Lexer<'src> {
         if self.src.get(i) == Some(&b'[') { level as i32 } else { -1 }
     }
 
-    fn read_long_string(&mut self, level: usize) -> String {
+    fn read_long_string(&mut self, level: usize) -> Result<String, LexError> {
+        let line = self.line;
         for _ in 0..level { self.advance(); }
         self.advance();
         if self.peek() == Some(b'\n') { self.advance(); }
@@ -172,7 +173,7 @@ impl<'src> Lexer<'src> {
         let mut out = Vec::new();
         loop {
             match self.advance() {
-                None => break,
+                None => return Err(LexError::UnterminatedString(line)),
                 Some(b']') => {
                     let mut eqs = Vec::new();
                     while self.peek() == Some(b'=') { eqs.push(b'='); self.advance(); }
@@ -186,7 +187,7 @@ impl<'src> Lexer<'src> {
                 Some(b) => out.push(b),
             }
         }
-        String::from_utf8_lossy(&out).into_owned()
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
     // Consumes up to (and including) the '}' that closes a ${...} embedded
@@ -294,7 +295,7 @@ impl<'src> Lexer<'src> {
                 .map(TokenKind::Int)
                 .map_err(|_| LexError::BadNumber(line));
         }
-        let mut is_float = false;
+        let mut is_float = first == b'.';
         while matches!(self.peek(), Some(b'0'..=b'9' | b'_')) { self.advance(); }
         if self.peek() == Some(b'.') && matches!(self.peek2(), Some(b'0'..=b'9')) {
             is_float = true;
@@ -367,7 +368,7 @@ impl<'src> Lexer<'src> {
                     else if self.eat(b'=') { TokenKind::DotDotEq }
                     else { TokenKind::DotDot }
                 } else if matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.read_number(b'0')?
+                    self.read_number(b'.')?
                 } else {
                     TokenKind::Dot
                 }
@@ -375,7 +376,7 @@ impl<'src> Lexer<'src> {
             b'[' => {
                 let level = self.count_long_bracket();
                 if level >= 0 {
-                    TokenKind::String(self.read_long_string(level as usize))
+                    TokenKind::String(self.read_long_string(level as usize)?)
                 } else {
                     TokenKind::LBracket
                 }
