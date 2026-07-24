@@ -50,8 +50,21 @@ fn read_required_size(fmt: &[u8], i: &mut usize, opt: char) -> Result<usize, Str
         .map_err(|_| format!("string.pack: bad size for '{opt}'"))
 }
 
-fn push_int_bytes(out: &mut Vec<u8>, n: i64, size: usize, little: bool) -> Result<(), String> {
+fn push_int_bytes(out: &mut Vec<u8>, n: i64, size: usize, signed: bool, little: bool) -> Result<(), String> {
     if size == 0 || size > 8 { return Err(format!("string.pack: unsupported integer size {size}")); }
+    if size < 8 {
+        let bits = size as u32 * 8;
+        let in_range = if signed {
+            n >= -(1i64 << (bits - 1)) && n < (1i64 << (bits - 1))
+        } else {
+            n >= 0 && n < (1i64 << bits)
+        };
+        if !in_range {
+            return Err(format!("string.pack: integer overflow for {}-byte {}", size, if signed { "signed" } else { "unsigned" }));
+        }
+    } else if !signed && n < 0 {
+        return Err("string.pack: unsigned overflow".into());
+    }
     let full = n.to_le_bytes();
     if little {
         out.extend_from_slice(&full[..size]);
@@ -84,13 +97,13 @@ pub fn pack(fmt: &str, args: &[PackValue]) -> Result<Vec<u8>, String> {
             b'>' => little = false,
             b'=' => little = true,
             b'!' => { while i < f.len() && f[i].is_ascii_digit() { i += 1; } }
-            b'b' | b'B' => push_int_bytes(&mut out, as_int(next_arg!())?, 1, little)?,
-            b'h' | b'H' => push_int_bytes(&mut out, as_int(next_arg!())?, 2, little)?,
+            b'b' | b'B' => push_int_bytes(&mut out, as_int(next_arg!())?, 1, c == b'b', little)?,
+            b'h' | b'H' => push_int_bytes(&mut out, as_int(next_arg!())?, 2, c == b'h', little)?,
             b'i' | b'I' => {
                 let size = read_size(f, &mut i, 4);
-                push_int_bytes(&mut out, as_int(next_arg!())?, size, little)?;
+                push_int_bytes(&mut out, as_int(next_arg!())?, size, c == b'i', little)?;
             }
-            b'l' | b'L' => push_int_bytes(&mut out, as_int(next_arg!())?, 8, little)?,
+            b'l' | b'L' => push_int_bytes(&mut out, as_int(next_arg!())?, 8, c == b'l', little)?,
             b'f' => {
                 let v = as_float(next_arg!())? as f32;
                 out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
@@ -101,6 +114,7 @@ pub fn pack(fmt: &str, args: &[PackValue]) -> Result<Vec<u8>, String> {
             }
             b'c' => {
                 let n = read_required_size(f, &mut i, 'c')?;
+                if n > crate::vm::MAX_ALLOC_LEN { return Err(format!("string.pack: 'c{n}' too large")); }
                 let s = as_bytes(next_arg!())?;
                 if s.len() > n { return Err(format!("string.pack: string longer than 'c{n}'")); }
                 out.extend_from_slice(s);
@@ -109,7 +123,7 @@ pub fn pack(fmt: &str, args: &[PackValue]) -> Result<Vec<u8>, String> {
             b's' => {
                 let size = read_size(f, &mut i, 8);
                 let s = as_bytes(next_arg!())?.to_vec();
-                push_int_bytes(&mut out, s.len() as i64, size, little)?;
+                push_int_bytes(&mut out, s.len() as i64, size, false, little)?;
                 out.extend_from_slice(&s);
             }
             b'x' => out.push(0),
