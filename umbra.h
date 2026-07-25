@@ -33,7 +33,7 @@ void umbra_pushinteger(umbra_State *U, int64_t n);
 void umbra_pushboolean(umbra_State *U, int b);
 void umbra_pushstring(umbra_State *U, const char *s);
 
-/** Returns: 0=nil 1=boolean 2=integer 3=float 4=string 5=table 6=function */
+/** Returns: 0=nil 1=boolean 2=integer 3=float 4=string 5=table 6=function 7=coroutine */
 int umbra_type(const umbra_State *U, int idx);
 int umbra_isnumber(const umbra_State *U, int idx);
 int umbra_isstring(const umbra_State *U, int idx);
