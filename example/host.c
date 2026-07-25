@@ -25,13 +25,14 @@ static int fn_print(umbra_State *U) {
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long sz = ftell(f);
+    if (sz < 0) { fclose(f); return NULL; }
     rewind(f);
-    char *buf = malloc(sz + 1);
+    char *buf = malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, sz, f);
-    buf[sz] = '\0';
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    buf[n] = '\0';
     fclose(f);
     return buf;
 }
@@ -49,7 +50,8 @@ int main(int argc, char **argv) {
     umbra_register(U, "print", fn_print);
 
     if (umbra_dostring(U, src) != UMBRA_OK) {
-        fprintf(stderr, "error: %s\n", umbra_tostring(U, -1));
+        const char *msg = umbra_tostring(U, -1);
+        fprintf(stderr, "error: %s\n", msg ? msg : "(no message)");
         free(src);
         umbra_close(U);
         return 1;
