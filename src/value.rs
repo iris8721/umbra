@@ -7,8 +7,8 @@
 ///   [47..0]                      payload         (48 bits)
 ///
 /// Floats that are not NaN pass through bit-for-bit unchanged.
-/// All heap pointers from Rust's allocator live in user-space
-/// (bit 47 = 0), so they fit cleanly in 48 bits with no masking loss.
+/// Heap pointers are assumed to fit in 48 bits (a 4-level paging user-space
+/// address; bit 47 is used to tag C functions, see Vm::make_cfn_val).
 /// Integers outside INLINE_INT_MIN..=INLINE_INT_MAX don't fit the 48-bit
 /// payload; those are heap-boxed as a plain i64 under TAG_BIGINT instead
 /// (see Vm::make_int), so the full i64 range round-trips correctly.
@@ -234,18 +234,28 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self.is_int_like(), other.is_int_like(), self.is_float(), other.is_float()) {
             (true, true, _, _) => self.as_int().unwrap() == other.as_int().unwrap(),
-            (true, false, _, true) => {
-                let n = self.as_int().unwrap();
-                let f = other.as_float().unwrap();
-                (n as f64) == f && f as i64 == n
-            }
-            (false, true, true, _) => {
-                let f = self.as_float().unwrap();
-                let n = other.as_int().unwrap();
-                (n as f64) == f && f as i64 == n
-            }
+            (true, false, _, true) =>
+                cmp_int_float(self.as_int().unwrap(), other.as_float().unwrap()) == Some(Ordering::Equal),
+            (false, true, true, _) =>
+                cmp_int_float(other.as_int().unwrap(), self.as_float().unwrap()) == Some(Ordering::Equal),
+            (false, false, true, true) => self.as_float().unwrap() == other.as_float().unwrap(),
             _ => self.0 == other.0,
         }
+    }
+}
+
+use std::cmp::Ordering;
+
+// Exact ordering of an i64 against an f64, without rounding the integer
+// through f64 first (which would make i64::MAX == 2^63).
+pub fn cmp_int_float(i: i64, f: f64) -> Option<Ordering> {
+    if f.is_nan() { return None; }
+    if f >= 9223372036854775808.0 { return Some(Ordering::Less); }
+    if f < -9223372036854775808.0 { return Some(Ordering::Greater); }
+    let fl = f.floor() as i64;
+    match i.cmp(&fl) {
+        Ordering::Equal => Some(if f > fl as f64 { Ordering::Less } else { Ordering::Equal }),
+        ord => Some(ord),
     }
 }
 

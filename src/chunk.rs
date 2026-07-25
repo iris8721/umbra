@@ -57,7 +57,6 @@ pub enum Op {
     SetGlobal,
 
     Call,
-    TailCall,
     Return,
 
     ForPrep,
@@ -68,8 +67,6 @@ pub enum Op {
 
     Closure,
     Vararg,
-
-    Yield,
 
     GetUpval,
     SetUpval,

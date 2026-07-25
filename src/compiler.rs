@@ -1,6 +1,12 @@
 use crate::ast::*;
 use crate::chunk::{Const, Op, Proto, RK_BIT, enc_abc, enc_abx, enc_asbx, iop};
 const BIAS: i32 = crate::chunk::BIAS;
+// Register operands share an 8-bit field with RK constants (bit 7 set), so
+// both registers and RK-encodable constants are limited to 0..128.
+const MAX_REGS: u8 = 128;
+const MAX_RK_CONSTS: usize = 128;
+// Call/Return operand meaning "as many results as the callee produced".
+const MULTRET: u8 = 255;
 
 #[derive(Debug, Clone)]
 pub struct CompileError {
@@ -179,6 +185,7 @@ struct UpvalInfo {
 struct LoopScope {
     break_jumps: Vec<usize>,
     continue_jumps: Vec<usize>,
+    locals_top: usize,
 }
 
 struct FnComp {
@@ -194,8 +201,10 @@ struct FnComp {
     free_reg: u8,
     loops: Vec<LoopScope>,
     line: u32,
-    labels: std::collections::HashMap<String, usize>,
-    pending_gotos: Vec<(String, usize, u32)>,
+    // Label -> (pc, active local count); gotos record their own local count
+    // so a jump into a later local's scope can be rejected.
+    labels: std::collections::HashMap<String, (usize, usize)>,
+    pending_gotos: Vec<(String, usize, u32, usize)>,
     // Names any nested closure in this function references — see
     // collect_captured_names. Consulted when a local/param is declared to
     // decide whether it needs boxing.
@@ -216,31 +225,42 @@ impl FnComp {
 
     fn alloc_reg(&mut self) -> CResult<u8> {
         let r = self.free_reg;
-        self.free_reg += 1;
-        if self.free_reg > self.proto.max_regs {
-            self.proto.max_regs = self.free_reg;
-        }
-        if self.free_reg == 0 {
-            return Err(err("too many registers", self.line));
-        }
+        self.reserve(r as usize + 1)?;
+        self.free_reg = r + 1;
         Ok(r)
+    }
+
+    // Registers written by hint (to_reg with Some(dst), call results, arg
+    // slots) never go through alloc_reg, so max_regs is bumped here instead;
+    // the VM's GC root scan trusts max_regs to cover every live register.
+    fn reserve(&mut self, top: usize) -> CResult<()> {
+        if top > MAX_REGS as usize {
+            return Err(err("function needs too many registers", self.line));
+        }
+        if self.proto.max_regs < top as u8 { self.proto.max_regs = top as u8; }
+        Ok(())
     }
 
     fn free_reg_to(&mut self, base: u8) {
         self.free_reg = base;
     }
 
-    #[allow(dead_code)]
-    fn top(&self) -> u8 { self.free_reg }
-
     fn const_str(&mut self, s: &str) -> usize { self.proto.add_string(s) }
 
     fn const_val(&mut self, c: Const) -> usize { self.proto.add_const(c) }
 
+    // Constants past the RK range are loaded into a fresh register instead;
+    // the register stays reserved until the caller resets free_reg.
     fn rk_const(&mut self, c: Const) -> CResult<usize> {
         let idx = self.const_val(c);
-        if idx < 256 { Ok(idx | RK_BIT) }
-        else { Err(err("too many constants", self.line)) }
+        if idx < MAX_RK_CONSTS { return Ok(idx | RK_BIT); }
+        let r = self.alloc_reg()?;
+        self.emit(enc_abx(Op::LoadK, r, idx as u16));
+        Ok(r as usize)
+    }
+
+    fn rk_str(&mut self, s: &str) -> CResult<u8> {
+        Ok(self.rk_const(Const::Str(s.to_owned()))? as u8)
     }
 
     // Returns (register, boxed).
@@ -288,36 +308,40 @@ impl FnComp {
         self.free_reg = new_free;
     }
 
-    // Emits `local:close()` calls (LIFO) for any <close> locals in
-    // locals[from_top..], meant to run right before a block's locals are
-    // truncated at from_top. Covers only the natural (fall-through) end of
-    // the scope a <close> local was declared in — break/continue/return (or
-    // an error) all skip these calls, since (unlike real Lua's __close)
-    // there's no unwind-time hook to catch those exits here.
+    // Emits `local:close()` calls (LIFO) for the <close> locals in
+    // locals[from_top..]. Called at a scope's fall-through end and before
+    // break/continue/return; an error unwinding through the scope skips it,
+    // since there's no unwind-time hook here (unlike real Lua's __close).
     fn emit_closes(&mut self, from_top: usize) -> CResult<()> {
         let closers: Vec<(u8, bool)> = self.locals[from_top..].iter()
             .filter(|l| l.close)
             .map(|l| (l.reg, l.boxed))
             .collect();
+        let saved_free = self.free_reg;
         for (reg, boxed) in closers.into_iter().rev() {
             // A <close> local that's also captured by a nested closure holds
             // a box (see the `boxed` field), not the resource itself — unbox
             // first so `close` is looked up on the real value.
             let value_reg = if boxed {
-                let dst = self.free_reg;
+                let dst = self.alloc_reg()?;
                 self.unbox_into(dst, reg)?;
                 dst
             } else {
                 reg
             };
-            let fn_reg = self.free_reg.max(value_reg + 1);
-            let fki = (self.const_str("close") | RK_BIT) as u8;
+            let fki = self.rk_str("close")?;
+            let fn_reg = self.alloc_reg()?;
+            self.reserve(fn_reg as usize + 2)?;
             self.emit(enc_abc(Op::GetTable, fn_reg, value_reg, fki));
             self.emit_move(fn_reg + 1, value_reg);
             self.emit(enc_abc(Op::Call, fn_reg, 2, 1));
-            if self.proto.max_regs < fn_reg + 2 { self.proto.max_regs = fn_reg + 2; }
+            self.free_reg = saved_free;
         }
         Ok(())
+    }
+
+    fn has_closes(&self, from_top: usize) -> bool {
+        self.locals[from_top..].iter().any(|l| l.close)
     }
 
     // Returns (upvalue index, boxed). Recurses through the *live* chain of
@@ -354,6 +378,7 @@ impl FnComp {
 
     fn to_reg(&mut self, e: Expr2, hint: Option<u8>) -> CResult<u8> {
         let dst = hint.unwrap_or_else(|| self.free_reg);
+        self.reserve(dst as usize + 1)?;
         match e.kind {
             ExprKind::Reg(r) => {
                 if let Some(h) = hint {
@@ -423,7 +448,7 @@ impl FnComp {
             ExprKind::False    => self.rk_const(Const::Bool(false)),
             ExprKind::IntK(n)  => self.rk_const(Const::Int(n)),
             ExprKind::FloatK(f)=> self.rk_const(Const::Float(f)),
-            ExprKind::K(i)     => Ok(i | RK_BIT),
+            ExprKind::K(i)     => if i < MAX_RK_CONSTS { Ok(i | RK_BIT) } else { Ok(self.to_reg(e, None)? as usize) },
             ExprKind::Reg(r)   => Ok(r as usize),
             ExprKind::Upval(_) => {
                 let r = self.to_reg(e, None)?;
@@ -443,9 +468,6 @@ impl FnComp {
             self.compile_stmt(stmt)?;
         }
         if let Some(ret) = &block.ret {
-            // Op::Return exits the function right here, so any close calls
-            // emitted after it would be unreachable bytecode — a `return` at
-            // the tail of a scope skips <close> cleanup, same as break/continue.
             self.compile_return(ret, block.line)?;
         } else {
             self.emit_closes(locals_top)?;
@@ -455,28 +477,44 @@ impl FnComp {
         Ok(())
     }
 
+    // A trailing call or `...` returns all its values (Return b=0). With
+    // <close> locals pending the close calls need scratch registers above the
+    // return values, which a variable-length tail can't guarantee, so a
+    // trailing call is then truncated to one result and `...` is expanded
+    // only after the closes have run.
     fn compile_return(&mut self, vals: &[Expr], line: u32) -> CResult<()> {
         self.line = line;
+        let closes = self.has_closes(0);
         if vals.is_empty() {
+            if closes { self.emit_closes(0)?; }
             self.emit(enc_abc(Op::Return, 0, 1, 0));
             return Ok(());
         }
         let base = self.free_reg;
         let n = vals.len();
-        let last_is_vararg = matches!(vals[n - 1], Expr::Vararg(_));
-        let fixed = if last_is_vararg { n - 1 } else { n };
+        let tail_vararg = matches!(vals[n - 1], Expr::Vararg(_));
+        let tail_call = !closes && matches!(vals[n - 1], Expr::Call(_) | Expr::MethodCall(_));
+        let fixed = if tail_vararg || tail_call { n - 1 } else { n };
         for (i, v) in vals[..fixed].iter().enumerate() {
             let dst = base + i as u8;
             let e = self.compile_expr(v)?;
             self.to_reg(e, Some(dst))?;
-            if self.free_reg <= dst { self.free_reg = dst + 1; }
+            self.free_reg = dst + 1;
         }
-        if last_is_vararg {
+        if tail_vararg {
+            if closes { self.emit_closes(0)?; }
             self.emit(enc_abc(Op::Vararg, base + fixed as u8, 0, 0));
             self.emit(enc_abc(Op::Return, base, 0, 0));
+        } else if tail_call {
+            match &vals[n - 1] {
+                Expr::Call(c) => self.compile_call(c, base + fixed as u8, MULTRET)?,
+                Expr::MethodCall(m) => self.compile_method_call(m, base + fixed as u8, MULTRET)?,
+                _ => unreachable!(),
+            }
+            self.emit(enc_abc(Op::Return, base, 0, 0));
         } else {
-            let nv = self.free_reg - base;
-            self.emit(enc_abc(Op::Return, base, nv + 1, 0));
+            if closes { self.emit_closes(0)?; }
+            self.emit(enc_abc(Op::Return, base, n as u8 + 1, 0));
         }
         Ok(())
     }
@@ -527,7 +565,7 @@ impl FnComp {
                     self.locals.push(Local { name: name.clone(), reg: base + i as u8, mutable: *mutable, close: closes[i], boxed });
                 }
                 if self.free_reg < base + nn as u8 { self.free_reg = base + nn as u8; }
-                if self.proto.max_regs < self.free_reg { self.proto.max_regs = self.free_reg; }
+                self.reserve(self.free_reg as usize)?;
                 for (i, name) in names.iter().enumerate() {
                     if self.captured.contains(name) { self.box_in_place(base + i as u8)?; }
                 }
@@ -539,7 +577,7 @@ impl FnComp {
                 let vr = self.to_reg(ve, None)?;
                 for name in fields {
                     let dst = self.alloc_reg()?;
-                    let fki = (self.const_str(name) | RK_BIT) as u8;
+                    let fki = self.rk_str(name)?;
                     self.emit(enc_abc(Op::GetTable, dst, vr, fki));
                     let boxed = self.captured.contains(name);
                     self.locals.push(Local { name: name.clone(), reg: dst, mutable: *mutable, close: false, boxed });
@@ -586,6 +624,7 @@ impl FnComp {
                     if self.free_reg <= dst { self.free_reg = dst + 1; }
                     self.emit_load_nil(dst);
                 }
+                self.reserve(self.free_reg as usize)?;
                 for (i, tgt) in targets.iter().enumerate() {
                     self.assign_target(tgt, tmp_base + i as u8)?;
                 }
@@ -607,7 +646,7 @@ impl FnComp {
                 let exit_jump = self.proto.emit_jump(*line);
                 self.free_reg_to(cond_reg);
 
-                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new() });
+                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
                 self.compile_block(body)?;
                 let scope = self.loops.pop().unwrap();
 
@@ -629,7 +668,7 @@ impl FnComp {
                 self.line = *line;
                 let loop_top = self.pc();
                 let reg_top = self.free_reg;
-                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new() });
+                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
                 let locals_top = self.locals_top();
                 for stmt in &body.stmts { self.compile_stmt(stmt)?; }
                 if let Some(r) = &body.ret { self.compile_return(r, body.line)?; }
@@ -718,7 +757,7 @@ impl FnComp {
                 self.locals.push(Local { name: var.clone(), reg: lv_reg, mutable: true, close: false, boxed: false });
                 let locals_save = self.locals.len() - 1;
 
-                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new() });
+                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
                 let inner_locals = self.locals_top();
                 for stmt in &body.stmts {
                     self.compile_stmt(stmt)?;
@@ -755,23 +794,11 @@ impl FnComp {
                 for _ in 0..(4 + vars.len()) { self.alloc_reg()?; }
 
                 if iters.len() == 1 {
-                    let it0 = iters[0].clone();
-                    match it0 {
-                        Expr::Call(ref c) => { self.compile_call(c, base, 3)?; }
-                        Expr::MethodCall(ref m) => {
-                            // compile_method_call writes the receiver at its own `base`
-                            // and results starting at `base+1` (see its Expr::MethodCall
-                            // callsite), unlike compile_call which writes results at
-                            // `base` itself — so give it a scratch base past our
-                            // reserved iter/state/control block and move them down.
-                            let call_base = self.alloc_reg()?;
-                            self.compile_method_call(m, call_base, 3)?;
-                            self.emit_move(base, call_base + 1);
-                            self.emit_move(base + 1, call_base + 2);
-                            self.emit_move(base + 2, call_base + 3);
-                        }
-                        _ => {
-                            let e = self.compile_expr(&it0)?;
+                    match &iters[0] {
+                        Expr::Call(c) => { self.compile_call(c, base, 3)?; }
+                        Expr::MethodCall(m) => { self.compile_method_call(m, base, 3)?; }
+                        it0 => {
+                            let e = self.compile_expr(it0)?;
                             self.to_reg(e, Some(base))?;
                             self.emit_load_nil(base + 1);
                             self.emit_load_nil(base + 2);
@@ -797,7 +824,7 @@ impl FnComp {
                     self.locals.push(Local { name: v.clone(), reg: base + 4 + i as u8, mutable: true, close: false, boxed: false });
                 }
 
-                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new() });
+                self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
                 let inner_locals = self.locals_top();
                 for s in &body.stmts { self.compile_stmt(s)?; }
                 if let Some(r) = &body.ret { self.compile_return(r, body.line)?; } else { self.emit_closes(inner_locals)?; }
@@ -846,15 +873,15 @@ impl FnComp {
                     let mut cur = base_r;
                     let field_end = if name.method.is_some() { nparts } else { nparts - 1 };
                     for p in &name.parts[1..field_end] {
-                        let fki = self.const_str(p) | RK_BIT;
+                        let fki = self.rk_str(p)?;
                         let next = self.alloc_reg()?;
-                        self.emit(enc_abc(Op::GetTable, next, cur, fki as u8));
+                        self.emit(enc_abc(Op::GetTable, next, cur, fki));
                         cur = next;
                     }
                     let last_key = name.method.as_deref()
                         .unwrap_or_else(|| name.parts.last().unwrap());
-                    let lki = self.const_str(last_key) | RK_BIT;
-                    self.emit(enc_abc(Op::SetTable, cur, lki as u8, dst));
+                    let lki = self.rk_str(last_key)?;
+                    self.emit(enc_abc(Op::SetTable, cur, lki, dst));
                     self.free_reg_to(base_r);
                 }
                 self.free_reg_to(dst);
@@ -910,35 +937,29 @@ impl FnComp {
                 self.free_reg_to(base);
             }
 
-            Stmt::Break(line) => {
+            Stmt::Break(line) | Stmt::Continue(line) => {
                 self.line = *line;
+                let is_break = matches!(stmt, Stmt::Break(_));
+                let locals_top = match self.loops.last() {
+                    Some(scope) => scope.locals_top,
+                    None => return Err(err(if is_break { "'break' outside loop" } else { "'continue' outside loop" }, *line)),
+                };
+                self.emit_closes(locals_top)?;
                 let j = self.proto.emit_jump(*line);
-                if let Some(scope) = self.loops.last_mut() {
-                    scope.break_jumps.push(j);
-                } else {
-                    return Err(err("'break' outside loop", *line));
-                }
-            }
-            Stmt::Continue(line) => {
-                self.line = *line;
-                let j = self.proto.emit_jump(*line);
-                if let Some(scope) = self.loops.last_mut() {
-                    scope.continue_jumps.push(j);
-                } else {
-                    return Err(err("'continue' outside loop", *line));
-                }
+                let scope = self.loops.last_mut().unwrap();
+                if is_break { scope.break_jumps.push(j); } else { scope.continue_jumps.push(j); }
             }
             Stmt::Goto(name, line) => {
                 self.line = *line;
                 let j = self.proto.emit_jump(*line);
-                self.pending_gotos.push((name.clone(), j, *line));
+                self.pending_gotos.push((name.clone(), j, *line, self.locals_top()));
             }
             Stmt::Label(name, line) => {
                 self.line = *line;
                 if self.labels.contains_key(name) {
                     return Err(err(format!("label '{name}' already defined in this function"), *line));
                 }
-                self.labels.insert(name.clone(), self.pc());
+                self.labels.insert(name.clone(), (self.pc(), self.locals_top()));
             }
         }
         Ok(())
@@ -976,22 +997,22 @@ impl FnComp {
             }
             Expr::Field { table, field, line } => {
                 self.line = *line;
+                let reg_top = self.free_reg;
                 let te = self.compile_expr(table)?;
                 let tr = self.to_reg(te, None)?;
-                let fki = (self.const_str(field) | RK_BIT) as u8;
+                let fki = self.rk_str(field)?;
                 self.emit(enc_abc(Op::SetTable, tr, fki, src));
-                if !matches!(te.kind, ExprKind::Reg(_)) {
-                    self.free_reg -= 1;
-                }
+                self.free_reg_to(reg_top);
             }
             Expr::Index { table, key, line } => {
                 self.line = *line;
+                let reg_top = self.free_reg;
                 let te = self.compile_expr(table)?;
                 let tr = self.to_reg(te, None)?;
                 let ke = self.compile_expr(key)?;
                 let kr = self.to_rk(ke)?;
                 self.emit(enc_abc(Op::SetTable, tr, kr as u8, src));
-                self.free_reg_to(tr + 1);
+                self.free_reg_to(reg_top);
             }
             other => return Err(err("invalid assignment target", other.line())),
         }
@@ -1092,7 +1113,7 @@ impl FnComp {
                 self.line = *line;
                 let te = self.compile_expr(table)?;
                 let tr = self.to_reg(te, None)?;
-                let fki = (self.const_str(field) | RK_BIT) as u8;
+                let fki = self.rk_str(field)?;
                 let dst = self.alloc_reg()?;
                 self.emit(enc_abc(Op::GetTable, dst, tr, fki));
                 if !matches!(te.kind, ExprKind::Reg(_)) {
@@ -1124,7 +1145,7 @@ impl FnComp {
                 self.line = m.line;
                 let base = self.free_reg;
                 self.compile_method_call(m, base, 1)?;
-                Ok(Expr2::reg(base + 1, m.line))
+                Ok(Expr2::reg(base, m.line))
             }
             Expr::Ternary { cond, then, else_, line } => {
                 self.line = *line;
@@ -1272,12 +1293,16 @@ impl FnComp {
 
         let mut arr_idx: usize = 0;
         let field_base = self.free_reg;
+        let nfields = tc.fields.len();
+        // Like Lua, `...` or a call as the very last field contributes every
+        // value it produces (SetList b=0 reads up to frame.top).
+        let mut open_tail = false;
 
-        for field in &tc.fields {
+        for (fi, field) in tc.fields.iter().enumerate() {
             match field {
                 TableField::Named { key, val, line } => {
                     self.line = *line;
-                    let fki = (self.const_str(key) | RK_BIT) as u8;
+                    let fki = self.rk_str(key)?;
                     let ve = self.compile_expr(val)?;
                     let vr = self.to_rk(ve)?;
                     self.emit(enc_abc(Op::SetTable, dst, fki, vr as u8));
@@ -1291,21 +1316,36 @@ impl FnComp {
                 }
                 TableField::Positional(val) => {
                     arr_idx += 1;
-                    let slot = field_base + (arr_idx - 1) as u8;
-                    let ve = self.compile_expr(val)?;
-                    self.to_reg(ve, Some(slot))?;
-                    if self.free_reg <= slot { self.free_reg = slot + 1; }
-                    if arr_idx % 50 == 0 {
-                        let b = 50u8;
+                    let slot = field_base + ((arr_idx - 1) % 50) as u8;
+                    let is_last = fi + 1 == nfields;
+                    match val {
+                        Expr::Vararg(_) if is_last => {
+                            self.reserve(slot as usize + 1)?;
+                            self.emit(enc_abc(Op::Vararg, slot, 0, 0));
+                            open_tail = true;
+                        }
+                        Expr::Call(c) if is_last => { self.compile_call(c, slot, MULTRET)?; open_tail = true; }
+                        Expr::MethodCall(m) if is_last => { self.compile_method_call(m, slot, MULTRET)?; open_tail = true; }
+                        _ => {
+                            let ve = self.compile_expr(val)?;
+                            self.to_reg(ve, Some(slot))?;
+                            self.free_reg = slot + 1;
+                        }
+                    }
+                    if !open_tail && arr_idx % 50 == 0 {
                         let c = (arr_idx / 50) as u8;
-                        self.emit(enc_abc(Op::SetList, dst, b, c));
+                        self.emit(enc_abc(Op::SetList, dst, 50, c));
                         self.free_reg_to(field_base);
                     }
                 }
             }
         }
         let rem = arr_idx % 50;
-        if rem > 0 {
+        if open_tail {
+            let c = ((arr_idx - 1) / 50 + 1) as u8;
+            self.emit(enc_abc(Op::SetList, dst, 0, c));
+            self.free_reg_to(field_base);
+        } else if rem > 0 {
             let c = (arr_idx / 50 + 1) as u8;
             self.emit(enc_abc(Op::SetList, dst, rem as u8, c));
             self.free_reg_to(field_base);
@@ -1314,6 +1354,7 @@ impl FnComp {
         Ok(Expr2::reg(dst, tc.line))
     }
 
+    // Callee at `base`, args above it, results land back at `base`.
     fn compile_call(&mut self, c: &CallExpr, base: u8, nresults: u8) -> CResult<()> {
         let ce = self.compile_expr(&c.callee)?;
         self.to_reg(ce, Some(base))?;
@@ -1321,55 +1362,65 @@ impl FnComp {
 
         let (nargs, is_variable) = self.push_args(&c.args, base + 1)?;
         let b = if is_variable { 0 } else { nargs + 1 };
-        let cr = nresults + 1;
-        self.emit(enc_abc(Op::Call, base, b, cr));
-        self.free_reg = base + nresults as u8;
-        Ok(())
+        self.emit_call(base, b, nresults)
     }
 
+    // Method at `base`, receiver at `base+1` (the implicit first arg), so the
+    // results land at `base` exactly like compile_call.
     fn compile_method_call(&mut self, m: &MethodCallExpr, base: u8, nresults: u8) -> CResult<()> {
         let re = self.compile_expr(&m.receiver)?;
-        self.to_reg(re, Some(base))?;
-        self.free_reg = base + 1;
+        self.to_reg(re, Some(base + 1))?;
+        self.free_reg = base + 2;
 
-        let fn_reg = self.alloc_reg()?;
-        let fki = (self.const_str(&m.method) | RK_BIT) as u8;
-        self.emit(enc_abc(Op::GetTable, fn_reg, base, fki));
-        let self_reg = self.alloc_reg()?;
-        self.emit_move(self_reg, base);
-        let (nargs, is_variable) = self.push_args(&m.args, base + 3)?;
+        let fki = self.rk_str(&m.method)?;
+        self.emit(enc_abc(Op::GetTable, base, base + 1, fki));
+        let (nargs, is_variable) = self.push_args(&m.args, base + 2)?;
         let b = if is_variable { 0 } else { nargs + 2 };
-        let cr = nresults + 1;
-        self.emit(enc_abc(Op::Call, fn_reg, b, cr));
-        self.free_reg = base + nresults as u8;
+        self.emit_call(base, b, nresults)
+    }
+
+    fn emit_call(&mut self, base: u8, b: u8, nresults: u8) -> CResult<()> {
+        if nresults == MULTRET {
+            self.emit(enc_abc(Op::Call, base, b, 0));
+            self.free_reg = base + 1;
+        } else {
+            self.reserve(base as usize + nresults as usize)?;
+            self.emit(enc_abc(Op::Call, base, b, nresults + 1));
+            self.free_reg = base + nresults;
+        }
         Ok(())
     }
 
-    // `is_variable` means the last argument was `...`; the VM reads frame.top
-    // (set by the preceding Vararg b=0) to get the real arg count at b=0.
+    // `is_variable` means the last argument was `...` or a call: the VM then
+    // reads frame.top (set by Vararg b=0 / Call c=0) for the real arg count.
     fn push_args(&mut self, args: &Args, arg_base: u8) -> CResult<(u8, bool)> {
         self.free_reg = arg_base;
         match args {
             Args::Exprs(exprs) => {
                 let n = exprs.len();
                 if n == 0 { return Ok((0, false)); }
-                let last_is_vararg = matches!(exprs[n - 1], Expr::Vararg(_));
-                let fixed = if last_is_vararg { n - 1 } else { n };
+                if n > MAX_REGS as usize { return Err(err("too many arguments", self.line)); }
+                let variable = matches!(exprs[n - 1], Expr::Vararg(_) | Expr::Call(_) | Expr::MethodCall(_));
+                let fixed = if variable { n - 1 } else { n };
                 for (i, e) in exprs[..fixed].iter().enumerate() {
                     let slot = arg_base + i as u8;
                     let ev = self.compile_expr(e)?;
                     self.to_reg(ev, Some(slot))?;
-                    if self.free_reg <= slot { self.free_reg = slot + 1; }
+                    self.free_reg = slot + 1;
                 }
-                if last_is_vararg {
-                    self.emit(enc_abc(Op::Vararg, arg_base + fixed as u8, 0, 0));
-                    Ok((fixed as u8, true))
-                } else {
-                    Ok((n as u8, false))
+                if !variable { return Ok((n as u8, false)); }
+                let slot = arg_base + fixed as u8;
+                match &exprs[n - 1] {
+                    Expr::Vararg(_) => { self.emit(enc_abc(Op::Vararg, slot, 0, 0)); }
+                    Expr::Call(c) => self.compile_call(c, slot, MULTRET)?,
+                    Expr::MethodCall(m) => self.compile_method_call(m, slot, MULTRET)?,
+                    _ => unreachable!(),
                 }
+                Ok((fixed as u8, true))
             }
             Args::String(s) => {
                 let ki = self.const_str(s);
+                self.reserve(arg_base as usize + 1)?;
                 self.emit(enc_abx(Op::LoadK, arg_base, ki as u16));
                 self.free_reg = arg_base + 1;
                 Ok((1, false))
@@ -1387,6 +1438,9 @@ impl FnComp {
 fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp>) -> CResult<Proto> {
     let captured = collect_captured_names(body);
     let mut fc = FnComp::new(source, outer, captured);
+    if body.params.len() > MAX_REGS as usize {
+        return Err(err("too many parameters", body.line));
+    }
     fc.proto.params = body.params.len() as u8;
     fc.proto.is_vararg = body.vararg;
 
@@ -1406,11 +1460,28 @@ fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp
 
     fc.compile_block(&body.body)?;
 
-    for (name, jump_idx, line) in &fc.pending_gotos {
+    for (name, jump_idx, line, goto_locals) in &fc.pending_gotos {
         match fc.labels.get(name) {
-            Some(&target) => fc.proto.patch_jump(*jump_idx, target),
+            Some(&(target, label_locals)) => {
+                if label_locals > *goto_locals {
+                    return Err(err(format!("goto '{name}' jumps into the scope of a local"), *line));
+                }
+                fc.proto.patch_jump(*jump_idx, target);
+            }
             None => return Err(err(format!("no visible label '{name}' for goto"), *line)),
         }
+    }
+
+    // Bx and upvalue operands are 16 and 8 bits wide; anything past that
+    // would have been silently truncated at emit time.
+    if fc.proto.consts.len() > u16::MAX as usize + 1 {
+        return Err(err("too many constants", body.line));
+    }
+    if fc.proto.protos.len() > u16::MAX as usize + 1 {
+        return Err(err("too many nested functions", body.line));
+    }
+    if fc.upvals.len() > u8::MAX as usize + 1 {
+        return Err(err("too many upvalues", body.line));
     }
 
     fc.proto.upvals = fc.upvals.iter().map(|u| {

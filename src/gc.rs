@@ -7,18 +7,26 @@ pub enum GcColor { White, Gray, Black }
 #[derive(Clone, Copy)]
 enum GcKind { Str, Table, Closure, BigInt }
 
-struct GcEntry { color: GcColor, kind: GcKind }
+struct GcEntry { color: GcColor, kind: GcKind, finalized: bool }
 
 pub struct Gc {
     objects:     HashMap<usize, GcEntry>,
     gray_list:   Vec<usize>,
+    // Allocations since the last collection; a cycle is due once this
+    // reaches threshold or the live count at the end of the previous cycle,
+    // whichever is larger, so a big live heap isn't re-marked every 1024 allocs.
     alloc_count: usize,
+    live_after_collect: usize,
     pub threshold: usize,
     // Host-only hard ceiling on live objects (0 = unlimited); unlike threshold
     // (which just triggers a collection attempt), exceeding this after a
     // collection is a real error — the script genuinely needs more than allowed.
     pub max_objects: usize,
+    // (table, __gc fn) pairs found unreachable by the last collect, waiting
+    // for the VM to run them. Both stay rooted (see Vm::gc_roots) until the
+    // finalizer has returned, since running one can trigger a nested cycle.
     pub pending_finalizers: Vec<(usize, Value)>,
+    pub running_finalizers: Vec<(usize, Value)>,
 }
 
 impl Gc {
@@ -27,35 +35,27 @@ impl Gc {
             objects:     HashMap::new(),
             gray_list:   Vec::new(),
             alloc_count: 0,
+            live_after_collect: 0,
             threshold:   1024,
             max_objects: 0,
             pending_finalizers: Vec::new(),
+            running_finalizers: Vec::new(),
         }
     }
 
-    pub fn register_string(&mut self, ptr: *mut u8) {
-        self.objects.insert(ptr as usize, GcEntry { color: GcColor::White, kind: GcKind::Str });
+    fn register(&mut self, ptr: *mut u8, kind: GcKind) {
+        self.objects.insert(ptr as usize, GcEntry { color: GcColor::White, kind, finalized: false });
         self.alloc_count += 1;
     }
 
-    pub fn register_table(&mut self, ptr: *mut u8) {
-        self.objects.insert(ptr as usize, GcEntry { color: GcColor::White, kind: GcKind::Table });
-        self.alloc_count += 1;
-    }
-
-    pub fn register_closure(&mut self, ptr: *mut u8) {
-        self.objects.insert(ptr as usize, GcEntry { color: GcColor::White, kind: GcKind::Closure });
-        self.alloc_count += 1;
-    }
-
-    pub fn register_bigint(&mut self, ptr: *mut u8) {
-        self.objects.insert(ptr as usize, GcEntry { color: GcColor::White, kind: GcKind::BigInt });
-        self.alloc_count += 1;
-    }
+    pub fn register_string(&mut self, ptr: *mut u8) { self.register(ptr, GcKind::Str); }
+    pub fn register_table(&mut self, ptr: *mut u8) { self.register(ptr, GcKind::Table); }
+    pub fn register_closure(&mut self, ptr: *mut u8) { self.register(ptr, GcKind::Closure); }
+    pub fn register_bigint(&mut self, ptr: *mut u8) { self.register(ptr, GcKind::BigInt); }
 
     pub fn should_collect(&self) -> bool {
-        self.alloc_count >= self.threshold
-            || (self.max_objects != 0 && self.alloc_count >= self.max_objects)
+        self.alloc_count >= self.threshold.max(self.live_after_collect)
+            || (self.max_objects != 0 && self.objects.len() >= self.max_objects)
     }
 
     pub fn live_count(&self) -> usize { self.objects.len() }
@@ -68,18 +68,30 @@ impl Gc {
         for entry in self.objects.values_mut() { entry.color = GcColor::White; }
 
         for v in roots { self.mark_value(v); }
+        self.propagate();
 
-        while let Some(ptr) = self.gray_list.pop() {
-            let kind = match self.objects.get(&ptr) {
-                Some(e) => e.kind,
-                None => continue,
-            };
-            if let Some(e) = self.objects.get_mut(&ptr) { e.color = GcColor::Black; }
-            match kind {
-                GcKind::Str | GcKind::BigInt => {}
-                GcKind::Table   => self.propagate_table(ptr),
-                GcKind::Closure => self.propagate_closure(ptr),
+        // Unreachable tables with a __gc metamethod are resurrected for one
+        // more cycle: marking the table reaches its metatable and the finalizer
+        // through normal propagation, so __gc(table) can run after this sweep.
+        // An object is finalized at most once.
+        {
+            use crate::vm::{Table, TableKey};
+            let white_tables: Vec<usize> = self.objects.iter()
+                .filter(|(_, e)| e.color == GcColor::White && !e.finalized && matches!(e.kind, GcKind::Table))
+                .map(|(&ptr, _)| ptr)
+                .collect();
+            for ptr in white_tables {
+                let t = unsafe { &*(ptr as *const Table) };
+                let mt_ptr = match t.metatable { Some(p) => p, None => continue };
+                if !self.objects.contains_key(&(mt_ptr as usize)) { continue; }
+                let mt = unsafe { &*mt_ptr };
+                if let Some(&gc_fn) = mt.hash.get(&TableKey::Str("__gc".to_owned())) {
+                    self.objects.get_mut(&ptr).unwrap().finalized = true;
+                    self.mark_value(Value::table(ptr as *mut u8));
+                    self.pending_finalizers.push((ptr, gc_fn));
+                }
             }
+            self.propagate();
         }
 
         // A table with __mode 'k'/'v' skipped marking those keys/values in
@@ -114,55 +126,13 @@ impl Gc {
                 });
             }
         }
-
-        // Pre-pass finds White tables with __gc and marks them (and their metatable)
-        // Black before anything is freed. Without this, freeing proceeds in arbitrary
-        // HashMap order, so a metatable can be freed before the table that references
-        // it is inspected, and the dereference below reads freed memory.
-        {
-            use crate::vm::{Table, TableKey};
-            let white_tables: Vec<usize> = self.objects.iter()
-                .filter(|(_, e)| e.color == GcColor::White && matches!(e.kind, GcKind::Table))
-                .map(|(&ptr, _)| ptr)
-                .collect();
-            for ptr in white_tables {
-                let t = unsafe { &*(ptr as *const Table) };
-                if let Some(mt_ptr) = t.metatable {
-                    let mt_addr = mt_ptr as usize;
-                    if !self.objects.contains_key(&mt_addr) { continue; }
-                    let mt = unsafe { &*mt_ptr };
-                    if let Some(&gc_fn) = mt.hash.get(&TableKey::Str("__gc".to_owned())) {
-                        self.objects.get_mut(&ptr).unwrap().color = GcColor::Black;
-                        if let Some(e) = self.objects.get_mut(&mt_addr) {
-                            e.color = GcColor::Black;
-                        }
-                        self.pending_finalizers.push((ptr, gc_fn));
-                    }
-                }
-            }
-        }
-
         let dead: Vec<(usize, GcKind)> = self.objects.iter()
             .filter(|(_, e)| e.color == GcColor::White)
             .map(|(&ptr, e)| (ptr, e.kind))
             .collect();
         for (ptr, kind) in dead {
             self.objects.remove(&ptr);
-            match kind {
-                GcKind::Str => {
-                    use crate::vm::RtString;
-                    unsafe { drop(Box::from_raw(ptr as *mut RtString)) }
-                }
-                GcKind::Table => {
-                    use crate::vm::Table;
-                    unsafe { drop(Box::from_raw(ptr as *mut Table)) }
-                }
-                GcKind::Closure => {
-                    use crate::vm::LuaClosure;
-                    unsafe { drop(Box::from_raw(ptr as *mut LuaClosure)) }
-                }
-                GcKind::BigInt => unsafe { drop(Box::from_raw(ptr as *mut i64)) },
-            }
+            free_object(ptr, kind);
         }
 
         string_cache.retain(|_, v| {
@@ -174,7 +144,31 @@ impl Gc {
             }
         });
 
-        self.alloc_count = self.objects.len();
+        self.alloc_count = 0;
+        self.live_after_collect = self.objects.len();
+    }
+
+    fn propagate(&mut self) {
+        while let Some(ptr) = self.gray_list.pop() {
+            let kind = match self.objects.get_mut(&ptr) {
+                Some(e) => { e.color = GcColor::Black; e.kind }
+                None => continue,
+            };
+            match kind {
+                GcKind::Str | GcKind::BigInt => {}
+                GcKind::Table   => self.propagate_table(ptr),
+                GcKind::Closure => self.propagate_closure(ptr),
+            }
+        }
+    }
+
+    pub fn free_all(&mut self) {
+        let all: Vec<(usize, GcKind)> = self.objects.drain().map(|(ptr, e)| (ptr, e.kind)).collect();
+        for (ptr, kind) in all { free_object(ptr, kind); }
+        self.pending_finalizers.clear();
+        self.running_finalizers.clear();
+        self.alloc_count = 0;
+        self.live_after_collect = 0;
     }
 
     fn mark_value(&mut self, v: Value) {
@@ -239,6 +233,18 @@ impl Gc {
         match ptr {
             Some(p) => self.objects.get(&(p as usize)).map(|e| e.color == GcColor::White).unwrap_or(false),
             None => false,
+        }
+    }
+}
+
+fn free_object(ptr: usize, kind: GcKind) {
+    use crate::vm::{LuaClosure, RtString, Table};
+    unsafe {
+        match kind {
+            GcKind::Str     => drop(Box::from_raw(ptr as *mut RtString)),
+            GcKind::Table   => drop(Box::from_raw(ptr as *mut Table)),
+            GcKind::Closure => drop(Box::from_raw(ptr as *mut LuaClosure)),
+            GcKind::BigInt  => drop(Box::from_raw(ptr as *mut i64)),
         }
     }
 }
