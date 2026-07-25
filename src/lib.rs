@@ -23,7 +23,7 @@ pub fn run_with_vm(src: &str, vm: &mut vm::Vm) -> Result<(), String> {
         return Err(parse_errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n"));
     }
     let proto = compile(block, None).map_err(|e| e.to_string())?;
-    vm.exec_owned(proto).map_err(|e| e.to_string())
+    vm.exec_owned(proto).map(|_| ()).map_err(|e| e.to_string())
 }
 
 pub fn run_capture(src: &str) -> Result<Vec<String>, String> {
@@ -40,7 +40,7 @@ pub fn run_capture(src: &str) -> Result<Vec<String>, String> {
         cap2.lock().unwrap().push(line);
     });
     let result = vm.exec(&proto).map_err(|e| e.to_string());
-    vm::clear_print_hook();
+    drop(vm);
     result?;
     Ok(Arc::try_unwrap(captured).unwrap().into_inner().unwrap())
 }
@@ -300,10 +300,7 @@ mod tests {
 
     #[test]
     fn top_level_panic_without_pcall_is_caught_not_crashed() {
-        // Exercises Vm::run()'s own catch_unwind directly: __debug_panic() called
-        // bare (not through pcall/call_value_isolated) panics inside Op::TailCall's
-        // unprotected cfn(&args)? — the unwind must still be caught, just one level
-        // up, rather than propagating out of this test process.
+        // A bare __debug_panic() unwinds out of Op::Call; Vm::run must catch it.
         let mut vm = vm::Vm::new();
         assert!(run_with_vm("__debug_panic()", &mut vm).is_err());
         assert!(vm.poisoned);
@@ -311,10 +308,7 @@ mod tests {
 
     #[test]
     fn coroutine_resume_panic_is_caught_not_crashed() {
-        // coroutine.resume swaps the coroutine's regs/frames into self before
-        // calling run_inner() directly (vm.rs, no local catch_unwind at that call);
-        // a panic there skips the swap-back on its way out, so this also checks
-        // that poisoning still holds even with regs/frames left unrestored.
+        // A panic inside a coroutine body must poison the VM, not escape.
         let mut vm = vm::Vm::new();
         let result = run_with_vm(
             "let co = coroutine.create(fn() { __debug_panic() })
@@ -1735,10 +1729,7 @@ mod tests {
 
     #[test]
     fn gc_tracks_and_frees_stdlib_computed_strings() {
-        // string.upper (and tostring/string.format/table.concat/etc.) allocate via
-        // alloc_string_val, which historically never registered with the GC at all
-        // — a permanent leak. This proves the result is now actually tracked and,
-        // once unreachable, actually freed rather than living forever.
+        // Computed strings (alloc_string_val) must be GC-tracked and freed.
         use std::ffi::CString;
 
         let U = api::umbra_newstate();
@@ -2648,5 +2639,549 @@ coroutine.resume(co)
 coroutine.resume(co, 10)
 coroutine.resume(co, 20)
 "#, &["10\t20"]);
+    }
+
+    #[test]
+    fn gc_finalizer_closure_and_fields_survive_until_it_runs() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+
+        // __gc is a real closure (captures `tag`) and reads the dying table's
+        // own fields: both must still be alive when the finalizer runs.
+        run_with_vm(
+            r#"seen = none
+let tag = "tagged"
+gcobj = setmetatable({ payload = {1, 2, 3} }, { __gc = fn(self) { seen = tag .. ":" .. #self.payload } })"#,
+            &mut vm,
+        ).unwrap();
+        run_with_vm("gcobj = none", &mut vm).unwrap();
+        vm.gc_collect();
+        run_with_vm("print(seen)", &mut vm).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["tagged:3"]);
+    }
+
+    #[test]
+    fn gc_finalizer_runs_once_per_object_with_shared_metatable() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+
+        run_with_vm(
+            r#"count = 0
+let mt = { __gc = fn(self) { count = count + 1 } }
+objs = {}
+for i = 1, 5 { objs[i] = setmetatable({}, mt) }"#,
+            &mut vm,
+        ).unwrap();
+        run_with_vm("objs = none", &mut vm).unwrap();
+        vm.gc_collect();
+        vm.gc_collect();
+        run_with_vm("print(count)", &mut vm).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["5"]);
+    }
+
+    #[test]
+    fn gc_nested_collection_inside_a_finalizer_keeps_pending_finalizers_alive() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        vm.gc.threshold = 8;
+
+        // Each finalizer allocates well past the threshold, so a collection
+        // runs while the other finalizable tables are still queued.
+        run_with_vm(
+            r#"count = 0
+let mt = { __gc = fn(self) {
+    var junk = {}
+    for i = 1, 64 { junk[i] = { i } }
+    count = count + #self
+} }
+objs = {}
+for i = 1, 8 { objs[i] = setmetatable({ i }, mt) }"#,
+            &mut vm,
+        ).unwrap();
+        run_with_vm("objs = none", &mut vm).unwrap();
+        vm.gc_collect();
+        run_with_vm("print(count)", &mut vm).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["8"]);
+    }
+
+    #[test]
+    fn gc_host_stack_values_are_roots() {
+        use std::ffi::{CStr, CString};
+
+        let U = api::umbra_newstate();
+        let s = CString::new("umbra_host_stack_root_string_xyz").unwrap();
+        unsafe { api::umbra_pushstring(U, s.as_ptr()) };
+        unsafe { api::umbra_gc_collect(U) };
+
+        let ptr = unsafe { api::umbra_tostring(U, -1) };
+        assert_eq!(unsafe { CStr::from_ptr(ptr) }.to_str().unwrap(), "umbra_host_stack_root_string_xyz");
+
+        // Still interned: pushing the same content again must not allocate.
+        let before = unsafe { api::umbra_gc_livecount(U) };
+        unsafe { api::umbra_pushstring(U, s.as_ptr()) };
+        assert_eq!(unsafe { api::umbra_gc_livecount(U) }, before);
+
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn gc_string_methods_survive_clearing_the_string_global() {
+        let mut vm = vm::Vm::new();
+        run_with_vm("string = none", &mut vm).unwrap();
+        vm.gc_collect();
+        run_with_vm(r#"assert(("abc"):len() == 3)"#, &mut vm).unwrap();
+    }
+
+    #[test]
+    fn gc_cached_modules_are_roots() {
+        let mod_name = "umbra_test_gc_module_root_xyz";
+        let path = format!("{mod_name}.umbra");
+        std::fs::write(&path, "return { answer = 42 }").unwrap();
+
+        let mut vm = vm::Vm::new();
+        let first = run_with_vm(&format!("require(\"{mod_name}\")"), &mut vm);
+        vm.gc_collect();
+        let second = run_with_vm(&format!("assert(require(\"{mod_name}\").answer == 42)"), &mut vm);
+        std::fs::remove_file(&path).ok();
+
+        first.unwrap();
+        second.unwrap();
+    }
+
+    #[test]
+    fn gc_dead_coroutines_release_their_registers() {
+        use std::ffi::CString;
+
+        let U = api::umbra_newstate();
+        let src = CString::new(
+            "var co = coroutine.create(fn() {
+                let junk = {}
+                for i = 1, 200 { junk[i] = {} }
+            })
+            coroutine.resume(co)
+            co = none"
+        ).unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+        unsafe { api::umbra_gc_collect(U) };
+        let live = unsafe { api::umbra_gc_livecount(U) };
+        assert!(live < 200, "finished coroutine still roots its garbage: {live} live objects");
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn gc_temporaries_in_call_arguments_are_roots() {
+        // Argument registers beyond the last alloc_reg'd slot were not
+        // counted in max_regs, so a collection between LoadK and Call could
+        // free a string that was about to be passed.
+        let mut vm = vm::Vm::new();
+        vm.gc.threshold = 1;
+        run_with_vm(
+            r#"fn f(a, b, c, d, e) { return a .. b .. c .. d .. e }
+for i = 1, 200 {
+    assert(f("aa" .. i, "bb" .. i, "cc" .. i, "dd" .. i, "ee" .. i) == "aa" .. i .. "bb" .. i .. "cc" .. i .. "dd" .. i .. "ee" .. i)
+}"#,
+            &mut vm,
+        ).unwrap();
+    }
+
+    #[test]
+    fn for_in_over_script_closure_iterator() {
+        assert_output(
+            r#"fn range(n) {
+    var i = 0
+    return fn() { i = i + 1; if i <= n { return i } }
+}
+for v in range(3) { print(v) }
+fn step(state, ctrl) { if ctrl < state { return ctrl + 1, ctrl * 10 } }
+for i, v in step, 3, 0 { print(i, v) }"#,
+            &["1", "2", "3", "1\t0", "2\t10", "3\t20"],
+        );
+    }
+
+    #[test]
+    fn index_assignment_does_not_clobber_live_locals() {
+        assert_output(
+            r#"let t = {}
+let k = "a"
+t[k] = 1
+print(k, t.a)"#,
+            &["a\t1"],
+        );
+    }
+
+    #[test]
+    fn method_call_results_land_in_order() {
+        assert_output(
+            r#"let o = { m = fn(self) { return 10, 20 } }
+let a, b = o:m()
+print(a, b)
+var calls = 0
+fn f() { calls = calls + 1; return 1 }
+print(o:m() + f())
+print(calls)"#,
+            &["10\t20", "11", "1"],
+        );
+    }
+
+    #[test]
+    fn table_constructor_past_fifty_positional_fields() {
+        let items: Vec<String> = (1..=120).map(|i| i.to_string()).collect();
+        assert_output(
+            &format!("let t = {{ {} }}\nprint(#t, t[50], t[51], t[100], t[101], t[120])", items.join(", ")),
+            &["120\t50\t51\t100\t101\t120"],
+        );
+    }
+
+    #[test]
+    fn many_constants_still_compile_correctly() {
+        // More string constants than the 7-bit RK operand can address: the
+        // extras must be loaded through a register rather than aliased.
+        let mut src = String::from("let t = {}\n");
+        for i in 1..=300 { src.push_str(&format!("t.k{i} = {i}\n")); }
+        src.push_str("print(t.k1, t.k129, t.k200, t.k300)");
+        assert_output(&src, &["1\t129\t200\t300"]);
+    }
+
+    #[test]
+    fn too_many_registers_is_a_compile_error() {
+        let mut src = String::new();
+        for i in 1..=140 { src.push_str(&format!("let v{i} = {i}\n")); }
+        assert!(run(&src).unwrap_err().contains("registers"));
+    }
+
+    #[test]
+    fn trailing_call_returns_and_passes_all_values() {
+        assert_output(
+            r##"fn two() { return 1, 2 }
+fn pass() { return two() }
+fn count(...) { return select("#", ...) }
+print(pass())
+print(count(two()))
+print(count(two(), two()))
+let t = { m = fn(self) { return 7, 8 } }
+fn viam() { return t:m() }
+print(viam())"##,
+            &["1\t2", "2", "3", "7\t8"],
+        );
+    }
+
+    #[test]
+    fn close_runs_on_break_continue_and_return() {
+        assert_output(
+            r#"fn res(name) { return { close = fn(self) { print("close " .. name) } } }
+fn early() {
+    let a <close> = res("ret")
+    return 1
+}
+print(early())
+for i = 1, 2 {
+    let b <close> = res("loop" .. i)
+    if i == 1 { continue }
+    break
+}"#,
+            &["close ret", "1", "close loop1", "close loop2"],
+        );
+    }
+
+    #[test]
+    fn goto_into_local_scope_is_rejected() {
+        assert!(run("goto skip\nlet x = 1\n::skip::\nprint(x)").unwrap_err().contains("scope"));
+        assert_output("var n = 0\n::top::\nn = n + 1\nif n < 3 { goto top }\nprint(n)", &["3"]);
+    }
+
+    #[test]
+    fn integer_division_by_zero_is_an_error() {
+        assert!(run("let x = 1 // 0").unwrap_err().contains("n//0"));
+        assert!(run("let x = 1 % 0").unwrap_err().contains("n%0"));
+        assert_output("print(1.0 // 0)", &["inf"]);
+    }
+
+    #[test]
+    fn shifts_follow_lua_semantics() {
+        assert_output(
+            "print(1 << 64, 1 << -1, 8 >> -2, -1 >> 63, 1 << 63)",
+            &["0\t0\t32\t1\t-9223372036854775808"],
+        );
+    }
+
+    #[test]
+    fn bitwise_ops_reject_non_integral_floats() {
+        assert_output("print(2.0 & 3)", &["2"]);
+        assert!(run("let x = 1.5 & 2").unwrap_err().contains("integer representation"));
+    }
+
+    #[test]
+    fn numeric_for_with_zero_step_is_an_error() {
+        assert!(run("for i = 1, 10, 0 { }").unwrap_err().contains("step is zero"));
+        assert!(run("for i = 1, \"x\" { }").unwrap_err().contains("limit"));
+    }
+
+    #[test]
+    fn vararg_expansion_grows_the_register_file() {
+        assert_output(
+            r##"fn f(...) { let t = {...} return #t, select("#", ...) }
+let big = {}
+for i = 1, 250 { big[i] = i }
+print(f(table.unpack(big)))"##,
+            &["250\t250"],
+        );
+    }
+
+    #[test]
+    fn mixed_int_float_comparison_is_exact() {
+        assert_output(
+            "print(math.maxinteger < 9223372036854775808.0, math.maxinteger == 9223372036854775808.0, -0.0 == 0.0, 1 == 1.0)",
+            &["true\tfalse\ttrue\ttrue"],
+        );
+        assert_output(
+            "let t = {}\nt[math.maxinteger] = \"int\"\nt[9223372036854775808.0] = \"float\"\nprint(t[math.maxinteger])",
+            &["int"],
+        );
+    }
+
+    #[test]
+    fn select_negative_and_zero_indices() {
+        assert_output("print(select(-1, 1, 2, 3))", &["3"]);
+        assert_output("print(select(-2, 1, 2, 3))", &["2\t3"]);
+        assert!(run("select(0, 1)").is_err());
+    }
+
+    #[test]
+    fn rawequal_compares_numbers_by_value() {
+        assert_output("print(rawequal(1, 1.0), rawequal(-0.0, 0.0), rawequal({}, {}))", &["true\ttrue\tfalse"]);
+    }
+
+    #[test]
+    fn table_sort_keeps_contents_when_comparator_errors() {
+        assert_output(
+            r#"let t = {3, 1, 2}
+let ok = pcall(table.sort, t, fn(a, b) { error("boom") })
+print(ok, #t, t[1] + t[2] + t[3])"#,
+            &["false\t3\t6"],
+        );
+    }
+
+    #[test]
+    fn table_remove_out_of_range_leaves_table_alone() {
+        assert_output("let t = {1, 2, 3}\nprint(table.remove(t, 7), #t)", &["nil\t3"]);
+    }
+
+    #[test]
+    fn string_find_plain_inside_multibyte_text() {
+        assert_output(r#"print(string.find("héllo", "x", 3, true))"#, &["nil"]);
+        assert_output(r#"print(string.find("héllo", "llo", 3, true))"#, &["4\t6"]);
+    }
+
+    #[test]
+    fn anchored_gsub_and_gmatch_match_once() {
+        assert_output(r#"print(string.gsub("aaa", "^a", "b"))"#, &["baa\t1"]);
+        assert_output(r#"var n = 0
+for m in string.gmatch("aaa", "^a") { n = n + 1 }
+print(n)"#, &["1"]);
+    }
+
+    #[test]
+    fn utf8_codes_rejects_positions_inside_a_character() {
+        assert_output(r#"var n = 0
+for p, c in utf8.codes("héllo") { n = n + 1 }
+print(n)"#, &["5"]);
+        assert!(run(r#"let it = utf8.codes("héllo")
+it("héllo", 3)"#).is_err());
+    }
+
+    #[test]
+    fn tonumber_handles_hex_and_bases() {
+        assert_output(r#"print(tonumber("0x10"), tonumber("ff", 16), tonumber("z", 36), tonumber("12", 2))"#, &["16\t255\t35\tnil"]);
+    }
+
+    #[test]
+    fn math_floor_of_huge_float_stays_float() {
+        assert_output("print(math.floor(1e300) == 1e300, math.floor(-2.5), math.ceil(2.5))", &["true\t-3\t3"]);
+    }
+
+    #[test]
+    fn math_random_near_integer_limits() {
+        assert_output(
+            "let r = math.random(math.maxinteger - 1, math.maxinteger)\nprint(r >= math.maxinteger - 1 and r <= math.maxinteger)",
+            &["true"],
+        );
+    }
+
+    #[test]
+    fn string_format_extra_specifiers_and_tostring() {
+        assert_output(
+            r#"let o = setmetatable({}, { __tostring = fn() { return "obj" } })
+print(string.format("%s|%c|%o|é%d", o, 65, 8, 1))"#,
+            &["obj|A|10|é1"],
+        );
+    }
+
+    #[test]
+    fn yield_inside_pcall_is_a_clean_error() {
+        assert_output(
+            r#"let co = coroutine.create(fn() {
+    let ok, err = pcall(fn() { yield(1) })
+    print(ok, err)
+    print(coroutine.isyieldable())
+})
+coroutine.resume(co)
+print(coroutine.isyieldable())"#,
+            &["false\tattempt to yield across a C-call boundary", "true", "false"],
+        );
+    }
+
+    #[test]
+    fn require_rejects_path_traversal() {
+        let err = run("require(\"..secret\")").unwrap_err();
+        assert!(err.contains("invalid module name"), "{err}");
+        assert!(run("require(\"a/b\")").unwrap_err().contains("invalid module name"));
+    }
+
+    #[test]
+    fn api_pcall_keeps_closure_upvalues() {
+        use std::ffi::CString;
+
+        let U = api::umbra_newstate();
+        let src = CString::new("let base = 40\nfn add(n) { return base + n }").unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+
+        let name = CString::new("add").unwrap();
+        unsafe { api::umbra_getglobal(U, name.as_ptr()) };
+        assert_eq!(unsafe { api::umbra_isfunction(U, -1) }, 1);
+        unsafe { api::umbra_pushinteger(U, 2) };
+        assert_eq!(unsafe { api::umbra_pcall(U, 1, 1) }, 0);
+        assert_eq!(unsafe { api::umbra_tointeger(U, -1) }, 42);
+
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_pcall_rejects_negative_nargs() {
+        use std::ffi::CStr;
+
+        let U = api::umbra_newstate();
+        assert_ne!(unsafe { api::umbra_pcall(U, -1, 0) }, 0);
+        let msg = unsafe { CStr::from_ptr(api::umbra_tostring(U, -1)) }.to_str().unwrap();
+        assert!(msg.contains("negative"), "{msg}");
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_pop_removes_exactly_n_values() {
+        let U = api::umbra_newstate();
+        for i in 0..5 { unsafe { api::umbra_pushinteger(U, i) }; }
+        unsafe { api::umbra_pop(U, 2) };
+        assert_eq!(unsafe { api::umbra_gettop(U) }, 3);
+        assert_eq!(unsafe { api::umbra_tointeger(U, -1) }, 2);
+        unsafe { api::umbra_pop(U, 0) };
+        assert_eq!(unsafe { api::umbra_gettop(U) }, 3);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_null_strings_are_harmless() {
+        let U = api::umbra_newstate();
+        unsafe { api::umbra_pushstring(U, std::ptr::null()) };
+        assert_eq!(unsafe { api::umbra_isnil(U, -1) }, 1);
+        unsafe { api::umbra_getglobal(U, std::ptr::null()) };
+        assert_eq!(unsafe { api::umbra_isnil(U, -1) }, 1);
+        assert_ne!(unsafe { api::umbra_dostring(U, std::ptr::null()) }, 0);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_reentrant_dostring_from_a_registered_function() {
+        use std::ffi::CString;
+
+        unsafe extern "C" fn reenter(U: *mut api::UmbraState) -> std::ffi::c_int {
+            let src = CString::new("inner = inner + 1").unwrap();
+            unsafe { api::umbra_dostring(U, src.as_ptr()) };
+            unsafe { api::umbra_pushinteger(U, 7) };
+            1
+        }
+
+        let U = api::umbra_newstate();
+        let name = CString::new("reenter").unwrap();
+        unsafe { api::umbra_register(U, name.as_ptr(), reenter) };
+        let src = CString::new(
+            "inner = 0
+            fn outer(x) { let y = x * 2; let r = reenter(); return y + r }
+            assert(outer(5) == 17)
+            assert(inner == 1)"
+        ).unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_register_result_count_is_clamped_to_the_frame() {
+        use std::ffi::CString;
+
+        unsafe extern "C" fn greedy(U: *mut api::UmbraState) -> std::ffi::c_int {
+            unsafe { api::umbra_pushinteger(U, 1) };
+            10
+        }
+
+        let U = api::umbra_newstate();
+        unsafe { api::umbra_pushinteger(U, 99) };
+        let name = CString::new("greedy").unwrap();
+        unsafe { api::umbra_register(U, name.as_ptr(), greedy) };
+        let src = CString::new("let a, b, c, d = greedy(5, 6)\nassert(a == 5 and b == 6 and c == 1 and d == none)").unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+        assert_eq!(unsafe { api::umbra_gettop(U) }, 1);
+        assert_eq!(unsafe { api::umbra_tointeger(U, 1) }, 99);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn failed_chunk_leaves_no_stale_frames() {
+        let mut vm = vm::Vm::new();
+        assert!(run_with_vm("fn f() { error(\"x\") }\nf()", &mut vm).is_err());
+        let mut vm2 = vm;
+        run_with_vm("assert(1 + 1 == 2)", &mut vm2).unwrap();
+        run_with_vm("assert(1 + 2 == 3)", &mut vm2).unwrap();
+    }
+
+    #[test]
+    fn lex_leading_dot_float_and_unterminated_long_string() {
+        use lexer::Lexer;
+        let toks = Lexer::tokenize(".5").unwrap();
+        assert!(matches!(toks[0].kind, lexer::TokenKind::Float(f) if f == 0.5));
+        assert!(Lexer::tokenize("[[abc").is_err());
+    }
+
+    #[test]
+    fn parse_xor_binds_tighter_than_or() {
+        assert_output("print(1 | 2 ~ 2)", &["1"]);
+        assert_output("print(2 ~ 3 & 1)", &["3"]);
+    }
+
+    #[test]
+    fn parse_statements_after_return_are_an_error() {
+        assert!(run("fn f() { return 1\nprint(2) }").is_err());
+        assert!(run("return 1\nprint(2)").is_err());
+        assert!(run("}").is_err());
+        assert!(run("if true { } else }").is_err());
+    }
+
+    #[test]
+    fn pack_rejects_out_of_range_and_huge_padding() {
+        assert!(run("string.pack(\"B\", -1)").unwrap_err().contains("overflow"));
+        assert!(run("string.pack(\"I2\", 70000)").unwrap_err().contains("overflow"));
+        assert!(run("string.pack(\"b\", 200)").unwrap_err().contains("overflow"));
+        assert!(run("string.pack(\"c999999999999\", \"x\")").unwrap_err().contains("too large"));
+        assert_output(r#"print(string.unpack("B", string.pack("B", 255)))"#, &["255\t2"]);
     }
 }
