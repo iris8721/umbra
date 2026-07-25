@@ -17,26 +17,29 @@ Familiar to anyone who knows Lua, with a C-flavored syntax:
 - Tables with metatables and the usual metamethods (`__index`, `__newindex`,
   `__add`, `__call`, `__gc`, `__tostring`, weak `__mode`, …) — enough for
   prototype-style OOP
-- Coroutines (`coroutine.create/resume/status/wrap`, `yield` as a statement)
+- Coroutines (`coroutine.create/resume/status/wrap/isyieldable`, `yield()`)
 - `switch`/`case`, ternary `cond ? a : b`, `++`/`--`, compound assignment
-  (`+=`, `-=`, …)
+  (`+=`, `-=`, …); note `!=` is not-equal and `~=` is xor-assign
 - String interpolation: `"balance: ${account.balance}"`
-- `<close>` variable attribute for deterministic cleanup
-  (`let f <close> = io.open(path)`)
+- `<close>` variable attribute: `close()` runs when the scope exits, whether
+  by fall-through, `break`, `continue` or `return`
 - `none` instead of `nil`; `not`/`and`/`or`; `@` line comments and
   `/* */` block comments
-- Integers and floats as distinct types, with automatic promotion to a
-  heap-boxed bigint on `i64` overflow instead of silent truncation
+- Integers and floats as distinct types; integers are full 64-bit (values
+  outside the NaN-box's 48-bit payload are heap-boxed transparently) and
+  wrap on overflow like Lua's
+- Multiple returns; a trailing call or `...` in a return, argument list or
+  table constructor passes all of its values
 - `require` module system (`require "foo.bar"` → `foo/bar.umbra`, cached)
-- `pcall`/`xpcall` error handling with line-attributed tracebacks
+- `goto`/labels, `pcall`/`xpcall` error handling with line-attributed tracebacks
 
 ## Standard library
 
 - `string` — `len sub rep upper lower reverse byte char format`, plus
   Lua-style pattern matching: `find match gmatch gsub`
-- `string.pack` / `string.unpack` — binary packing, a subset of Lua 5.3/5.4's
-  format language (fixed-width ints, floats, length-prefixed strings,
-  endianness, padding)
+- `string.pack` / `string.unpack` — a subset of Lua 5.3/5.4's format
+  language (fixed-width ints, floats, length-prefixed strings, endianness,
+  padding); see limitations below
 - `table` — `insert remove concat sort pack unpack move`
 - `io` — `open read write lines close` on file handles
 - `os` — `time clock date getenv`
@@ -60,8 +63,9 @@ source → lexer → parser (AST) → compiler → bytecode chunk → register V
 - `src/compiler.rs` — AST → bytecode for a register-based VM
 - `src/chunk.rs` — bytecode chunk format (opcodes, constants, line table)
 - `src/vm.rs` — interpreter loop, metatables, coroutines, stdlib
-- `src/gc.rs` — tri-color mark-and-sweep over strings, tables, closures, and
-  bigints; incremental threshold plus a host-settable hard object ceiling
+- `src/gc.rs` — stop-the-world tri-color mark-and-sweep over strings, tables,
+  closures, and bigints; allocation-count threshold plus a host-settable hard
+  object ceiling
 - `src/value.rs` — NaN-boxed value representation
 - `src/api.rs` + `umbra.h` — the C embedding surface
 
@@ -79,9 +83,6 @@ cargo build --release
 Produces `libumbra` as both a `cdylib` (for C hosts) and an `rlib` (for Rust
 hosts). `umbra.h` is emitted by `build.rs` — cbindgen doesn't yet handle Rust
 2024's `#[unsafe(no_mangle)]`, so the header is generated programmatically.
-
-*Note: build not verified in the environment this repo was staged in — no
-Rust toolchain installed. Edition 2024 requires a recent stable rustc.*
 
 ## Embedding from C
 
@@ -125,24 +126,27 @@ Runnable `.umbra` programs in `example/`:
 cargo test
 ```
 
-224 tests covering the lexer, parser, value representation, VM semantics, GC
-behavior under coroutines, panic containment, and stdlib edge cases
-(allocation-cap enforcement, out-of-range arguments, etc.).
+The suite covers the lexer, parser, value representation, VM semantics,
+GC behavior (finalizers, weak tables, coroutines), panic containment, the C
+API, and stdlib edge cases.
 
 ## Known limitations
 
 - `require` and `io`/`os` do real filesystem and environment access — don't
   expose them to untrusted scripts (the step limit and object ceiling are the
   intended sandboxing knobs)
-- `string.pack` ignores alignment (`!`) and treats native endianness as
-  little-endian
-- No `goto` and no `load`/`dofile` beyond `require`
-
-## Notes
-
-Comments in the source were written by Claude Sonnet 5 with guidance, to
-articulate some of the architecture decisions and make certain invariants
-clear. The design and code are mine.
+- `string.pack` returns the packed bytes hex-encoded (strings must be valid
+  UTF-8), so its output isn't interchangeable with real Lua; alignment (`!`)
+  is ignored and native endianness is treated as little-endian
+- `<close>` cleanup does not run when an error unwinds through the scope
+- `yield` can't cross a `pcall`, metamethod or `table.sort` comparator
+  boundary; it fails with "attempt to yield across a C-call boundary"
+- `coroutine.create`/`wrap` take script functions only, not host functions
+- Floating-point NaN is represented as `none` (the NaN bit patterns are the
+  value encoding), so `0/0` yields `none`
+- Strings are UTF-8, not byte strings: `string.char(200)` produces a two-byte
+  character and `string.sub`/`reverse` slice on bytes but re-validate
+- No `load`/`dofile` beyond `require`
 
 ## License
 
