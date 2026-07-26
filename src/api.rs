@@ -14,7 +14,7 @@ pub struct UmbraState {
 
 // Callback ABI: receives the state, reads args via umbra_to*, pushes results
 // via umbra_push*, returns the number of results.
-pub type UmbraCFunction = unsafe extern "C" fn(*mut UmbraState) -> c_int;
+pub type UmbraCFunction = Option<unsafe extern "C" fn(*mut UmbraState) -> c_int>;
 
 #[repr(C)]
 pub enum UmbraStatus {
@@ -52,6 +52,12 @@ impl UmbraState {
         let v = self.vm.intern_pub(msg);
         self.stack_mut().push(v);
         UmbraStatus::RuntimeError as c_int
+    }
+
+    fn push_status_error(&mut self, msg: &str, status: UmbraStatus) -> c_int {
+        let v = self.vm.intern_pub(msg);
+        self.stack_mut().push(v);
+        status as c_int
     }
 }
 
@@ -212,7 +218,13 @@ pub unsafe extern "C" fn umbra_getglobal(U: *mut UmbraState, name: *const c_char
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_setglobal(U: *mut UmbraState, name: *const c_char) {
     let state = unsafe { &mut *U };
-    let v = state.stack_mut().pop().unwrap_or(Value::nil());
+    // Clamp to the current C frame like settop does: with an empty frame the
+    // pop must not steal a slot belonging to the caller's stack.
+    let v = if state.stack().len() > state.api_base {
+        state.stack_mut().pop().unwrap_or(Value::nil())
+    } else {
+        Value::nil()
+    };
     if let Some(rs) = unsafe { cstr(name) } {
         state.vm.set_global(rs.as_ref(), v);
     }
@@ -230,11 +242,23 @@ pub unsafe extern "C" fn umbra_dostring(U: *mut UmbraState, src: *const c_char) 
     };
     // An unwind must never reach this extern "C" boundary uncaught.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::run_with_vm(rs.as_ref(), &mut state.vm)
+        // Inlined run_with_vm so parse/compile failures can report
+        // UMBRA_ERR_SYNTAX instead of collapsing into a runtime error.
+        let (block, parse_errs) = crate::parse(rs.as_ref());
+        if !parse_errs.is_empty() {
+            let msg = parse_errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+            return Err((UmbraStatus::SyntaxError, msg));
+        }
+        match crate::compile(block, None) {
+            Err(e) => Err((UmbraStatus::SyntaxError, e.to_string())),
+            Ok(proto) => state.vm.exec_owned(proto)
+                .map(|_| ())
+                .map_err(|e| (UmbraStatus::RuntimeError, e.to_string())),
+        }
     }));
     match outcome {
         Ok(Ok(())) => UmbraStatus::Ok as c_int,
-        Ok(Err(e)) => state.push_error(&e),
+        Ok(Err((status, msg))) => state.push_status_error(&msg, status),
         Err(payload) => {
             state.vm.poisoned = true;
             state.push_error(&format!("internal error (panic): {}", crate::vm::panic_message(&*payload)))
@@ -325,6 +349,9 @@ pub unsafe extern "C" fn umbra_register(
     f: UmbraCFunction,
 ) {
     let state = unsafe { &mut *U };
+    // Option<fn> is ABI-identical to a raw pointer: a C host passing NULL
+    // arrives as None and must not be registered (calling it would jump to 0).
+    let Some(f) = f else { return };
     let rs = match unsafe { cstr(name) } {
         Some(rs) => rs.into_owned(),
         None => return,
