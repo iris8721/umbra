@@ -2197,7 +2197,7 @@ gcobj = setmetatable({}, { __gc = fn(self) { gcfired = true } })"#,
 
         let U = api::umbra_newstate();
         let name = CString::new("double_it").unwrap();
-        unsafe { api::umbra_register(U, name.as_ptr(), my_fn) };
+        unsafe { api::umbra_register(U, name.as_ptr(), Some(my_fn)) };
 
         let src = CString::new("double_it(21)").unwrap();
         let rc = unsafe { api::umbra_dostring(U, src.as_ptr()) };
@@ -2811,6 +2811,278 @@ for i, v in step, 3, 0 { print(i, v) }"#,
     }
 
     #[test]
+    fn gc_varargs_are_roots() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        run_with_vm(
+            r#"finalized = 0
+let mt = { __gc = fn(self) { finalized = finalized + 1 } }
+fn f(...) {
+    var junk = {}
+    for i = 1, 3000 { junk[i] = {i} }
+    junk = none
+    let a, b = ...
+    print(a.x)
+}
+f(setmetatable({x = 7}, mt), setmetatable({x = 8}, mt))
+print(finalized)"#,
+            &mut vm,
+        ).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["7", "0"]);
+    }
+
+    #[test]
+    fn gc_frame_top_results_are_roots() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        vm.gc.threshold = 1;
+        run_with_vm(
+            r#"finalized = 0
+let mt = { __gc = fn(self) { finalized = finalized + 1 } }
+fn many() {
+    return setmetatable({}, mt), setmetatable({}, mt), setmetatable({}, mt),
+           setmetatable({}, mt), setmetatable({}, mt), setmetatable({}, mt),
+           setmetatable({}, mt), setmetatable({}, mt), setmetatable({}, mt),
+           setmetatable({}, mt), setmetatable({}, mt), setmetatable({}, mt)
+}
+print(many())
+print(finalized)"#,
+            &mut vm,
+        ).unwrap();
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(lines.last().unwrap(), "0", "live call results were finalized early: {lines:?}");
+    }
+
+    #[test]
+    fn gc_weak_key_entry_whose_value_keeps_its_key_is_collected() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        run_with_vm(
+            r#"wt = setmetatable({}, { __mode = "k" })
+var k = {}
+wt[k] = { owner = k }
+k = none"#,
+            &mut vm,
+        ).unwrap();
+        vm.gc_collect();
+        run_with_vm(
+            "var n = 0
+for k, v in pairs(wt) { n = n + 1 }
+print(n)",
+            &mut vm,
+        ).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["0"]);
+    }
+
+    #[test]
+    fn gc_finalizers_queued_during_a_drain_run_on_later_collects() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        vm.gc.threshold = 4;
+        // Each finalizer drops four more finalizable tables into a weak-key
+        // table and allocates past the threshold, forcing nested collections
+        // mid-drain. Those collections must not recurse into the finalizer
+        // drain; the queued finalizers run on subsequent collects instead.
+        // (mt/wt are globals: a `let mt = {__gc = ...}` local is not in scope
+        // inside its own initializer, so the closure would see global `mt`.)
+        run_with_vm(
+            r#"depth = 0
+made = 0
+wt = setmetatable({}, { __mode = "k" })
+mt = { __gc = fn(self) {
+    depth = depth + 1
+    if made < 12 {
+        for i = 1, 4 {
+            wt[setmetatable({}, mt)] = 1
+            made = made + 1
+        }
+        var junk = {}
+        for i = 1, 3000 { junk[i] = {i} }
+    }
+} }
+var t = setmetatable({}, mt)
+t = none"#,
+            &mut vm,
+        ).unwrap();
+        for _ in 0..8 { vm.gc_collect(); }
+        run_with_vm("print(depth, made)", &mut vm).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["13\t12"]);
+    }
+
+
+
+    #[test]
+    fn gc_varargs_survive_collection_inside_pcall() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        run_with_vm(
+            r#"finalized = 0
+let mt = { __gc = fn(self) { finalized = finalized + 1 } }
+fn f(...) {
+    pcall(fn() {
+        var junk = {}
+        for i = 1, 3000 { junk[i] = {i} }
+    })
+    let a = ...
+    print(a.x)
+}
+f(setmetatable({x = 7}, mt))
+print(finalized)"#,
+            &mut vm,
+        ).unwrap();
+        eprintln!("log: {:?}", log.lock().unwrap());
+    }
+
+
+    #[test]
+    fn gc_finalizer_can_resurrect_its_object() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        run_with_vm(
+            r#"saved = none
+var t = setmetatable({ x = 42 }, { __gc = fn(self) { saved = self } })
+t = none"#,
+            &mut vm,
+        ).unwrap();
+        vm.gc_collect();
+        vm.gc_collect();
+        run_with_vm("print(saved.x)", &mut vm).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["42"]);
+    }
+
+    #[test]
+    fn gc_suspended_coroutine_varargs_are_roots() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        run_with_vm(
+            r#"finalized = 0
+let mt = { __gc = fn(self) { finalized = finalized + 1 } }
+co = coroutine.create(fn(...) {
+    yield()
+    let a = ...
+    print(a.x)
+})
+coroutine.resume(co, setmetatable({x = 9}, mt))"#,
+            &mut vm,
+        ).unwrap();
+        vm.gc_collect();
+        run_with_vm("coroutine.resume(co)\nprint(finalized)", &mut vm).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["9", "0"]);
+    }
+
+    #[test]
+    fn gc_collects_cycles_through_metatables_and_upvalues() {
+        use vm::Vm;
+        let mut vm = Vm::new();
+        run_with_vm(
+            r#"var t = {}
+var mt = { __index = t }
+setmetatable(t, mt)
+t.self = t
+mt.back = t
+var f = (fn() {
+    let cell = {}
+    let g = fn() { return cell }
+    cell.owner = g
+    return g
+})()
+t = none
+mt = none
+f = none"#,
+            &mut vm,
+        ).unwrap();
+        vm.gc_collect();
+        let after = vm.gc.live_count();
+        vm.gc_collect();
+        assert_eq!(vm.gc.live_count(), after);
+        run_with_vm("x = 1", &mut vm).unwrap();
+        vm.gc_collect();
+        let baseline = vm.gc.live_count();
+        assert!(after <= baseline + 4, "cycle leaked: after={after} baseline={baseline}");
+    }
+
+    #[test]
+    fn gc_stress_leaves_no_live_garbage() {
+        use vm::Vm;
+        let mut vm = Vm::new();
+        run_with_vm("x = 1", &mut vm).unwrap();
+        vm.gc_collect();
+        let baseline = vm.gc.live_count();
+        run_with_vm(
+            r#"for i = 1, 100000 {
+    let t = { i, "s" .. i, { nested = i } }
+}"#,
+            &mut vm,
+        ).unwrap();
+        vm.gc_collect();
+        vm.gc_collect();
+        let after = vm.gc.live_count();
+        assert!(after <= baseline + 8, "leak: baseline {baseline} after {after}");
+    }
+
+    #[test]
+    fn table_float_keys_at_i64_boundary() {
+        // 2^63-1 and 2^63 are the same f64, so both literals hit one key —
+        // matches Lua 5.4's float-key normalization.
+        assert_output(
+            r#"let t = {}
+t[9223372036854775807.0] = "a"
+t[9223372036854775808.0] = "b"
+t[-9223372036854775808.0] = "c"
+t[-9223372036854775809.0] = "d"
+t[0.0] = "z"
+print(t[9223372036854775807.0], t[9223372036854775808.0], t[-9223372036854775808.0], t[-9223372036854775809.0], t[0])
+print(t[2.5], t[-0.0])"#,
+            &["b\tb\td\td\tz", "nil\tz"],
+        );
+    }
+
+    #[test]
+    fn gc_unpack_spill_results_are_roots() {
+        use vm::Vm;
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        vm.gc.threshold = 1;
+        run_with_vm(
+            r#"finalized = 0
+let mt = { __gc = fn(self) { finalized = finalized + 1 } }
+fn mk() {
+    let t = {}
+    for i = 1, 60 { t[i] = setmetatable({}, mt) }
+    return t
+}
+print(unpack(mk()))
+print(finalized)"#,
+            &mut vm,
+        ).unwrap();
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(lines.last().unwrap(), "0", "live call results were finalized early: {lines:?}");
+    }
+
+    #[test]
     fn index_assignment_does_not_clobber_live_locals() {
         assert_output(
             r#"let t = {}
@@ -3114,7 +3386,7 @@ print(coroutine.isyieldable())"#,
 
         let U = api::umbra_newstate();
         let name = CString::new("reenter").unwrap();
-        unsafe { api::umbra_register(U, name.as_ptr(), reenter) };
+        unsafe { api::umbra_register(U, name.as_ptr(), Some(reenter)) };
         let src = CString::new(
             "inner = 0
             fn outer(x) { let y = x * 2; let r = reenter(); return y + r }
@@ -3137,7 +3409,7 @@ print(coroutine.isyieldable())"#,
         let U = api::umbra_newstate();
         unsafe { api::umbra_pushinteger(U, 99) };
         let name = CString::new("greedy").unwrap();
-        unsafe { api::umbra_register(U, name.as_ptr(), greedy) };
+        unsafe { api::umbra_register(U, name.as_ptr(), Some(greedy)) };
         let src = CString::new("let a, b, c, d = greedy(5, 6)\nassert(a == 5 and b == 6 and c == 1 and d == none)").unwrap();
         assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
         assert_eq!(unsafe { api::umbra_gettop(U) }, 1);

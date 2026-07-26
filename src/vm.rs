@@ -280,6 +280,10 @@ pub struct Vm {
     pub step_limit: u64,
     pub step_count: u64,
     pub loaded_modules: HashMap<String, Value>,
+    // Frame stacks parked by run_isolated while a nested isolated call
+    // (metamethod, pcall target, __gc) runs; their varargs must stay
+    // reachable to the collector.
+    saved_frames: Vec<Vec<Frame>>,
     coroutine_depth: usize,
 }
 
@@ -361,6 +365,7 @@ impl Vm {
             step_limit: 0,
             step_count: 0,
             loaded_modules: HashMap::new(),
+            saved_frames: Vec::new(),
             coroutine_depth: 0,
         };
         vm.register_stdlib();
@@ -391,12 +396,26 @@ impl Vm {
     // resume() swaps a coroutine's regs into self.regs for its run, so the live
     // state at any moment is split between self.regs and every other coroutine's
     // parked regs — missing the latter frees values a suspended coroutine still holds.
+
     fn gc_roots(&self) -> Vec<Value> {
+        // Registers are rooted up to the deepest frame's extent; frame.top can
+        // reach past base + max_regs after a multi-value call or `...` spill,
+        // and those results are still live until the next instruction consumes
+        // them.
         let reg_top = self.frames.iter().map(|f| {
-            f.base + unsafe { &*f.proto }.max_regs as usize
+            (f.base + unsafe { &*f.proto }.max_regs as usize).max(f.top)
         }).max().unwrap_or(0).min(self.regs.len());
         let mut roots: Vec<Value> = self.regs[..reg_top].to_vec();
+        // Varargs are copied out of the register window into the frame, so
+        // they need their own scan — nothing else references them.
+        for f in self.frames.iter().chain(self.saved_frames.iter().flatten()) {
+            roots.extend(f.varargs.iter().copied());
+        }
+        roots.extend(self.globals.array.iter().copied());
         roots.extend(self.globals.hash.values().copied());
+        if let Some(mt) = self.globals.metatable {
+            roots.push(Value::table(mt as *mut u8));
+        }
         roots.extend(self.host_stack.iter().copied());
         roots.extend(self.loaded_modules.values().copied());
         roots.push(self.string_lib);
@@ -405,6 +424,9 @@ impl Vm {
             if co.status == CoStatus::Dead { continue; }
             roots.extend(co.regs.iter().copied());
             roots.push(co.fn_val);
+            for f in &co.frames {
+                roots.extend(f.varargs.iter().copied());
+            }
         }
         for &(ptr, gc_fn) in self.gc.pending_finalizers.iter().chain(&self.gc.running_finalizers) {
             roots.push(Value::table(ptr as *mut u8));
@@ -417,17 +439,24 @@ impl Vm {
         let roots = self.gc_roots();
         self.gc.collect(roots.into_iter(), &mut self.string_cache);
 
+        // A collection triggered from inside a finalizer (or any nested
+        // collect while finalizers are draining) must not run the finalizers
+        // it just queued: that would recurse gc_collect on the Rust stack
+        // without bound. They stay pending and the outermost collect drains
+        // them iteratively below.
+        if !self.gc.running_finalizers.is_empty() { return; }
         let batch = std::mem::take(&mut self.gc.pending_finalizers);
         if batch.is_empty() { return; }
         // Kept in running_finalizers (a root) while they run: a nested
         // collection from inside one finalizer must not sweep the others.
-        let start = self.gc.running_finalizers.len();
         self.gc.running_finalizers.extend(batch);
-        for i in start..self.gc.running_finalizers.len() {
+        let mut i = 0;
+        while i < self.gc.running_finalizers.len() {
             let (ptr, gc_fn) = self.gc.running_finalizers[i];
             let _ = self.call_value_isolated(gc_fn, &[Value::table(ptr as *mut u8)]);
+            i += 1;
         }
-        self.gc.running_finalizers.truncate(start);
+        self.gc.running_finalizers.clear();
         let roots = self.gc_roots();
         self.gc.collect(roots.into_iter(), &mut self.string_cache);
     }
@@ -446,9 +475,23 @@ impl Vm {
         if self.poisoned {
             return Err(VmError::RuntimeError("VM is poisoned by a previous internal error".into()));
         }
+        // The frame stores raw pointers into the closure's upvalue vector, not
+        // the closure itself, and callers (e.g. umbra_pcall) may hold fn_val
+        // nowhere the collector can see — root it for the duration of the call.
+        self.host_stack.push(fn_val);
+        let result = self.call_value_isolated_inner(fn_val, args);
+        self.host_stack.pop();
+        result
+    }
+
+    fn call_value_isolated_inner(&mut self, fn_val: Value, args: &[Value]) -> VmResult<Vec<Value>> {
         if let Some(cfn) = get_cfn(fn_val) {
-            CURRENT_VM.with(|c| c.set(self as *mut Vm));
-            return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cfn(args))) {
+            // Same save/restore as run(): the cfn may reenter the API on a
+            // different state and leave CURRENT_VM pointing at it.
+            let prev_vm = CURRENT_VM.with(|c| c.replace(self as *mut Vm));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cfn(args)));
+            CURRENT_VM.with(|c| c.set(prev_vm));
+            return match result {
                 Ok(r) => r,
                 Err(payload) => {
                     self.poisoned = true;
@@ -468,17 +511,17 @@ impl Vm {
     // isolated frames are discarded on return, so there'd be nothing to resume.
     fn run_isolated(&mut self, proto: *const Proto, upvals_ptr: *mut Value, upvals_len: usize, args: &[Value]) -> VmResult<Vec<Value>> {
         let base = self.scratch_base();
-        let saved_frames = std::mem::take(&mut self.frames);
+        self.saved_frames.push(std::mem::take(&mut self.frames));
         let needed = base + unsafe { &*proto }.max_regs as usize + 8;
         if needed > self.regs.len() { self.regs.resize(needed + 64, Value::nil()); }
         for (i, &v) in args.iter().enumerate() { self.regs[base + i] = v; }
         if let Err(e) = self.push_frame(proto, upvals_ptr, upvals_len, base, args.len() as u8, 255) {
-            self.frames = saved_frames;
+            self.frames = self.saved_frames.pop().unwrap();
             return Err(e);
         }
         let run_result = self.run();
         let results = std::mem::take(&mut self.top_level_results);
-        self.frames = saved_frames;
+        self.frames = self.saved_frames.pop().unwrap();
         match run_result {
             Ok(()) => Ok(results),
             Err(VmError::Yield(_)) if self.coroutine_depth > 0 =>

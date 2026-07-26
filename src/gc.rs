@@ -69,6 +69,7 @@ impl Gc {
 
         for v in roots { self.mark_value(v); }
         self.propagate();
+        self.mark_ephemerons();
 
         // Unreachable tables with a __gc metamethod are resurrected for one
         // more cycle: marking the table reaches its metatable and the finalizer
@@ -92,6 +93,7 @@ impl Gc {
                 }
             }
             self.propagate();
+            self.mark_ephemerons();
         }
 
         // A table with __mode 'k'/'v' skipped marking those keys/values in
@@ -206,11 +208,23 @@ impl Gc {
             let mut vs: Vec<Value> = Vec::new();
             if !weak_values {
                 vs.extend(t.array.iter().copied());
-                vs.extend(t.hash.values().copied());
             }
-            if !weak_keys {
-                for k in t.hash.keys() {
+            for (k, v) in t.hash.iter() {
+                if weak_keys {
+                    // Ephemeron semantics: the value is only marked once its
+                    // key is known reachable, so a value that points back at
+                    // its own key can't keep the entry alive. Keys still white
+                    // here may be marked later; mark_ephemerons revisits them.
+                    let key_live = match k {
+                        TableKey::Ptr(bits) => !self.is_dead_value(Value::from_raw(*bits)),
+                        _ => true,
+                    };
+                    if key_live && !weak_values {
+                        vs.push(*v);
+                    }
+                } else {
                     if let TableKey::Ptr(bits) = k { vs.push(Value::from_raw(*bits)); }
+                    if !weak_values { vs.push(*v); }
                 }
             }
             if let Some(mt) = t.metatable {
@@ -219,6 +233,43 @@ impl Gc {
             vs
         };
         for v in values { self.mark_value(v); }
+    }
+
+    // Weak-key tables defer marking a value until its key is reachable, but
+    // marking that value can make further keys (and their values) reachable,
+    // so this runs to a fixpoint. Called after each propagate() in collect.
+    fn mark_ephemerons(&mut self) {
+        use crate::vm::{Table, TableKey};
+        loop {
+            let weak_key_tables: Vec<usize> = self.objects.iter()
+                .filter(|(_, e)| e.color != GcColor::White && matches!(e.kind, GcKind::Table))
+                .map(|(&ptr, _)| ptr)
+                .filter(|&ptr| {
+                    let (wk, wv) = table_weak_mode(unsafe { &*(ptr as *const Table) });
+                    wk && !wv
+                })
+                .collect();
+            let mut marked_any = false;
+            for ptr in weak_key_tables {
+                let t = unsafe { &*(ptr as *const Table) };
+                let pending: Vec<Value> = t.hash.iter()
+                    .filter(|(k, v)| {
+                        let key_live = match k {
+                            TableKey::Ptr(bits) => !self.is_dead_value(Value::from_raw(*bits)),
+                            _ => true,
+                        };
+                        key_live && self.is_dead_value(**v)
+                    })
+                    .map(|(_, v)| *v)
+                    .collect();
+                for v in pending {
+                    self.mark_value(v);
+                    marked_any = true;
+                }
+            }
+            if !marked_any { break; }
+            self.propagate();
+        }
     }
 
     // A GC-tracked value that isn't in `objects` at all was never a heap object
