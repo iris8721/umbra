@@ -147,6 +147,8 @@ API, and stdlib edge cases.
 - Strings are UTF-8, not byte strings: `string.char(200)` produces a two-byte
   character and `string.sub`/`reverse` slice on bytes but re-validate
 - No `load`/`dofile` beyond `require`
+- Expressions and blocks nest at most 100 levels; deeper sources are a
+  parse error ("expected fewer nesting levels"), not a crash
 
 ## License
 

@@ -2945,7 +2945,7 @@ f(setmetatable({x = 7}, mt))
 print(finalized)"#,
             &mut vm,
         ).unwrap();
-        eprintln!("log: {:?}", log.lock().unwrap());
+        assert_eq!(*log.lock().unwrap(), vec!["7", "0"]);
     }
 
 
