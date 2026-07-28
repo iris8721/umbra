@@ -3456,4 +3456,92 @@ print(coroutine.isyieldable())"#,
         assert!(run("string.pack(\"c999999999999\", \"x\")").unwrap_err().contains("too large"));
         assert_output(r#"print(string.unpack("B", string.pack("B", 255)))"#, &["255\t2"]);
     }
+
+    #[test]
+    fn api_setglobal_in_c_fn_does_not_steal_caller_stack() {
+        use std::ffi::CString;
+
+        // setglobal pops the value to store; with an empty C frame that pop
+        // must not reach below api_base into the host's own stack.
+        unsafe extern "C" fn setg(U: *mut api::UmbraState) -> std::ffi::c_int {
+            let name = CString::new("g_from_c").unwrap();
+            unsafe { api::umbra_setglobal(U, name.as_ptr()) };
+            0
+        }
+
+        let U = api::umbra_newstate();
+        unsafe { api::umbra_pushinteger(U, 777) };
+        let name = CString::new("setg").unwrap();
+        unsafe { api::umbra_register(U, name.as_ptr(), Some(setg)) };
+        let src = CString::new("setg()").unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+        assert_eq!(unsafe { api::umbra_gettop(U) }, 1);
+        assert_eq!(unsafe { api::umbra_tointeger(U, 1) }, 777);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_dostring_reports_syntax_errors_as_syntax() {
+        use std::ffi::CString;
+
+        let U = api::umbra_newstate();
+        let bad = CString::new("this is not valid umbra !!!").unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, bad.as_ptr()) },
+                   api::UmbraStatus::SyntaxError as std::ffi::c_int);
+        let good = CString::new("x = 1").unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, good.as_ptr()) }, 0);
+        let boom = CString::new("error(\"boom\")").unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, boom.as_ptr()) },
+                   api::UmbraStatus::RuntimeError as std::ffi::c_int);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_pcall_invokes_callable_tables() {
+        use std::ffi::CString;
+
+        let U = api::umbra_newstate();
+        let src = CString::new(
+            "t = setmetatable({}, {__call = fn(self, x) { return x * 2 }})"
+        ).unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+        let name = CString::new("t").unwrap();
+        unsafe { api::umbra_getglobal(U, name.as_ptr()) };
+        unsafe { api::umbra_pushinteger(U, 21) };
+        assert_eq!(unsafe { api::umbra_pcall(U, 1, 1) }, 0);
+        assert_eq!(unsafe { api::umbra_tointeger(U, -1) }, 42);
+        unsafe { api::umbra_close(U) };
+    }
+
+    #[test]
+    fn api_cross_state_reentry_keeps_allocations_on_their_own_vm() {
+        use std::ffi::{CStr, CString};
+
+        // A registered fn that runs a script on a *second* state: without
+        // CURRENT_VM save/restore, the outer script's later allocations are
+        // registered on the inner VM's GC and dangle after it collects.
+        static mut INNER: *mut api::UmbraState = std::ptr::null_mut();
+        unsafe extern "C" fn cross(U: *mut api::UmbraState) -> std::ffi::c_int {
+            let src = CString::new("q = 1").unwrap();
+            unsafe { api::umbra_dostring(INNER, src.as_ptr()) };
+            unsafe { api::umbra_pushinteger(U, 1) };
+            1
+        }
+
+        let outer = api::umbra_newstate();
+        let inner = api::umbra_newstate();
+        unsafe { INNER = inner };
+        let name = CString::new("cross").unwrap();
+        unsafe { api::umbra_register(outer, name.as_ptr(), Some(cross)) };
+        let src = CString::new("v = cross()\ns = tostring(123)").unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(outer, src.as_ptr()) }, 0);
+        // Inner state collects: it must not sweep the string the outer VM owns.
+        unsafe { api::umbra_gc_collect(inner) };
+        let gname = CString::new("s").unwrap();
+        unsafe { api::umbra_getglobal(outer, gname.as_ptr()) };
+        let s = unsafe { CStr::from_ptr(api::umbra_tostring(outer, -1)) };
+        assert_eq!(s.to_str().unwrap(), "123");
+        unsafe { api::umbra_close(inner) };
+        unsafe { api::umbra_close(outer) };
+    }
 }

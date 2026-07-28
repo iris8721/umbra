@@ -499,6 +499,17 @@ impl Vm {
                 }
             };
         }
+        if fn_val.is_table() {
+            // Op::Call honors __call on tables; pcall/metamethod dispatch must too.
+            let mm = self.get_mm(fn_val, "__call");
+            if mm.is_nil() {
+                return Err(VmError::RuntimeError("attempt to call a table value".into()));
+            }
+            let mut mm_args = Vec::with_capacity(args.len() + 1);
+            mm_args.push(fn_val);
+            mm_args.extend_from_slice(args);
+            return self.call_value_isolated_inner(mm, &mm_args);
+        }
         if let Some(cp) = get_proto_callable(fn_val) {
             self.run_isolated(cp.proto, cp.upvals_ptr, cp.upvals_len, args)
         } else {
@@ -799,8 +810,14 @@ impl Vm {
         if self.poisoned {
             return Err(VmError::RuntimeError("VM is poisoned by a previous internal error".into()));
         }
-        CURRENT_VM.with(|c| c.set(self as *mut Vm));
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner())) {
+        // Save/restore: a host C function may reenter the API on a *different*
+        // state (umbra_dostring/umbra_pcall), and leaving CURRENT_VM pointing
+        // at that other VM would register this VM's later allocations on the
+        // wrong collector.
+        let prev_vm = CURRENT_VM.with(|c| c.replace(self as *mut Vm));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner()));
+        CURRENT_VM.with(|c| c.set(prev_vm));
+        match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(self.enrich_error_line(e)),
             Err(payload) => {
