@@ -127,7 +127,7 @@ impl<'src> Lexer<'src> {
         if self.peek() == Some(b) { self.advance(); true } else { false }
     }
 
-    fn skip_whitespace_and_comments(&mut self) {
+    fn skip_whitespace_and_comments(&mut self) -> Result<(), LexError> {
         loop {
             while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
                 self.advance();
@@ -138,10 +138,11 @@ impl<'src> Lexer<'src> {
                 continue;
             }
             if self.peek() == Some(b'/') && self.peek2() == Some(b'*') {
+                let line = self.line;
                 self.advance(); self.advance();
                 loop {
                     match self.advance() {
-                        None => break,
+                        None => return Err(LexError::UnterminatedComment(line)),
                         Some(b'*') if self.peek() == Some(b'/') => { self.advance(); break; }
                         _ => {}
                     }
@@ -150,6 +151,7 @@ impl<'src> Lexer<'src> {
             }
             break;
         }
+        Ok(())
     }
 
     /// Assumes `pos` is already past the opening `[`; returns the `=` level
@@ -246,7 +248,40 @@ impl<'src> Lexer<'src> {
                         Some(b'\\') => out.push(b'\\'),
                         Some(b'\'') => out.push(b'\''),
                         Some(b'"')  => out.push(b'"'),
-                        Some(b'\n') | Some(b'\r') => out.push(b'\n'),
+                        Some(b'\n') => out.push(b'\n'),
+                        Some(b'\r') => {
+                            out.push(b'\n');
+                            if self.peek() == Some(b'\n') { self.advance(); }
+                        }
+                        Some(b'z') => {
+                            while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c)) {
+                                self.advance();
+                            }
+                        }
+                        Some(b'u') => {
+                            if !self.eat(b'{') { return Err(LexError::BadEscape(self.line)); }
+                            let mut cp: u32 = 0;
+                            let mut digits = 0usize;
+                            while let Some(h) = self.peek().and_then(hex_digit) {
+                                self.advance();
+                                digits += 1;
+                                cp = match cp.checked_mul(16).and_then(|v| v.checked_add(h as u32)) {
+                                    Some(v) => v,
+                                    None => return Err(LexError::BadEscape(self.line)),
+                                };
+                            }
+                            if digits == 0 || !self.eat(b'}') {
+                                return Err(LexError::BadEscape(self.line));
+                            }
+                            match char::from_u32(cp) {
+                                Some(c) => {
+                                    let mut buf = [0u8; 4];
+                                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                                }
+                                None => return Err(LexError::BadEscape(self.line)),
+                            }
+                        }
+                        Some(b'$') => out.push(b'$'),
                         Some(b'x') => {
                             let h1 = self.advance().and_then(hex_digit);
                             let h2 = self.advance().and_then(hex_digit);
@@ -288,16 +323,43 @@ impl<'src> Lexer<'src> {
             while matches!(self.peek(), Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' | b'_')) {
                 self.advance();
             }
+            let mut is_float = false;
+            // Fractional part: `0xA.8`; a '.' is consumed unless it begins a
+            // '..' concat, matching the decimal rule below.
+            if self.peek() == Some(b'.') && self.peek2() != Some(b'.') {
+                is_float = true;
+                self.advance();
+                while matches!(self.peek(), Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' | b'_')) {
+                    self.advance();
+                }
+            }
+            // Binary exponent: `0x1p4` == 16.0. Only consumed when at least
+            // one digit follows the optional sign, so `0x1p` stays an error.
+            if matches!(self.peek(), Some(b'p' | b'P')) {
+                let mut i = self.pos + 1;
+                if matches!(self.src.get(i), Some(b'+' | b'-')) { i += 1; }
+                if matches!(self.src.get(i), Some(b'0'..=b'9')) {
+                    is_float = true;
+                    self.advance();
+                    if matches!(self.peek(), Some(b'+' | b'-')) { self.advance(); }
+                    while matches!(self.peek(), Some(b'0'..=b'9')) { self.advance(); }
+                }
+            }
             let s: String = self.src[start..self.pos].iter()
                 .filter(|&&b| b != b'_')
                 .map(|&b| b as char).collect();
-            return i64::from_str_radix(&s[2..], 16)
-                .map(TokenKind::Int)
+            if is_float {
+                return parse_hex_float(&s).map(TokenKind::Float).map_err(|_| LexError::BadNumber(line));
+            }
+            // Hex literals wrap modulo 2^64 like Lua's, so 0xFFFFFFFFFFFFFFFF
+            // is -1 rather than a malformed-number error.
+            return u64::from_str_radix(&s[2..], 16)
+                .map(|v| TokenKind::Int(v as i64))
                 .map_err(|_| LexError::BadNumber(line));
         }
         let mut is_float = first == b'.';
         while matches!(self.peek(), Some(b'0'..=b'9' | b'_')) { self.advance(); }
-        if self.peek() == Some(b'.') && matches!(self.peek2(), Some(b'0'..=b'9')) {
+        if self.peek() == Some(b'.') && self.peek2() != Some(b'.') {
             is_float = true;
             self.advance();
             while matches!(self.peek(), Some(b'0'..=b'9' | b'_')) { self.advance(); }
@@ -314,12 +376,16 @@ impl<'src> Lexer<'src> {
         if is_float {
             s.parse().map(TokenKind::Float).map_err(|_| LexError::BadNumber(line))
         } else {
-            s.parse().map(TokenKind::Int).map_err(|_| LexError::BadNumber(line))
+            // Decimal literals that overflow i64 become floats, like Lua.
+            match s.parse::<i64>() {
+                Ok(n) => Ok(TokenKind::Int(n)),
+                Err(_) => s.parse::<f64>().map(TokenKind::Float).map_err(|_| LexError::BadNumber(line)),
+            }
         }
     }
 
     pub fn next_token(&mut self) -> Result<Token, LexError> {
-        self.skip_whitespace_and_comments();
+        self.skip_whitespace_and_comments()?;
         let line = self.line;
         let b = match self.advance() {
             None => return Ok(Token { kind: TokenKind::Eof, line }),
@@ -452,6 +518,7 @@ fn hex_digit(b: u8) -> Option<u8> {
 pub enum LexError {
     UnexpectedChar(char, u32),
     UnterminatedString(u32),
+    UnterminatedComment(u32),
     BadEscape(u32),
     BadNumber(u32),
 }
@@ -461,8 +528,36 @@ impl std::fmt::Display for LexError {
         match self {
             LexError::UnexpectedChar(c, l) => write!(f, "line {l}: unexpected character '{c}'"),
             LexError::UnterminatedString(l) => write!(f, "line {l}: unterminated string"),
+            LexError::UnterminatedComment(l) => write!(f, "line {l}: unterminated comment"),
             LexError::BadEscape(l) => write!(f, "line {l}: invalid escape sequence"),
             LexError::BadNumber(l) => write!(f, "line {l}: malformed number literal"),
         }
     }
+}
+
+/// Parses a Lua-style hexadecimal float such as `0xA.8p1` (== 21.0). The
+/// exponent is a power of two; without a `p`/`P` part the value is exact.
+fn parse_hex_float(s: &str) -> Result<f64, ()> {
+    let body = &s[2..];
+    let (mantissa, exp) = match body.find(|c| c == 'p' || c == 'P') {
+        Some(i) => (&body[..i], body[i + 1..].parse::<i32>().map_err(|_| ())?),
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = match mantissa.find('.') {
+        Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(());
+    }
+    let mut value = 0.0f64;
+    for c in int_part.chars() {
+        value = value * 16.0 + c.to_digit(16).ok_or(())? as f64;
+    }
+    let mut scale = 1.0f64 / 16.0;
+    for c in frac_part.chars() {
+        value += c.to_digit(16).ok_or(())? as f64 * scale;
+        scale /= 16.0;
+    }
+    Ok(value * 2f64.powi(exp))
 }

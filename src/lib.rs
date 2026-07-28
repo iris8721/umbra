@@ -3374,6 +3374,96 @@ print(coroutine.isyieldable())"#,
     }
 
     #[test]
+    fn lex_unterminated_block_comment_is_an_error() {
+        use lexer::Lexer;
+        assert!(Lexer::tokenize("/* never closed").is_err());
+        assert!(Lexer::tokenize("1 /* ok */ 2 /* never closed").is_err());
+        assert!(Lexer::tokenize("/* ok */ 42").is_ok());
+    }
+
+    #[test]
+    fn lex_string_escape_edge_cases() {
+        use lexer::{Lexer, TokenKind};
+        // CRLF and lone-CR line continuations both fold to a single \n.
+        let toks = Lexer::tokenize("\"a\\\r\nb\"").unwrap();
+        assert!(matches!(&toks[0].kind, TokenKind::String(s) if s == "a\nb"));
+        let toks = Lexer::tokenize("\"a\\\rb\"").unwrap();
+        assert!(matches!(&toks[0].kind, TokenKind::String(s) if s == "a\nb"));
+        // \z skips whitespace including newlines; \u{...} encodes UTF-8;
+        // \$ escapes the interpolation sigil.
+        let toks = Lexer::tokenize("\"a\\z\n   b\"").unwrap();
+        assert!(matches!(&toks[0].kind, TokenKind::String(s) if s == "ab"));
+        let toks = Lexer::tokenize("\"\\u{48}\\u{49}\"").unwrap();
+        assert!(matches!(&toks[0].kind, TokenKind::String(s) if s == "HI"));
+        let toks = Lexer::tokenize("\"\\${x}\"").unwrap();
+        assert!(matches!(&toks[0].kind, TokenKind::String(s) if s == "${x}"));
+        assert!(Lexer::tokenize("\"\\u{}\"").is_err());
+        assert!(Lexer::tokenize("\"\\u{110000}\"").is_err());
+        assert!(Lexer::tokenize("\"\\q\"").is_err());
+    }
+
+    #[test]
+    fn lex_number_edge_cases() {
+        use lexer::{Lexer, TokenKind};
+        let toks = Lexer::tokenize("0xA.8p1").unwrap();
+        assert!(matches!(toks[0].kind, TokenKind::Float(f) if f == 21.0));
+        let toks = Lexer::tokenize("0x1p4").unwrap();
+        assert!(matches!(toks[0].kind, TokenKind::Float(f) if f == 16.0));
+        // Hex literals wrap mod 2^64 like Lua.
+        let toks = Lexer::tokenize("0xFFFFFFFFFFFFFFFF").unwrap();
+        assert!(matches!(toks[0].kind, TokenKind::Int(-1)));
+        // Decimal literals past i64 become floats.
+        let toks = Lexer::tokenize("9223372036854775808").unwrap();
+        assert!(matches!(toks[0].kind, TokenKind::Float(_)));
+        // Trailing dot is a float, but `..` still lexes as concat.
+        let toks = Lexer::tokenize("5.").unwrap();
+        assert!(matches!(toks[0].kind, TokenKind::Float(f) if f == 5.0));
+        let toks = Lexer::tokenize("5..2").unwrap();
+        assert!(matches!(toks[0].kind, TokenKind::Int(5)));
+        assert!(matches!(toks[1].kind, TokenKind::DotDot));
+        assert!(matches!(toks[2].kind, TokenKind::Int(2)));
+    }
+
+    #[test]
+    fn parse_ternary_allows_ident_and_call_branches() {
+        assert_output(
+            "let x = 5\nlet big = \"B\"\nlet small = \"S\"\nprint(x > 3 ? big : small)",
+            &["B"],
+        );
+        assert_output(
+            "let t = {m = fn(self) { return \"M\" }}\nprint(true ? t:m() : \"no\")",
+            &["M"],
+        );
+        assert_output("print(false ? 1 : true ? 2 : 3)", &["2"]);
+    }
+
+    #[test]
+    fn parse_deep_nesting_errors_instead_of_overflowing() {
+        let parens = format!("print({}1{})", "(".repeat(5000), ")".repeat(5000));
+        assert!(run(&parens).is_err());
+        let chain = format!("let x = {}1", "1+".repeat(5000));
+        assert!(run(&chain).is_err());
+        let blocks = format!("if true {{ {} print(1) {}", "{ ".repeat(5000), "}".repeat(5000));
+        assert!(run(&blocks).is_err());
+        // Reasonable nesting still works.
+        assert_output(
+            &format!("print({}1{})", "(".repeat(50), ")".repeat(50)),
+            &["1"],
+        );
+    }
+
+    #[test]
+    fn parse_interp_rejects_trailing_tokens() {
+        assert!(run("print(\"${a b}\")").is_err());
+        assert!(run("print(\"${{1,2}[1]}\")").is_err());
+        // Interpolated strings work as call arguments too.
+        assert_output(
+            "fn f(s) { return s }\nlet n = \"x\"\nprint(f\"${n}\")",
+            &["x"],
+        );
+    }
+
+    #[test]
     fn api_reentrant_dostring_from_a_registered_function() {
         use std::ffi::CString;
 

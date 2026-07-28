@@ -43,15 +43,38 @@ pub struct Parser<'src> {
     lexer: Lexer<'src>,
     current: Token,
     lookahead: Option<Token>,
+    lookahead2: Option<Token>,
     errors: Vec<ParseError>,
     switch_counter: u32,
+    // Recursion budget shared by expressions and blocks; also charged per
+    // iteration of the Pratt/suffix loops so flat chains like `a+b+…+b` or
+    // `a.b.c…` can't grow the AST deeper than the compiler can walk.
+    depth: u32,
 }
+
+// Lua 5.4 stops at ~200 C-stack levels; our recursive-descent frames are
+// fatter, so 100 keeps deeply nested sources a clean parse error instead of
+// a stack overflow in the parser, the compiler's recursive walks, or AST
+// drop — even on a 2 MiB thread stack.
+pub(crate) const MAX_DEPTH: u32 = 100;
 
 impl<'src> Parser<'src> {
     pub fn new(src: &'src str) -> PResult<Self> {
+        Self::at_depth(src, 0)
+    }
+
+    fn at_depth(src: &'src str, depth: u32) -> PResult<Self> {
         let mut lexer = Lexer::new(src);
         let current = lexer.next_token()?;
-        Ok(Self { lexer, current, lookahead: None, errors: Vec::new(), switch_counter: 0 })
+        Ok(Self { lexer, current, lookahead: None, lookahead2: None, errors: Vec::new(), switch_counter: 0, depth })
+    }
+
+    fn nest(&mut self) -> PResult<u32> {
+        if self.depth >= MAX_DEPTH {
+            return Err(ParseError::Expected { what: "fewer nesting levels", line: self.line() });
+        }
+        self.depth += 1;
+        Ok(self.depth - 1)
     }
 
     fn peek(&self) -> &TokenKind { &self.current.kind }
@@ -64,12 +87,23 @@ impl<'src> Parser<'src> {
         Ok(&self.lookahead.as_ref().unwrap().kind)
     }
 
+    fn peek3(&mut self) -> PResult<&TokenKind> {
+        self.peek2()?;
+        if self.lookahead2.is_none() {
+            self.lookahead2 = Some(self.lexer.next_token()?);
+        }
+        Ok(&self.lookahead2.as_ref().unwrap().kind)
+    }
+
     fn advance(&mut self) -> PResult<Token> {
         let prev = self.current.clone();
         self.current = match self.lookahead.take() {
             Some(t) => t,
             None => self.lexer.next_token()?,
         };
+        if let Some(t) = self.lookahead2.take() {
+            self.lookahead = Some(t);
+        }
         Ok(prev)
     }
 
@@ -148,6 +182,13 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_braced_block(&mut self) -> PResult<Block> {
+        let saved = self.nest()?;
+        let block = self.parse_braced_block_inner();
+        self.depth = saved;
+        block
+    }
+
+    fn parse_braced_block_inner(&mut self) -> PResult<Block> {
         self.expect(&TokenKind::LBrace, "'{'")?;
         let block = self.parse_block_body(true);
         self.expect(&TokenKind::RBrace, "'}'")?;
@@ -334,6 +375,9 @@ impl<'src> Parser<'src> {
 
         let mut arms: Vec<(Vec<Expr>, Block)> = Vec::new();
         while self.check(&TokenKind::Case) {
+            if arms.len() as u32 >= MAX_DEPTH {
+                return Err(ParseError::Expected { what: "fewer switch cases", line: self.line() });
+            }
             self.advance()?;
             let mut values = vec![self.parse_expr()?];
             while self.eat(&TokenKind::Comma)? {
@@ -558,6 +602,13 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_pratt(&mut self, min_bp: u8) -> PResult<Expr> {
+        let saved = self.nest()?;
+        let r = self.parse_pratt_inner(min_bp);
+        self.depth = saved;
+        r
+    }
+
+    fn parse_pratt_inner(&mut self, min_bp: u8) -> PResult<Expr> {
         let line = self.line();
         let mut lhs = if matches!(self.peek(), TokenKind::PlusPlus | TokenKind::MinusMinus) {
             let delta = if matches!(self.peek(), TokenKind::PlusPlus) { 1 } else { -1 };
@@ -576,6 +627,7 @@ impl<'src> Parser<'src> {
             let line = self.line();
             let Some((op, lbp, rbp)) = self.binary_op() else { break };
             if lbp < min_bp { break; }
+            self.nest()?;
             self.advance()?;
             let rhs = self.parse_pratt(rbp)?;
             if op == Binop::Concat {
@@ -586,7 +638,7 @@ impl<'src> Parser<'src> {
                 match rhs {
                     Expr::Concat { parts: rhs_parts, .. } => parts.extend(rhs_parts),
                     other => parts.push(other),
-                }
+                };
                 lhs = Expr::Concat { parts, line };
             } else {
                 lhs = Expr::Binop { op, lhs: Box::new(lhs), rhs: Box::new(rhs), line };
@@ -665,8 +717,15 @@ impl<'src> Parser<'src> {
                     if !s.is_empty() { out.push(Expr::String(s, line)); }
                 }
                 InterpPart::Expr(src) => {
-                    let mut sub = Parser::new(&src)?;
-                    out.push(sub.parse_expr()?);
+                    let mut sub = Parser::at_depth(&src, self.depth)?;
+                    let e = sub.parse_expr()?;
+                    if !matches!(sub.peek(), TokenKind::Eof) {
+                        return Err(ParseError::Unexpected {
+                            tok: format!("{:?}", sub.peek()),
+                            line,
+                        });
+                    }
+                    out.push(e);
                 }
             }
         }
@@ -701,6 +760,13 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_suffixed_expr(&mut self) -> PResult<Expr> {
+        let saved = self.depth;
+        let r = self.parse_suffixed_expr_inner();
+        self.depth = saved;
+        r
+    }
+
+    fn parse_suffixed_expr_inner(&mut self) -> PResult<Expr> {
         let mut e = self.parse_primary()?;
         loop {
             let line = self.line();
@@ -717,6 +783,12 @@ impl<'src> Parser<'src> {
                     e = Expr::Index { table: Box::new(e), key: Box::new(key), line };
                 }
                 TokenKind::Colon => {
+                    // A method call needs `:name` followed by call arguments;
+                    // without them the ':' belongs to an enclosing `?:` or
+                    // is simply a syntax error downstream.
+                    let is_method = matches!(self.peek2()?, TokenKind::Ident(_))
+                        && matches!(self.peek3()?, TokenKind::LParen | TokenKind::String(_) | TokenKind::InterpString(_));
+                    if !is_method { break; }
                     self.advance()?;
                     let method = self.expect_ident()?;
                     let args = self.parse_args()?;
@@ -724,7 +796,7 @@ impl<'src> Parser<'src> {
                         receiver: Box::new(e), method, args, line,
                     });
                 }
-                TokenKind::LParen | TokenKind::String(_) => {
+                TokenKind::LParen | TokenKind::String(_) | TokenKind::InterpString(_) => {
                     let args = self.parse_args()?;
                     e = Expr::Call(CallExpr { callee: Box::new(e), args, line });
                 }
@@ -736,6 +808,7 @@ impl<'src> Parser<'src> {
                 }
                 _ => break,
             }
+            self.nest()?;
         }
         Ok(e)
     }
@@ -780,6 +853,15 @@ impl<'src> Parser<'src> {
                 }
             }
             TokenKind::String(_) => Ok(Args::String(self.expect_string()?)),
+            TokenKind::InterpString(_) => {
+                let line = self.line();
+                match self.advance()?.kind {
+                    TokenKind::InterpString(parts) => {
+                        Ok(Args::Exprs(vec![self.build_interp_expr(parts, line)?]))
+                    }
+                    _ => unreachable!(),
+                }
+            }
             _ => Err(ParseError::Expected { what: "function arguments", line: self.line() }),
         }
     }
