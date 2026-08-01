@@ -59,6 +59,19 @@ impl UmbraState {
         self.stack_mut().push(v);
         status as c_int
     }
+
+    // A thrown error object keeps its identity for the host (like Lua's
+    // lua_pcall leaving the error value on the stack); other errors are
+    // pushed as message strings.
+    fn push_vm_error(&mut self, e: VmError) -> c_int {
+        match e {
+            VmError::Thrown(v) => {
+                self.stack_mut().push(v);
+                UmbraStatus::RuntimeError as c_int
+            }
+            other => self.push_error(&other.to_string()),
+        }
+    }
 }
 
 unsafe fn cstr<'a>(s: *const c_char) -> Option<std::borrow::Cow<'a, str>> {
@@ -241,24 +254,31 @@ pub unsafe extern "C" fn umbra_dostring(U: *mut UmbraState, src: *const c_char) 
         None => return state.push_error("umbra_dostring: null source"),
     };
     // An unwind must never reach this extern "C" boundary uncaught.
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Inlined run_with_vm so parse/compile failures can report
-        // UMBRA_ERR_SYNTAX instead of collapsing into a runtime error.
-        let (block, parse_errs) = crate::parse(rs.as_ref());
-        if !parse_errs.is_empty() {
-            let msg = parse_errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
-            return Err((UmbraStatus::SyntaxError, msg));
-        }
-        match crate::compile(block, None) {
-            Err(e) => Err((UmbraStatus::SyntaxError, e.to_string())),
-            Ok(proto) => state.vm.exec_owned(proto)
-                .map(|_| ())
-                .map_err(|e| (UmbraStatus::RuntimeError, e.to_string())),
-        }
-    }));
+    // Inlined run_with_vm so parse/compile failures can report
+    // UMBRA_ERR_SYNTAX instead of collapsing into a runtime error.
+    let outcome: Result<Result<(), (UmbraStatus, VmError)>, _> =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (block, parse_errs) = crate::parse(rs.as_ref());
+            if !parse_errs.is_empty() {
+                let msg = parse_errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+                return Err((UmbraStatus::SyntaxError, VmError::RuntimeError(msg)));
+            }
+            match crate::compile(block, None) {
+                Err(e) => Err((UmbraStatus::SyntaxError, VmError::RuntimeError(e.to_string()))),
+                Ok(proto) => state.vm.exec_owned(proto)
+                    .map(|_| ())
+                    .map_err(|e| (UmbraStatus::RuntimeError, e)),
+            }
+        }));
     match outcome {
         Ok(Ok(())) => UmbraStatus::Ok as c_int,
-        Ok(Err((status, msg))) => state.push_status_error(&msg, status),
+        Ok(Err((status, e))) => match e {
+            VmError::Thrown(v) => {
+                state.stack_mut().push(v);
+                status as c_int
+            }
+            other => state.push_status_error(&other.to_string(), status),
+        },
         Err(payload) => {
             state.vm.poisoned = true;
             state.push_error(&format!("internal error (panic): {}", crate::vm::panic_message(&*payload)))
@@ -304,7 +324,7 @@ pub unsafe extern "C" fn umbra_pcall(U: *mut UmbraState, nargs: c_int, nres: c_i
             }
             UmbraStatus::Ok as c_int
         }
-        Err(e) => state.push_error(&e.to_string()),
+        Err(e) => state.push_vm_error(e),
     }
 }
 
