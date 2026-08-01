@@ -3435,6 +3435,12 @@ print(coroutine.isyieldable())"#,
             &["M"],
         );
         assert_output("print(false ? 1 : true ? 2 : 3)", &["2"]);
+        // `:` after a field is the separator even when a call follows;
+        // `:` after a method call is too.
+        assert_output(
+            "let t = {b = 1, m = fn(self) { return \"M\" }}\nfn c(n) { return n * 10 }\nprint(5 > 0 ? t.b : c(1))\nprint(5 > 0 ? t:m() : c(1))",
+            &["1", "M"],
+        );
     }
 
     #[test]

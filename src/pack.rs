@@ -14,7 +14,9 @@ pub enum PackValue {
 fn as_int(v: &PackValue) -> Result<i64, String> {
     match v {
         PackValue::Int(n) => Ok(*n),
-        PackValue::Float(f) => Ok(*f as i64),
+        PackValue::Float(f) if f.fract() == 0.0
+            && *f >= -9223372036854775808.0 && *f < 9223372036854775808.0 => Ok(*f as i64),
+        PackValue::Float(_) => Err("string.pack: number has no integer representation".to_string()),
         PackValue::Str(_) => Err("string.pack: number expected".to_string()),
     }
 }
@@ -38,7 +40,9 @@ fn read_size(fmt: &[u8], i: &mut usize, default: usize) -> usize {
     let start = *i;
     while *i < fmt.len() && fmt[*i].is_ascii_digit() { *i += 1; }
     if *i == start { default } else {
-        std::str::from_utf8(&fmt[start..*i]).unwrap().parse().unwrap_or(default)
+        // Saturate rather than silently fall back: an overflowing size must
+        // fail the format's own range check, not be read as the default.
+        std::str::from_utf8(&fmt[start..*i]).unwrap().parse().unwrap_or(usize::MAX)
     }
 }
 
@@ -103,7 +107,14 @@ pub fn pack(fmt: &str, args: &[PackValue]) -> Result<Vec<u8>, String> {
                 let size = read_size(f, &mut i, 4);
                 push_int_bytes(&mut out, as_int(next_arg!())?, size, c == b'i', little)?;
             }
-            b'l' | b'L' => push_int_bytes(&mut out, as_int(next_arg!())?, 8, c == b'l', little)?,
+            b'l' | b'L' | b'j' | b'J' | b'T' => {
+                // j/J are lua_Integer (i64 here); T is size_t — all 8 bytes.
+                push_int_bytes(&mut out, as_int(next_arg!())?, 8, c != b'J' && c != b'L' && c != b'T', little)?
+            }
+            b'n' => {
+                let v = as_float(next_arg!())?;
+                out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
+            }
             b'f' => {
                 let v = as_float(next_arg!())? as f32;
                 out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
@@ -127,6 +138,22 @@ pub fn pack(fmt: &str, args: &[PackValue]) -> Result<Vec<u8>, String> {
                 out.extend_from_slice(&s);
             }
             b'x' => out.push(0),
+            b'z' => {
+                let s = as_bytes(next_arg!())?;
+                if s.contains(&0) { return Err("string.pack: 'z' string contains zeros".into()); }
+                out.extend_from_slice(s);
+                out.push(0);
+            }
+            b'X' => {
+                // Consumes the next option (plus any size digits) as its
+                // operand but packs nothing for it.
+                let op = *f.get(i).ok_or("string.pack: missing format option after 'X'")?;
+                if matches!(op, b'<' | b'>' | b'=' | b'!' | b' ' | b'X') {
+                    return Err(format!("string.pack: invalid format option 'X{}'", op as char));
+                }
+                i += 1;
+                while i < f.len() && f[i].is_ascii_digit() { i += 1; }
+            }
             _ => return Err(format!("string.pack: invalid format option '{}'", c as char)),
         }
     }
@@ -189,8 +216,14 @@ pub fn unpack(fmt: &str, data: &[u8], start: usize) -> Result<(Vec<PackValue>, u
                 let size = read_size(f, &mut i, 4);
                 results.push(PackValue::Int(read_int(data, &mut pos, size, false, little)?));
             }
-            b'l' => results.push(PackValue::Int(read_int(data, &mut pos, 8, true, little)?)),
-            b'L' => results.push(PackValue::Int(read_int(data, &mut pos, 8, false, little)?)),
+            b'l' | b'j' | b'T' => results.push(PackValue::Int(read_int(data, &mut pos, 8, true, little)?)),
+            b'L' | b'J' => results.push(PackValue::Int(read_int(data, &mut pos, 8, false, little)?)),
+            b'n' => {
+                let bs = read_bytes(data, &mut pos, 8)?;
+                let arr: [u8; 8] = bs.try_into().unwrap();
+                let v = if little { f64::from_le_bytes(arr) } else { f64::from_be_bytes(arr) };
+                results.push(PackValue::Float(v));
+            }
             b'f' => {
                 let bs = read_bytes(data, &mut pos, 4)?;
                 let arr: [u8; 4] = bs.try_into().unwrap();
@@ -213,7 +246,21 @@ pub fn unpack(fmt: &str, data: &[u8], start: usize) -> Result<(Vec<PackValue>, u
                 results.push(PackValue::Str(read_bytes(data, &mut pos, len)?.to_vec()));
             }
             b'x' => { read_bytes(data, &mut pos, 1)?; }
-            _ => return Err(format!("string.unpack: invalid format option '{}'", c as char)),
+            b'z' => {
+                let end = data[*pos..].iter().position(|&b| b == 0)
+                    .map(|p| *pos + p)
+                    .ok_or("string.unpack: unfinished string for format 'z'")?;
+                results.push(PackValue::Str(data[*pos..end].to_vec()));
+                pos = end + 1;
+            }
+            b'X' => {
+                let op = *f.get(i).ok_or("string.unpack: missing format option after 'X'")?;
+                if matches!(op, b'<' | b'>' | b'=' | b'!' | b' ' | b'X') {
+                    return Err(format!("string.unpack: invalid format option 'X{}'", op as char));
+                }
+                i += 1;
+                while i < f.len() && f[i].is_ascii_digit() { i += 1; }
+            }
         }
     }
     Ok((results, pos))

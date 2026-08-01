@@ -259,6 +259,36 @@ pub fn cmp_int_float(i: i64, f: f64) -> Option<Ordering> {
     }
 }
 
+/// Lua's LUAI_NUMFFORMAT "%.14g" plus the ".0" suffix Lua appends to floats
+/// that print without a fraction or exponent (so tostring(3.0) == "3.0").
+pub fn lua_float_str(f: f64) -> String {
+    if f.is_infinite() { return if f > 0.0 { "inf".into() } else { "-inf".into() }; }
+    if f.is_nan() { return "nan".into(); }
+    if f == 0.0 { return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() }; }
+    // Round to 14 significant digits, then pick fixed vs scientific the way
+    // C's %g does: scientific iff the decimal exponent is < -4 or >= 14.
+    let e = format!("{:.13e}", f);
+    let exp: i32 = e[e.rfind('e').unwrap() + 1..].parse().unwrap();
+    let mut s = if (-4..14).contains(&exp) {
+        let decimals = (13 - exp).max(0) as usize;
+        let mut t = format!("{:.*}", decimals, f);
+        if t.contains('.') {
+            while t.ends_with('0') { t.pop(); }
+            if t.ends_with('.') { t.pop(); }
+        }
+        t
+    } else {
+        let mut t = e;
+        let epos = t.rfind('e').unwrap();
+        let mut mantissa: String = t[..epos].into();
+        while mantissa.ends_with('0') { mantissa.pop(); }
+        if mantissa.ends_with('.') { mantissa.pop(); }
+        format!("{}e{}{:02}", mantissa, if exp < 0 { "-" } else { "+" }, exp.abs())
+    };
+    if !s.contains(['.', 'e', 'n']) { s.push_str(".0"); }
+    s
+}
+
 impl Eq for Value {}
 
 impl std::fmt::Debug for Value {
@@ -281,7 +311,7 @@ impl std::fmt::Display for Value {
         if self.is_nil()        { write!(f, "nil") }
         else if self.is_bool()  { write!(f, "{}", (self.0 & PAYLOAD_MASK) == MISC_TRUE) }
         else if self.is_int_like() { write!(f, "{}", self.as_int().unwrap()) }
-        else if self.is_float() { write!(f, "{}", self.as_float().unwrap()) }
+        else if self.is_float() { write!(f, "{}", lua_float_str(self.as_float().unwrap())) }
         else { write!(f, "{}", self.type_name()) }
     }
 }

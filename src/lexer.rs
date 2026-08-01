@@ -97,6 +97,7 @@ pub struct Token {
     pub line: u32,
 }
 
+#[derive(Clone)]
 pub struct Lexer<'src> {
     src: &'src [u8],
     pos: usize,
@@ -537,7 +538,7 @@ impl std::fmt::Display for LexError {
 
 /// Parses a Lua-style hexadecimal float such as `0xA.8p1` (== 21.0). The
 /// exponent is a power of two; without a `p`/`P` part the value is exact.
-fn parse_hex_float(s: &str) -> Result<f64, ()> {
+pub(crate) fn parse_hex_float(s: &str) -> Result<f64, ()> {
     let body = &s[2..];
     let (mantissa, exp) = match body.find(|c| c == 'p' || c == 'P') {
         Some(i) => (&body[..i], body[i + 1..].parse::<i32>().map_err(|_| ())?),

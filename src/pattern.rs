@@ -216,7 +216,9 @@ impl<'a> MatchState<'a> {
     fn match_capture(&self, s: usize, digit: u8) -> Result<Option<usize>, String> {
         let idx = digit.wrapping_sub(b'1') as usize;
         let &(cs, clen) = self.captures.get(idx).ok_or("invalid capture index")?;
-        if clen < 0 { return Err("invalid capture index".into()); }
+        if clen == CAP_UNFINISHED { return Err("unfinished capture".into()); }
+        // A position capture has no text to re-match; Lua fails the match.
+        if clen == CAP_POSITION { return Ok(None); }
         let clen = clen as usize;
         if self.subj.len() >= s + clen && self.subj[cs..cs + clen] == self.subj[s..s + clen] {
             Ok(Some(s + clen))

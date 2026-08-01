@@ -50,6 +50,10 @@ pub struct Parser<'src> {
     // iteration of the Pratt/suffix loops so flat chains like `a+b+…+b` or
     // `a.b.c…` can't grow the AST deeper than the compiler can walk.
     depth: u32,
+    // Number of enclosing `?:` then-branches currently being parsed. While
+    // nonzero, a `:` followed by `ident args` is ambiguous (method call vs
+    // ternary separator) and resolved by speculative parse.
+    ternary_depth: u32,
 }
 
 // Lua 5.4 stops at ~200 C-stack levels; our recursive-descent frames are
@@ -66,7 +70,7 @@ impl<'src> Parser<'src> {
     fn at_depth(src: &'src str, depth: u32) -> PResult<Self> {
         let mut lexer = Lexer::new(src);
         let current = lexer.next_token()?;
-        Ok(Self { lexer, current, lookahead: None, lookahead2: None, errors: Vec::new(), switch_counter: 0, depth })
+        Ok(Self { lexer, current, lookahead: None, lookahead2: None, errors: Vec::new(), switch_counter: 0, depth, ternary_depth: 0 })
     }
 
     fn nest(&mut self) -> PResult<u32> {
@@ -190,7 +194,11 @@ impl<'src> Parser<'src> {
 
     fn parse_braced_block_inner(&mut self) -> PResult<Block> {
         self.expect(&TokenKind::LBrace, "'{'")?;
+        // A ':' inside a braced block can never be an enclosing ternary's
+        // separator, so method calls parse normally in there.
+        let td = std::mem::replace(&mut self.ternary_depth, 0);
         let block = self.parse_block_body(true);
+        self.ternary_depth = td;
         self.expect(&TokenKind::RBrace, "'}'")?;
         Ok(block)
     }
@@ -591,7 +599,10 @@ impl<'src> Parser<'src> {
         if self.check(&TokenKind::Question) {
             let line = self.line();
             self.advance()?;
-            let then_e = self.parse_expr()?;
+            self.ternary_depth += 1;
+            let then_e = self.parse_expr();
+            self.ternary_depth -= 1;
+            let then_e = then_e?;
             self.expect(&TokenKind::Colon, "':'")?;
             let else_e = self.parse_expr()?; // right-associative: a ? b : c ? d : e
             return Ok(Expr::Ternary {
@@ -778,7 +789,10 @@ impl<'src> Parser<'src> {
                 }
                 TokenKind::LBracket => {
                     self.advance()?;
-                    let key = self.parse_expr()?;
+                    let td = std::mem::replace(&mut self.ternary_depth, 0);
+                    let key = self.parse_expr();
+                    self.ternary_depth = td;
+                    let key = key?;
                     self.expect(&TokenKind::RBracket, "']'")?;
                     e = Expr::Index { table: Box::new(e), key: Box::new(key), line };
                 }
@@ -786,9 +800,34 @@ impl<'src> Parser<'src> {
                     // A method call needs `:name` followed by call arguments;
                     // without them the ':' belongs to an enclosing `?:` or
                     // is simply a syntax error downstream.
-                    let is_method = matches!(self.peek2()?, TokenKind::Ident(_))
-                        && matches!(self.peek3()?, TokenKind::LParen | TokenKind::String(_) | TokenKind::InterpString(_));
-                    if !is_method { break; }
+                    if !matches!(self.peek2()?, TokenKind::Ident(_)) { break; }
+                    if self.ternary_depth > 0 {
+                        // `x ? a:b() : c` vs `x ? a.b : c(1)`: inside a
+                        // then-branch a `:` is ambiguous, so try the method
+                        // call and keep it only when a real separator follows.
+                        let saved = (self.lexer.clone(), self.current.clone(),
+                                     self.lookahead.clone(), self.lookahead2.clone(), self.depth);
+                        self.advance()?;
+                        let ok = self.expect_ident()
+                            .and_then(|m| self.parse_args().map(|a| (m, a)));
+                        match ok {
+                            Ok((method, args)) if self.check(&TokenKind::Colon) => {
+                                e = Expr::MethodCall(MethodCallExpr {
+                                    receiver: Box::new(e), method, args, line,
+                                });
+                            }
+                            _ => {
+                                let (lx, cur, la, la2, d) = saved;
+                                self.lexer = lx; self.current = cur;
+                                self.lookahead = la; self.lookahead2 = la2; self.depth = d;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    if !matches!(self.peek3()?, TokenKind::LParen | TokenKind::String(_) | TokenKind::InterpString(_)) {
+                        break;
+                    }
                     self.advance()?;
                     let method = self.expect_ident()?;
                     let args = self.parse_args()?;
@@ -828,7 +867,10 @@ impl<'src> Parser<'src> {
             }
             TokenKind::LParen => {
                 self.advance()?;
-                let e = self.parse_expr()?;
+                let td = std::mem::replace(&mut self.ternary_depth, 0);
+                let e = self.parse_expr();
+                self.ternary_depth = td;
+                let e = e?;
                 self.expect(&TokenKind::RParen, "')'")?;
                 Ok(e)
             }
@@ -847,7 +889,10 @@ impl<'src> Parser<'src> {
                     self.advance()?;
                     Ok(Args::Exprs(vec![]))
                 } else {
-                    let exprs = self.parse_exprlist()?;
+                    let td = std::mem::replace(&mut self.ternary_depth, 0);
+                    let exprs = self.parse_exprlist();
+                    self.ternary_depth = td;
+                    let exprs = exprs?;
                     self.expect(&TokenKind::RParen, "')'")?;
                     Ok(Args::Exprs(exprs))
                 }
@@ -869,13 +914,18 @@ impl<'src> Parser<'src> {
     fn parse_table_constructor(&mut self) -> PResult<TableConstructor> {
         let line = self.line();
         self.expect(&TokenKind::LBrace, "'{'")?;
+        let td = std::mem::replace(&mut self.ternary_depth, 0);
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            fields.push(self.parse_table_field()?);
+            match self.parse_table_field() {
+                Ok(f) => fields.push(f),
+                Err(e) => { self.ternary_depth = td; return Err(e); }
+            }
             if !self.eat(&TokenKind::Comma)? && !self.eat(&TokenKind::Semicolon)? {
                 break;
             }
         }
+        self.ternary_depth = td;
         self.expect(&TokenKind::RBrace, "'}'")?;
         Ok(TableConstructor { fields, line })
     }
