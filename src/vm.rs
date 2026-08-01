@@ -50,22 +50,70 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> String {
+// Inverse of civil_from_days (Howard Hinnant's days_from_civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + (d - 1) as u64;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+// (year, month, day, yday, weekday-since-Sunday) for an epoch second.
+fn civil_fields(epoch_secs: i64) -> (i64, u32, u32, u32, u32) {
     let days = epoch_secs.div_euclid(86400);
-    let secs_of_day = epoch_secs.rem_euclid(86400);
     let (year, month, day) = civil_from_days(days);
+    let yday = (days - days_from_civil(year, 1, 1) + 1) as u32;
+    let wday = (days + 4).rem_euclid(7) as u32; // 1970-01-01 was a Thursday
+    (year, month, day, yday, wday)
+}
+
+pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> String {
+    const WDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June",
+                                "July", "August", "September", "October", "November", "December"];
+    let secs_of_day = epoch_secs.rem_euclid(86400);
+    let (year, month, day, yday, wday) = civil_fields(epoch_secs);
     let (hour, min, sec) = (secs_of_day / 3600, (secs_of_day / 60) % 60, secs_of_day % 60);
+    let hour12 = if hour % 12 == 0 { 12 } else { hour % 12 };
+    // Week-of-year: %U counts Sundays, %W counts Mondays (strftime rules).
+    let week_u = (yday as i64 + 6 - wday as i64).div_euclid(7);
+    let week_w = (yday as i64 + 6 - (wday as i64 + 6) % 7).div_euclid(7);
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '%' { out.push(c); continue; }
         match chars.next() {
             Some('Y') => out.push_str(&year.to_string()),
+            Some('y') => out.push_str(&format!("{:02}", year.rem_euclid(100))),
             Some('m') => out.push_str(&format!("{month:02}")),
             Some('d') => out.push_str(&format!("{day:02}")),
+            Some('e') => out.push_str(&format!("{day:2}")),
             Some('H') => out.push_str(&format!("{hour:02}")),
+            Some('I') => out.push_str(&format!("{hour12:02}")),
             Some('M') => out.push_str(&format!("{min:02}")),
             Some('S') => out.push_str(&format!("{sec:02}")),
+            Some('p') => out.push_str(if hour < 12 { "AM" } else { "PM" }),
+            Some('a') => out.push_str(&WDAYS[wday as usize][..3]),
+            Some('A') => out.push_str(WDAYS[wday as usize]),
+            Some('b') | Some('h') => out.push_str(&MONTHS[(month - 1) as usize][..3]),
+            Some('B') => out.push_str(MONTHS[(month - 1) as usize]),
+            Some('j') => out.push_str(&format!("{yday:03}")),
+            Some('U') => out.push_str(&format!("{week_u:02}")),
+            Some('W') => out.push_str(&format!("{week_w:02}")),
+            Some('w') => out.push_str(&wday.to_string()),
+            Some('c') => out.push_str(&format!("{} {} {:02} {:02}:{:02}:{:02} {}",
+                &WDAYS[wday as usize][..3], &MONTHS[(month - 1) as usize][..3],
+                day, hour, min, sec, year)),
+            Some('x') => out.push_str(&format!("{month:02}/{day:02}/{:02}", year.rem_euclid(100))),
+            Some('X') | Some('T') => out.push_str(&format!("{hour:02}:{min:02}:{sec:02}")),
+            Some('D') => out.push_str(&format!("{month:02}/{day:02}/{:02}", year.rem_euclid(100))),
+            Some('F') => out.push_str(&format!("{year}-{month:02}-{day:02}")),
+            Some('R') => out.push_str(&format!("{hour:02}:{min:02}")),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
             Some('%') => out.push('%'),
             Some(other) => { out.push('%'); out.push(other); }
             None => out.push('%'),
@@ -323,6 +371,9 @@ pub enum VmError {
     RuntimeError(String),
     StackOverflow,
     Yield(Vec<Value>),
+    // A value thrown by error()/assert(): propagated to pcall/xpcall/resume
+    // as-is (like Lua's error object), never line-prefixed by enrichment.
+    Thrown(Value),
 }
 
 impl std::fmt::Display for VmError {
@@ -331,6 +382,7 @@ impl std::fmt::Display for VmError {
             VmError::RuntimeError(s) => write!(f, "{s}"),
             VmError::StackOverflow => write!(f, "stack overflow"),
             VmError::Yield(_) => write!(f, "attempt to yield from outside a coroutine"),
+            VmError::Thrown(v) => write!(f, "{v}"),
         }
     }
 }
@@ -776,7 +828,8 @@ impl Vm {
     // Chunks run in an isolated frame too, so a host calling back into the VM
     // from inside a registered C function can't collide with the running script.
     pub fn exec(&mut self, proto: &Proto) -> VmResult<()> {
-        self.run_isolated(proto, std::ptr::null_mut(), 0, &[]).map(|_| ())
+        self.run_isolated(proto, std::ptr::null_mut(), 0, &[])
+            .map(|_| ()).map_err(thrown_to_runtime)
     }
 
     // Proto must be owned here (not borrowed) so raw closure pointers into it
@@ -786,6 +839,7 @@ impl Vm {
         let ptr: *const Proto = &*boxed;
         self.owned_protos.push(boxed);
         self.run_isolated(ptr, std::ptr::null_mut(), 0, &[])
+            .map_err(thrown_to_runtime)
     }
 
     pub fn push_frame(&mut self, proto: *const Proto, upvals_ptr: *mut Value, upvals_len: usize, base: usize, nargs: u8, expected: u8) -> VmResult<()> {
@@ -827,21 +881,26 @@ impl Vm {
         }
     }
 
-    // Idempotent via the prefix check, so re-enrichment at an outer
-    // call_value_isolated/run layer, as an error propagates through nested
-    // calls, is a no-op rather than stacking "line N: line M: ...".
     fn enrich_error_line(&mut self, e: VmError) -> VmError {
-        if let VmError::RuntimeError(msg) = &e {
-            if !msg.starts_with("line ") {
-                self.last_traceback = Some(build_traceback(&self.frames));
-                if let Some(frame) = self.frames.last() {
-                    let proto = unsafe { &*frame.proto };
-                    let pc = frame.pc.saturating_sub(1);
-                    if let Some(&line) = proto.lines.get(pc) {
-                        return VmError::RuntimeError(format!("line {line}: {msg}"));
+        match &e {
+            VmError::RuntimeError(msg) => {
+                if !msg.starts_with("line ") {
+                    self.last_traceback = Some(build_traceback(&self.frames));
+                    if let Some(frame) = self.frames.last() {
+                        let proto = unsafe { &*frame.proto };
+                        let pc = frame.pc.saturating_sub(1);
+                        if let Some(&line) = proto.lines.get(pc) {
+                            return VmError::RuntimeError(format!("line {line}: {msg}"));
+                        }
                     }
                 }
             }
+            // Thrown values keep their identity (no line prefix), but the
+            // traceback is still captured for debug.traceback.
+            VmError::Thrown(_) => {
+                self.last_traceback = Some(build_traceback(&self.frames));
+            }
+            _ => {}
         }
         e
     }
@@ -954,12 +1013,12 @@ impl Vm {
                     }
                     Op::IDiv => arith_op!(a, b, c,
                         |x: i64, y: i64| -> VmResult<i64> {
-                            if y == 0 { Err(VmError::RuntimeError("attempt to perform 'n//0'".into())) } else { Ok(x.wrapping_div_euclid(y)) }
+                            if y == 0 { Err(VmError::RuntimeError("attempt to perform 'n//0'".into())) } else { Ok(lua_idiv(x, y)) }
                         },
                         |x: f64, y: f64| (x / y).floor(), "__idiv"),
                     Op::Mod  => arith_op!(a, b, c,
                         |x: i64, y: i64| -> VmResult<i64> {
-                            if y == 0 { Err(VmError::RuntimeError("attempt to perform 'n%0'".into())) } else { Ok(x.wrapping_rem_euclid(y)) }
+                            if y == 0 { Err(VmError::RuntimeError("attempt to perform 'n%0'".into())) } else { Ok(lua_mod(x, y)) }
                         },
                         |x: f64, y: f64| x - (x / y).floor() * y, "__mod"),
                     Op::Pow  => {
@@ -1210,29 +1269,33 @@ impl Vm {
                     }
 
                     Op::ForPrep => {
-                        let init = to_number(R!(a), "initial value")?;
+                        // R!(a) keeps the initial value; ForLoop treats it as
+                        // the next candidate index. No init-step subtraction:
+                        // an i64 wrap there (e.g. init=mininteger, step=1)
+                        // would corrupt the first iteration.
+                        to_number(R!(a), "initial value")?;
                         to_number(R!(a + 1), "limit")?;
                         let step = to_number(R!(a + 2), "step")?;
                         if matches!(step, Num::Int(0)) || matches!(step, Num::Float(f) if f == 0.0) {
                             return Err(VmError::RuntimeError("'for' step is zero".into()));
                         }
-                        R!(a) = num_sub(init, step);
                         frame.pc = (frame.pc as i32 + sbx) as usize;
                     }
                     Op::ForLoop => {
                         let idx  = to_number(R!(a), "initial value")?;
                         let lim  = to_number(R!(a + 1), "limit")?;
                         let step = to_number(R!(a + 2), "step")?;
-                        let new_idx_v = num_add(idx, step);
-                        R!(a) = new_idx_v;
-                        let new_idx = to_number(new_idx_v, "initial value")?;
                         let in_range = if num_is_positive(step) {
-                            num_le(new_idx, lim)
+                            num_le(idx, lim)
                         } else {
-                            num_le(lim, new_idx)
+                            num_le(lim, idx)
                         };
                         if in_range {
-                            R!(a + 3) = new_idx_v;
+                            R!(a + 3) = R!(a);
+                            // Advance the candidate for the next check. Integer
+                            // overflow must terminate the loop (Lua semantics),
+                            // not wrap the counter back to the other end.
+                            R!(a) = num_add(idx, step);
                             frame.pc = (frame.pc as i32 + sbx) as usize;
                         }
                     }
@@ -1355,26 +1418,53 @@ impl Vm {
 
         self.set_global_cfn("tonumber", |args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            let base = args.get(1).map(|&b| int_from_val(b)).unwrap_or(10);
+            let base = match args.get(1) {
+                None => 10,
+                Some(&b) => int_arg(b, "tonumber")?,
+            };
             if base == 10 && (v.is_int_like() || v.is_float()) { return Ok(vec![v]); }
-            if !v.is_string() { return Ok(vec![Value::nil()]); }
-            let s = unsafe { string_ref(v) }.trim();
+            // With an explicit base the argument must be a string, like Lua.
+            if !v.is_string() {
+                return if base == 10 { Ok(vec![Value::nil()]) }
+                       else { Err(VmError::RuntimeError("tonumber: string expected".into())) };
+            }
+            let s = unsafe { string_ref(v) };
             if base != 10 {
                 if !(2..=36).contains(&base) {
                     return Err(VmError::RuntimeError("tonumber: base out of range".into()));
                 }
-                let (neg, digits) = match s.strip_prefix('-') { Some(r) => (true, r), None => (false, s) };
-                return Ok(vec![match i64::from_str_radix(digits, base as u32) {
-                    Ok(n) => make_int_via_current_vm(if neg { n.wrapping_neg() } else { n }),
-                    Err(_) => Value::nil(),
-                }]);
+                // Lua: leading space skipped, optional sign, optional 0x for
+                // base 16, then digits only — any trailing junk fails, and
+                // overflow wraps modulo 2^64.
+                let mut t = s.trim_start();
+                let neg = t.starts_with('-');
+                if neg || t.starts_with('+') { t = &t[1..]; }
+                if base == 16 { t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t); }
+                if t.is_empty() { return Ok(vec![Value::nil()]); }
+                let mut n: u64 = 0;
+                for c in t.bytes() {
+                    let d = (c as char).to_digit(base as u32);
+                    match d { Some(d) => n = n.wrapping_mul(base as u64).wrapping_add(d as u64),
+                              None => return Ok(vec![Value::nil()]) }
+                }
+                let n = n as i64;
+                return Ok(vec![make_int_via_current_vm(if neg { n.wrapping_neg() } else { n })]);
             }
+            let s = s.trim();
             let (neg, body) = match s.strip_prefix('-') { Some(r) => (true, r), None => (false, s) };
             if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-                return Ok(vec![match i64::from_str_radix(hex, 16) {
-                    Ok(n) => make_int_via_current_vm(if neg { n.wrapping_neg() } else { n }),
-                    Err(_) => Value::nil(),
-                }]);
+                // Integer hex wraps modulo 2^64 like the lexer; failing that,
+                // a hex float (0xA.8p1) is still a number.
+                if !hex.is_empty() && hex.bytes().all(|b| (b as char).is_ascii_hexdigit()) {
+                    let mut n: u64 = 0;
+                    for c in hex.bytes() { n = n.wrapping_mul(16).wrapping_add((c as char).to_digit(16).unwrap() as u64); }
+                    let n = n as i64;
+                    return Ok(vec![make_int_via_current_vm(if neg { n.wrapping_neg() } else { n })]);
+                }
+                if let Ok(f) = crate::lexer::parse_hex_float(body) {
+                    return Ok(vec![Value::float(if neg { -f } else { f })]);
+                }
+                return Ok(vec![Value::nil()]);
             }
             if let Ok(n) = s.parse::<i64>() { return Ok(vec![make_int_via_current_vm(n)]); }
             if let Ok(f) = s.parse::<f64>() { return Ok(vec![Value::float(f)]); }
@@ -1390,20 +1480,38 @@ impl Vm {
             let v = args.first().copied().unwrap_or(Value::nil());
             if !v.is_truthy() {
                 let msg = args.get(1).copied().unwrap_or(Value::nil());
-                let s = if msg.is_string() { unsafe { string_ref(msg) }.to_owned() }
-                        else { "assertion failed!".into() };
-                return Err(VmError::RuntimeError(s));
+                // Like Lua: a non-string message is thrown as-is so pcall
+                // returns the original value; strings get the line prefix.
+                if msg.is_nil() {
+                    return Err(VmError::RuntimeError("assertion failed!".into()));
+                }
+                if msg.is_string() {
+                    return Err(VmError::RuntimeError(unsafe { string_ref(msg) }.to_owned()));
+                }
+                return Err(VmError::Thrown(msg));
             }
             Ok(args.to_vec())
         });
 
         self.set_global_cfn("error", |args| {
             let msg = args.first().copied().unwrap_or(Value::nil());
-            let level = args.get(1).map(|v| v.as_int().unwrap_or(1)).unwrap_or(1);
-            let s = if msg.is_string() { unsafe { string_ref(msg) }.to_owned() }
-                    else { format!("{msg}") };
-            // level 1 is prefixed by enrich_error_line from the innermost frame;
-            // level >= 2 attributes the error to an outer frame here instead.
+            let level = match args.get(1) {
+                None => 1,
+                Some(&v) => int_val(v).map_err(|_| {
+                    VmError::RuntimeError("bad argument #2 to 'error' (integer expected)".into())
+                })?,
+            };
+            // Non-string messages are thrown as-is at any level (Lua semantics).
+            if !msg.is_string() {
+                return Err(VmError::Thrown(msg));
+            }
+            let s = unsafe { string_ref(msg) }.to_owned();
+            // level 1 is prefixed by enrich_error_line from the innermost
+            // frame; level 0 stays bare; level >= 2 attributes the error to an
+            // outer frame here instead.
+            if level <= 0 {
+                return Err(VmError::Thrown(msg));
+            }
             if level >= 2 {
                 let prefixed = CURRENT_VM.with(|c| {
                     let vm_ptr = c.get();
@@ -1418,7 +1526,8 @@ impl Vm {
                         None => s.clone(),
                     }
                 });
-                return Err(VmError::RuntimeError(prefixed));
+                return Err(VmError::Thrown(with_current_vm(|vm| vm.intern(&prefixed))
+                    .unwrap_or_else(|| alloc_string_val(&prefixed))));
             }
             Err(VmError::RuntimeError(s))
         });
@@ -1445,6 +1554,7 @@ impl Vm {
                         ret.extend(results);
                         Ok(ret)
                     }
+                    Err(VmError::Thrown(v)) => Ok(vec![Value::bool(false), v]),
                     Err(e) => {
                         let msg = vm.intern_pub(&e.to_string());
                         Ok(vec![Value::bool(false), msg])
@@ -1470,7 +1580,12 @@ impl Vm {
                         Ok(ret)
                     }
                     Err(e) => {
-                        let msg = vm.intern_pub(&e.to_string());
+                        // Thrown values reach the handler as the original
+                        // object; internal errors are stringified as before.
+                        let msg = match e {
+                            VmError::Thrown(v) => v,
+                            other => vm.intern_pub(&other.to_string()),
+                        };
                         // The handler runs even if it panics/errors itself: its own
                         // failure shouldn't be worse than the error it's handling.
                         let handled = vm.call_value_isolated(handler, &[msg])
@@ -1574,11 +1689,15 @@ impl Vm {
 
         self.set_global_cfn("unpack", |args| {
             let t = args.first().copied().unwrap_or(Value::nil());
-            if !t.is_table() { return Ok(vec![]); }
+            if !t.is_table() { return Err(VmError::RuntimeError("unpack: table expected".into())); }
             let table = unsafe { table_ref(t) };
             let n = table.length();
-            let result: Vec<Value> = (1..=n).map(|i| table.raw_get(Value::int(i))).collect();
-            Ok(result)
+            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "unpack")? };
+            let j = match args.get(2) { None => n, Some(&v) => int_arg(v, "unpack")? };
+            if checked_range_len(i, j).is_none() {
+                return Err(VmError::RuntimeError("unpack: range too large".into()));
+            }
+            Ok((i..=j).map(|k| table.raw_get(make_int_via_current_vm(k))).collect())
         });
 
         self.set_global_cfn("select", |args| {
@@ -1679,6 +1798,7 @@ impl Vm {
                         Ok(ret)
                     }
                     Err(e) if vm.poisoned => Err(e),
+                    Err(VmError::Thrown(v)) => Ok(vec![Value::bool(false), v]),
                     Err(e) => {
                         let msg = vm.intern(&e.to_string());
                         Ok(vec![Value::bool(false), msg])
@@ -1742,8 +1862,8 @@ impl Vm {
         let v_str_sub = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.sub")?;
             let len = s.len();
-            let i = int_from_val(args.get(1).copied().unwrap_or(Value::int(1)));
-            let j = int_from_val(args.get(2).copied().unwrap_or(Value::int(-1)));
+            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "string.sub")? };
+            let j = match args.get(2) { None => -1, Some(&v) => int_arg(v, "string.sub")? };
             let start = lua_str_start(len, i);
             let end   = lua_str_end(len, j);
             if start >= end { return Ok(vec![alloc_string_val("")]); }
@@ -1751,10 +1871,13 @@ impl Vm {
         });
         let v_str_rep = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.rep")?;
-            let n = int_from_val(args.get(1).copied().unwrap_or(Value::int(0)));
-            let sep = args.get(2).filter(|v| v.is_string())
-                .map(|&v| unsafe { string_ref(v) }.to_owned())
-                .unwrap_or_default();
+            let n = match args.get(1) { None => 0, Some(&v) => int_arg(v, "string.rep")? };
+            let sep = match args.get(2) {
+                None => String::new(),
+                Some(&v) if v.is_string() => unsafe { string_ref(v) }.to_owned(),
+                Some(&v) if v.is_number() => coerce_to_concat_str(v),
+                Some(_) => return Err(VmError::RuntimeError("string.rep: string expected".into())),
+            };
             if n <= 0 { return Ok(vec![alloc_string_val("")]); }
             let n = n as usize;
             let total = n.saturating_mul(s.len() + sep.len());
@@ -1776,8 +1899,8 @@ impl Vm {
         });
         let v_str_byte = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.byte")?;
-            let i = int_from_val(args.get(1).copied().unwrap_or(Value::int(1)));
-            let j = int_from_val(args.get(2).copied().unwrap_or(Value::int(i)));
+            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "string.byte")? };
+            let j = match args.get(2) { None => i, Some(&v) => int_arg(v, "string.byte")? };
             let start = lua_str_start(s.len(), i);
             let end   = lua_str_end(s.len(), j).min(s.len());
             if end.saturating_sub(start) > MAX_ALLOC_LEN / 8 {
@@ -1789,7 +1912,7 @@ impl Vm {
         let v_str_char = self.make_cfn_val(|args| {
             let mut s = String::with_capacity(args.len());
             for &v in args {
-                let n = int_from_val(v);
+                let n = int_arg(v, "string.char")?;
                 let b = u8::try_from(n).map_err(|_| VmError::RuntimeError("string.char: value out of range".into()))?;
                 s.push(b as char);
             }
@@ -1798,8 +1921,10 @@ impl Vm {
         let v_str_find = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.find")?;
             let pat = str_arg(args, 1, "string.find")?;
-            let init = args.get(2).map(|&v| int_from_val(v)).unwrap_or(1);
+            let init = match args.get(2) { None => 1, Some(&v) => int_arg(v, "string.find")? };
             let plain = args.get(3).map(|&v| v.is_truthy()).unwrap_or(false);
+            // Lua: init past len+1 finds nothing (even an empty pattern).
+            if init > s.len() as i64 + 1 { return Ok(vec![Value::nil()]); }
             let start = lua_str_start(s.len(), init);
             if plain {
                 let hay = &s.as_bytes()[start..];
@@ -1827,7 +1952,8 @@ impl Vm {
         let v_str_match = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.match")?;
             let pat = str_arg(args, 1, "string.match")?;
-            let init = args.get(2).map(|&v| int_from_val(v)).unwrap_or(1);
+            let init = match args.get(2) { None => 1, Some(&v) => int_arg(v, "string.match")? };
+            if init > s.len() as i64 + 1 { return Ok(vec![Value::nil()]); }
             let start = lua_str_start(s.len(), init);
             match pattern::find_from(s.as_bytes(), pat.as_bytes(), start) {
                 Ok(Some(m)) => {
@@ -1844,7 +1970,9 @@ impl Vm {
         let v_str_gmatch = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.gmatch")?.to_owned();
             let pat = str_arg(args, 1, "string.gmatch")?.to_owned();
-            let pos = Cell::new(0usize);
+            let init = match args.get(2) { None => 1, Some(&v) => int_arg(v, "string.gmatch")? };
+            let pos = Cell::new(if init > s.len() as i64 + 1 { usize::MAX }
+                                else { lua_str_start(s.len(), init) });
             let iter_val = CURRENT_VM.with(|c| {
                 let vm_ptr = c.get();
                 if vm_ptr.is_null() { return Value::nil(); }
@@ -1875,7 +2003,7 @@ impl Vm {
             let s = str_arg(args, 0, "string.gsub")?;
             let pat = str_arg(args, 1, "string.gsub")?;
             let repl = args.get(2).copied().unwrap_or(Value::nil());
-            let max_n = args.get(3).map(|&v| int_from_val(v)).unwrap_or(i64::MAX);
+            let max_n = match args.get(3) { None => i64::MAX, Some(&v) => int_arg(v, "string.gsub")? };
             let sb = s.as_bytes();
             let mut out: Vec<u8> = Vec::new();
             let mut pos = 0usize;
@@ -1933,7 +2061,16 @@ impl Vm {
             let hex = str_arg(args, 1, "string.unpack")?;
             let bytes = hex_to_bytes(hex)
                 .ok_or_else(|| VmError::RuntimeError("string.unpack: invalid packed data".into()))?;
-            let start = args.get(2).map(|&v| int_from_val(v)).unwrap_or(1).max(1) as usize - 1;
+            // Lua's posrelatI: negative counts back from the end; 0 or a
+            // position past len+1 is an error, not a silent clamp.
+            let init = match args.get(2) { None => 1, Some(&v) => int_arg(v, "string.unpack")? };
+            let start = if init > 0 { init }
+                        else if init != 0 && -init <= bytes.len() as i64 { bytes.len() as i64 + init + 1 }
+                        else { 0 };
+            if start < 1 || start > bytes.len() as i64 + 1 {
+                return Err(VmError::RuntimeError("string.unpack: initial position out of bounds".into()));
+            }
+            let start = (start - 1) as usize;
             let (vals, end_pos) = pack::unpack(fmt, &bytes, start).map_err(VmError::RuntimeError)?;
             let mut out: Vec<Value> = vals.into_iter().map(|pv| match pv {
                 pack::PackValue::Int(n) => make_int_via_current_vm(n),
@@ -2060,35 +2197,63 @@ impl Vm {
             if v.is_int_like() { return Ok(vec![v]); }
             if v.is_float() {
                 let f = v.as_float().unwrap();
-                let i = f as i64;
-                if i as f64 == f { return Ok(vec![make_int_via_current_vm(i)]); }
+                // Bounds first: `f as i64` saturates, and i64::MAX as f64 is
+                // exactly 2^63, so the round-trip check alone would wrongly
+                // accept 2^63 (and any larger float) as i64::MAX.
+                if f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+                    let i = f as i64;
+                    if i as f64 == f { return Ok(vec![make_int_via_current_vm(i)]); }
+                }
             }
             Ok(vec![Value::nil()])
         });
         let v_math_random = self.make_cfn_val(|args| {
+            if args.len() > 2 {
+                return Err(VmError::RuntimeError("math.random: wrong number of arguments".into()));
+            }
             let r = RNG.with(|c| { let n = splitmix64(c.get()); c.set(n); n });
             match args.len() {
                 0 => Ok(vec![Value::float((r >> 11) as f64 * (1.0_f64 / (1u64 << 53) as f64))]),
                 1 => {
-                    let m = int_from_val(args[0]);
+                    let m = int_arg(args[0], "math.random")?;
                     if m < 1 { return Err(VmError::RuntimeError("math.random: interval is empty".into())); }
                     Ok(vec![make_int_via_current_vm(1 + (r % m as u64) as i64)])
                 }
                 _ => {
-                    let lo = int_from_val(args[0]);
-                    let hi = int_from_val(args[1]);
+                    let lo = int_arg(args[0], "math.random")?;
+                    let hi = int_arg(args[1], "math.random")?;
                     if lo > hi { return Err(VmError::RuntimeError("math.random: interval is empty".into())); }
-                    let range = hi as i128 - lo as i128 + 1;
-                    if range > u64::MAX as i128 {
-                        return Err(VmError::RuntimeError("math.random: range too large".into()));
+                    // The full i64 span can't be a u64 range; Lua treats it
+                    // as "any bits" rather than erroring.
+                    if lo == i64::MIN && hi == i64::MAX {
+                        return Ok(vec![make_int_via_current_vm(r as i64)]);
                     }
+                    let range = hi as i128 - lo as i128 + 1;
                     Ok(vec![make_int_via_current_vm((lo as i128 + (r % range as u64) as i128) as i64)])
                 }
             }
         });
         let v_math_randomseed = self.make_cfn_val(|args| {
-            RNG.with(|c| c.set(int_from_val(args.first().copied().unwrap_or(Value::int(0))) as u64));
+            let seed = match args.first() { None => 0, Some(&v) => int_arg(v, "math.randomseed")? };
+            RNG.with(|c| c.set(seed as u64));
             Ok(vec![])
+        });
+        let v_math_fmod = self.make_cfn_val(|args| {
+            let a = args.first().copied().unwrap_or(Value::nil());
+            let b = args.get(1).copied().unwrap_or(Value::nil());
+            if a.is_int_like() && b.is_int_like() {
+                let (x, y) = (a.as_int().unwrap(), b.as_int().unwrap());
+                if y == 0 { return Err(VmError::RuntimeError("math.fmod: zero divisor".into())); }
+                return Ok(vec![make_int_via_current_vm(x.wrapping_rem(y))]);
+            }
+            let x = a.to_float().ok_or_else(|| VmError::RuntimeError("math.fmod: number expected".into()))?;
+            let y = b.to_float().ok_or_else(|| VmError::RuntimeError("math.fmod: number expected".into()))?;
+            Ok(vec![Value::float(x % y)])
+        });
+        let v_math_ult = self.make_cfn_val(|args| {
+            let a = int_arg(args.first().copied().unwrap_or(Value::nil()), "math.ult")?;
+            let b = int_arg(args.get(1).copied().unwrap_or(Value::nil()), "math.ult")?;
+            Ok(vec![Value::bool((a as u64) < (b as u64))])
         });
 
         {
@@ -2113,6 +2278,8 @@ impl Vm {
             let k = self.intern("tointeger");   mt.raw_set(k, v_math_tointeger);
             let k = self.intern("random");      mt.raw_set(k, v_math_random);
             let k = self.intern("randomseed");  mt.raw_set(k, v_math_randomseed);
+            let k = self.intern("fmod");        mt.raw_set(k, v_math_fmod);
+            let k = self.intern("ult");         mt.raw_set(k, v_math_ult);
         }
         let k_math = self.intern("math");
         self.globals.raw_set(k_math, Value::table(math_table_ptr));
@@ -2130,7 +2297,7 @@ impl Vm {
                     tbl.raw_set(Value::int(n), args[1]);
                 }
                 3 => {
-                    let pos = int_from_val(args[1]);
+                    let pos = int_arg(args[1], "table.insert")?;
                     let n   = tbl.length();
                     if pos < 1 || pos > n + 1 {
                         return Err(VmError::RuntimeError("table.insert: position out of bounds".into()));
@@ -2150,7 +2317,7 @@ impl Vm {
             if !t.is_table() { return Err(VmError::RuntimeError("table.remove: table expected".into())); }
             let tbl = unsafe { table_ref(t) };
             let n = tbl.length();
-            let pos = args.get(1).map(|&v| int_from_val(v)).unwrap_or(n);
+            let pos = match args.get(1) { None => n, Some(&v) => int_arg(v, "table.remove")? };
             if n == 0 || pos < 1 || pos > n { return Ok(vec![Value::nil()]); }
             let removed = tbl.raw_get(Value::int(pos));
             for i in pos..n {
@@ -2164,12 +2331,16 @@ impl Vm {
             let t = args.first().copied().unwrap_or(Value::nil());
             if !t.is_table() { return Err(VmError::RuntimeError("table.concat: table expected".into())); }
             let tbl = unsafe { &*(t.as_table().unwrap() as *const Table) };
-            let sep = args.get(1).filter(|v| v.is_string())
-                .map(|&v| unsafe { string_ref(v) }.to_owned())
-                .unwrap_or_default();
+            let sep = match args.get(1) {
+                None => String::new(),
+                Some(&v) if v.is_nil() => String::new(),
+                Some(&v) if v.is_string() => unsafe { string_ref(v) }.to_owned(),
+                Some(&v) if v.is_number() => coerce_to_concat_str(v),
+                Some(_) => return Err(VmError::RuntimeError("table.concat: string expected".into())),
+            };
             let n = tbl.length();
-            let i = args.get(2).map(|&v| int_from_val(v)).unwrap_or(1);
-            let j = args.get(3).map(|&v| int_from_val(v)).unwrap_or(n);
+            let i = match args.get(2) { None => 1, Some(&v) => int_arg(v, "table.concat")? };
+            let j = match args.get(3) { None => n, Some(&v) => int_arg(v, "table.concat")? };
             if checked_range_len(i, j).is_none() {
                 return Err(VmError::RuntimeError("table.concat: range too large".into()));
             }
@@ -2202,6 +2373,25 @@ impl Vm {
                             Ok(res) => Ok(res.into_iter().next().unwrap_or(Value::nil()).is_truthy()),
                             Err(e)  => Err(e),
                         }
+                    }).and_then(|lt| {
+                        // Lua's "invalid order function": a comparator that
+                        // claims both a<b and b<a can't drive a sort.
+                        if !lt { return Ok(false); }
+                        CURRENT_VM.with(|c| {
+                            let vm_ptr = c.get();
+                            if vm_ptr.is_null() { return Ok(false); }
+                            let vm = unsafe { &mut *vm_ptr };
+                            match vm.call_value_isolated(cf, &[*b, *a]) {
+                                Ok(res) => {
+                                    if res.into_iter().next().unwrap_or(Value::nil()).is_truthy() {
+                                        Err(VmError::RuntimeError("invalid order function for sorting".into()))
+                                    } else {
+                                        Ok(true)
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        })
                     }),
                     None => value_lt(*a, *b),
                 };
@@ -2231,11 +2421,11 @@ impl Vm {
         });
         let v_tbl_unpack = self.make_cfn_val(|args| {
             let t = args.first().copied().unwrap_or(Value::nil());
-            if !t.is_table() { return Ok(vec![]); }
+            if !t.is_table() { return Err(VmError::RuntimeError("table.unpack: table expected".into())); }
             let tbl = unsafe { &*(t.as_table().unwrap() as *const Table) };
             let n = tbl.length();
-            let i = args.get(1).map(|&v| int_from_val(v)).unwrap_or(1);
-            let j = args.get(2).map(|&v| int_from_val(v)).unwrap_or(n);
+            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "table.unpack")? };
+            let j = match args.get(2) { None => n, Some(&v) => int_arg(v, "table.unpack")? };
             if checked_range_len(i, j).is_none() {
                 return Err(VmError::RuntimeError("table.unpack: range too large".into()));
             }
@@ -2244,10 +2434,14 @@ impl Vm {
         let v_tbl_move = self.make_cfn_val(|args| {
             let a1 = args.first().copied().unwrap_or(Value::nil());
             if !a1.is_table() { return Err(VmError::RuntimeError("table.move: table expected".into())); }
-            let f  = int_from_val(args.get(1).copied().unwrap_or(Value::int(1)));
-            let e  = int_from_val(args.get(2).copied().unwrap_or(Value::int(0)));
-            let t  = int_from_val(args.get(3).copied().unwrap_or(Value::int(1)));
-            let a2 = args.get(4).copied().filter(|v| v.is_table()).unwrap_or(a1);
+            let f  = int_arg(args.get(1).copied().unwrap_or(Value::nil()), "table.move")?;
+            let e  = int_arg(args.get(2).copied().unwrap_or(Value::nil()), "table.move")?;
+            let t  = int_arg(args.get(3).copied().unwrap_or(Value::nil()), "table.move")?;
+            let a2 = match args.get(4) {
+                None => a1,
+                Some(&v) if v.is_table() => v,
+                Some(_) => return Err(VmError::RuntimeError("table.move: table expected".into())),
+            };
             if e >= f {
                 if checked_range_len(f, e).is_none() {
                     return Err(VmError::RuntimeError("table.move: range too large".into()));
@@ -2291,35 +2485,14 @@ impl Vm {
             Ok(vec![])
         });
         let v_io_read = self.make_cfn_val(|args| {
-            let fmt = args.first().filter(|v| v.is_string())
-                .map(|&v| unsafe { string_ref(v) }.trim_start_matches('*').to_owned())
-                .unwrap_or_else(|| "l".to_owned());
-            use std::io::Read as _;
-            match fmt.as_str() {
-                "a" => {
-                    let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)
-                        .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
-                    Ok(vec![alloc_string_val(&buf)])
-                }
-                "n" => {
-                    let mut line = String::new();
-                    std::io::stdin().read_line(&mut line)
-                        .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
-                    let trimmed = line.trim();
-                    if let Ok(i) = trimmed.parse::<i64>() { Ok(vec![make_int_via_current_vm(i)]) }
-                    else if let Ok(f) = trimmed.parse::<f64>() { Ok(vec![Value::float(f)]) }
-                    else { Ok(vec![Value::nil()]) }
-                }
-                _ => {
-                    let mut line = String::new();
-                    let n = std::io::stdin().read_line(&mut line)
-                        .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
-                    if n == 0 { return Ok(vec![Value::nil()]); }
-                    while line.ends_with('\n') || line.ends_with('\r') { line.pop(); }
-                    Ok(vec![alloc_string_val(&line)])
-                }
+            let fmts: Vec<Value> = if args.is_empty() { vec![Value::nil()] } else { args.to_vec() };
+            let mut out = Vec::new();
+            for fv in fmts {
+                let v = read_stdin_format(&fv)?;
+                if v.is_nil() { return Ok(vec![Value::nil()]); }
+                out.push(v);
             }
+            Ok(out)
         });
         let v_io_open = self.make_cfn_val(|args| {
             let path = str_arg(args, 0, "io.open")?.to_owned();
@@ -2353,35 +2526,21 @@ impl Vm {
                     let mut guard = f.borrow_mut();
                     let file = guard.as_mut()
                         .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
-                    let fmt = args.get(1).filter(|v| v.is_string())
-                        .map(|&v| unsafe { string_ref(v) }.trim_start_matches('*').to_owned())
-                        .unwrap_or_else(|| "l".to_owned());
-                    match fmt.as_str() {
-                        "a" => {
-                            use std::io::Read;
-                            let mut buf = String::new();
-                            file.read_to_string(&mut buf)
-                                .map_err(|e| VmError::RuntimeError(format!("file:read: {e}")))?;
-                            Ok(vec![alloc_string_val(&buf)])
-                        }
-                        "n" => match read_line_from_file(file)? {
-                            None => Ok(vec![Value::nil()]),
-                            Some(l) => {
-                                let t = l.trim();
-                                if let Ok(i) = t.parse::<i64>() { Ok(vec![make_int_via_current_vm(i)]) }
-                                else if let Ok(fl) = t.parse::<f64>() { Ok(vec![Value::float(fl)]) }
-                                else { Ok(vec![Value::nil()]) }
-                            }
-                        },
-                        _ => match read_line_from_file(file)? {
-                            None => Ok(vec![Value::nil()]),
-                            Some(mut l) => {
-                                while l.ends_with('\n') || l.ends_with('\r') { l.pop(); }
-                                Ok(vec![alloc_string_val(&l)])
-                            }
-                        },
+                    let fmts: Vec<Value> = if args.len() <= 1 { vec![Value::nil()] } else { args[1..].to_vec() };
+                    let mut out = Vec::new();
+                    for fv in fmts {
+                        let v = read_file_format(file, &fv)?;
+                        if v.is_nil() { return Ok(vec![Value::nil()]); }
+                        out.push(v);
                     }
+                    Ok(out)
                 });
+
+                // The handle table exists before the method closures so
+                // file:write can return it (Lua returns the file for chaining).
+                let ft_ptr = alloc_table_raw();
+                vm.gc.register_table(ft_ptr);
+                let handle = Value::table(ft_ptr);
 
                 let f = file.clone();
                 let v_write = vm.make_cfn_val(move |args| {
@@ -2397,7 +2556,7 @@ impl Vm {
                     }
                     file.write_all(out.as_bytes())
                         .map_err(|e| VmError::RuntimeError(format!("file:write: {e}")))?;
-                    Ok(vec![])
+                    Ok(vec![handle])
                 });
 
                 let f = file.clone();
@@ -2417,7 +2576,9 @@ impl Vm {
                             let file = guard.as_mut()
                                 .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
                             match read_line_from_file(file)? {
-                                None => Ok(vec![Value::nil()]),
+                                // Lua closes the file when its lines iterator
+                                // reaches EOF.
+                                None => { guard.take(); Ok(vec![Value::nil()]) }
                                 Some(mut l) => {
                                     while l.ends_with('\n') || l.ends_with('\r') { l.pop(); }
                                     Ok(vec![alloc_string_val(&l)])
@@ -2428,22 +2589,57 @@ impl Vm {
                     Ok(vec![iter_val])
                 });
 
-                let ft_ptr = alloc_table_raw();
-                vm.gc.register_table(ft_ptr);
                 let ft = unsafe { &mut *(ft_ptr as *mut Table) };
                 let k = vm.intern("read");  ft.raw_set(k, v_read);
                 let k = vm.intern("write"); ft.raw_set(k, v_write);
                 let k = vm.intern("close"); ft.raw_set(k, v_close);
                 let k = vm.intern("lines"); ft.raw_set(k, v_lines);
-                Value::table(ft_ptr)
+                handle
             });
             Ok(vec![handle_val])
+        });
+        let v_io_lines = self.make_cfn_val(|args| {
+            let path = str_arg(args, 0, "io.lines")?.to_owned();
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => return Err(VmError::RuntimeError(format!("io.lines: cannot open '{path}': {e}"))),
+            };
+            let file = std::rc::Rc::new(std::cell::RefCell::new(Some(file)));
+            let iter_val = CURRENT_VM.with(|c| {
+                let vm_ptr = c.get();
+                if vm_ptr.is_null() { return Value::nil(); }
+                unsafe { &mut *vm_ptr }.make_cfn_val(move |_args| {
+                    let mut guard = file.borrow_mut();
+                    let f = guard.as_mut()
+                        .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
+                    match read_line_from_file(f)? {
+                        None => { guard.take(); Ok(vec![Value::nil()]) }
+                        Some(mut l) => {
+                            while l.ends_with('\n') || l.ends_with('\r') { l.pop(); }
+                            Ok(vec![alloc_string_val(&l)])
+                        }
+                    }
+                })
+            });
+            Ok(vec![iter_val])
+        });
+        let v_io_close = self.make_cfn_val(|args| {
+            let h = args.first().copied().unwrap_or(Value::nil());
+            if !h.is_table() { return Err(VmError::RuntimeError("io.close: file expected".into())); }
+            let close = unsafe { table_ref(h) }.raw_get(alloc_string_val("close"));
+            CURRENT_VM.with(|c| {
+                let vm_ptr = c.get();
+                if vm_ptr.is_null() { return Err(VmError::RuntimeError("no VM context".into())); }
+                unsafe { &mut *vm_ptr }.call_value_isolated(close, &[h])
+            })
         });
         {
             let iot = unsafe { &mut *(io_table_ptr as *mut Table) };
             let k = self.intern("write"); iot.raw_set(k, v_io_write);
             let k = self.intern("read");  iot.raw_set(k, v_io_read);
             let k = self.intern("open");  iot.raw_set(k, v_io_open);
+            let k = self.intern("lines"); iot.raw_set(k, v_io_lines);
+            let k = self.intern("close"); iot.raw_set(k, v_io_close);
         }
         let k_io = self.intern("io");
         self.globals.raw_set(k_io, Value::table(io_table_ptr));
@@ -2451,7 +2647,30 @@ impl Vm {
         let os_table_ptr = alloc_table_raw();
         self.gc.register_table(os_table_ptr);
 
-        let v_os_time = self.make_cfn_val(|_args| {
+        let v_os_time = self.make_cfn_val(|args| {
+            if let Some(&t) = args.first() {
+                if !t.is_table() {
+                    return Err(VmError::RuntimeError("os.time: table expected".into()));
+                }
+                let tbl = unsafe { &*(t.as_table().unwrap() as *const Table) };
+                let get = |name: &str| tbl.raw_get(alloc_string_val(name));
+                let field = |name: &str, who: &str| -> VmResult<i64> {
+                    let v = get(name);
+                    if v.is_nil() {
+                        return Err(VmError::RuntimeError(format!("{who}: field '{name}' missing in date table")));
+                    }
+                    int_arg(v, who)
+                };
+                let year  = field("year", "os.time")?;
+                let month = field("month", "os.time")?;
+                let day   = field("day", "os.time")?;
+                let hour   = if get("hour").is_nil() { 12 } else { int_arg(get("hour"), "os.time")? };
+                let min    = if get("min").is_nil() { 0 } else { int_arg(get("min"), "os.time")? };
+                let sec    = if get("sec").is_nil() { 0 } else { int_arg(get("sec"), "os.time")? };
+                let isdst  = get("isdst").is_truthy();
+                return Ok(vec![make_int_via_current_vm(days_from_civil(year, month, day) * 86400
+                    + hour * 3600 + min * 60 + sec - if isdst { 3600 } else { 0 })]);
+            }
             let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64).unwrap_or(0);
             Ok(vec![make_int_via_current_vm(secs)])
@@ -2468,13 +2687,41 @@ impl Vm {
             }
         });
         let v_os_date = self.make_cfn_val(|args| {
-            let fmt = args.first().filter(|v| v.is_string())
+            let mut fmt = args.first().filter(|v| v.is_string())
                 .map(|&v| unsafe { string_ref(v) }.to_owned())
-                .unwrap_or_else(|| "%Y-%m-%d %H:%M:%S".to_owned());
-            let secs = args.get(1).map(|&v| int_from_val(v)).unwrap_or_else(|| {
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64).unwrap_or(0)
-            });
+                .unwrap_or_else(|| "%c".to_owned());
+            // '!' selects UTC; Umbra only has UTC, so it's a no-op marker.
+            if let Some(rest) = fmt.strip_prefix('!') { fmt = rest.to_owned(); }
+            let secs = match args.get(1) {
+                None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64).unwrap_or(0),
+                Some(&v) => int_arg(v, "os.date")?,
+            };
+            if fmt == "*t" {
+                return Ok(vec![CURRENT_VM.with(|c| {
+                    let vm_ptr = c.get();
+                    if vm_ptr.is_null() { return Value::nil(); }
+                    let vm = unsafe { &mut *vm_ptr };
+                    let ptr = alloc_table_raw();
+                    vm.gc.register_table(ptr);
+                    let t = unsafe { &mut *(ptr as *mut Table) };
+                    let (year, month, day, yday, wday) = civil_fields(secs);
+                    let sod = secs.rem_euclid(86400);
+                    let mut set = |t: &mut Table, k: &str, v: i64| {
+                        t.raw_set(vm.intern(k), make_int_via_current_vm(v));
+                    };
+                    set(t, "year", year);
+                    set(t, "month", month as i64);
+                    set(t, "day", day as i64);
+                    set(t, "hour", sod / 3600);
+                    set(t, "min", (sod / 60) % 60);
+                    set(t, "sec", sod % 60);
+                    set(t, "wday", wday as i64 + 1);
+                    set(t, "yday", yday as i64);
+                    t.raw_set(vm.intern("isdst"), Value::bool(false));
+                    Value::table(ptr)
+                })]);
+            }
             Ok(vec![alloc_string_val(&format_civil_time(secs, &fmt))])
         });
         {
@@ -2493,7 +2740,7 @@ impl Vm {
         let v_utf8_char = self.make_cfn_val(|args| {
             let mut s = String::new();
             for &v in args {
-                let n = int_from_val(v);
+                let n = int_arg(v, "utf8.char")?;
                 let cp = u32::try_from(n).ok().and_then(char::from_u32)
                     .ok_or_else(|| VmError::RuntimeError("utf8.char: value out of range".into()))?;
                 s.push(cp);
@@ -2502,23 +2749,26 @@ impl Vm {
         });
         let v_utf8_len = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "utf8.len")?;
-            let i = args.get(1).map(|&v| int_from_val(v)).unwrap_or(1);
-            let j = args.get(2).map(|&v| int_from_val(v)).unwrap_or(-1);
+            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "utf8.len")? };
+            let j = match args.get(2) { None => -1, Some(&v) => int_arg(v, "utf8.len")? };
             let start = lua_str_start(s.len(), i);
             let end = lua_str_end(s.len(), j);
-            if start > end || !s.is_char_boundary(start) || !s.is_char_boundary(end) {
+            // An empty range is 0 characters, not an error.
+            if start > end { return Ok(vec![Value::int(0)]); }
+            if !s.is_char_boundary(start) || !s.is_char_boundary(end) {
                 return Ok(vec![Value::nil(), Value::int(start as i64 + 1)]);
             }
             Ok(vec![make_int_via_current_vm(s[start..end].chars().count() as i64)])
         });
         let v_utf8_codepoint = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "utf8.codepoint")?;
-            let i = args.get(1).map(|&v| int_from_val(v)).unwrap_or(1);
-            let j = args.get(2).map(|&v| int_from_val(v)).unwrap_or(i);
+            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "utf8.codepoint")? };
+            let j = match args.get(2) { None => i, Some(&v) => int_arg(v, "utf8.codepoint")? };
             let start = lua_str_start(s.len(), i);
             // i/j are start-of-character byte positions, not a byte range end —
             // a multi-byte char's last byte can't be an exact "j" on its own.
             let last_start = lua_str_start(s.len(), j);
+            if start > last_start { return Ok(vec![]); }
             if start > s.len() || !s.is_char_boundary(start) {
                 return Err(VmError::RuntimeError("utf8.codepoint: invalid byte position".into()));
             }
@@ -2535,7 +2785,7 @@ impl Vm {
                 let vm_ptr = c.get();
                 if vm_ptr.is_null() { return Value::nil(); }
                 unsafe { &mut *vm_ptr }.make_cfn_val(move |cargs| {
-                    let prev = cargs.get(1).map(|&v| int_from_val(v)).unwrap_or(0);
+                    let prev = match cargs.get(1) { None => 0, Some(&v) => int_arg(v, "utf8.codes")? };
                     let next_byte = if prev <= 0 { 0usize } else {
                         let p = (prev - 1) as usize;
                         if p >= s.len() || !s.is_char_boundary(p) {
@@ -2686,6 +2936,33 @@ pub fn get_cfn_pub(v: Value) -> Option<&'static dyn Fn(&[Value]) -> VmResult<Vec
     get_cfn(v)
 }
 
+// Lua floor division/modulo on integers: the result rounds toward -inf and
+// the remainder takes the divisor's sign (unlike Rust's div_euclid, which
+// keeps the remainder non-negative). wrapping_* keeps i64::MIN // -1 and
+// i64::MIN % -1 panic-free (MIN and 0 respectively, like Lua's wrap).
+fn lua_idiv(x: i64, y: i64) -> i64 {
+    let q = x.wrapping_div(y);
+    let r = x.wrapping_rem(y);
+    if r != 0 && (r < 0) != (y < 0) { q - 1 } else { q }
+}
+
+fn lua_mod(x: i64, y: i64) -> i64 {
+    let r = x.wrapping_rem(y);
+    if r != 0 && (r < 0) != (y < 0) { r + y } else { r }
+}
+
+// At the top-level boundary (exec/exec_owned) a thrown value that escaped
+// every pcall becomes a plain runtime error carrying its display form —
+// there is no script-side handler left to receive the object.
+fn thrown_to_runtime(e: VmError) -> VmError {
+    match e {
+        VmError::Thrown(v) if v.is_string() =>
+            VmError::RuntimeError(unsafe { string_ref(v) }.to_owned()),
+        VmError::Thrown(v) => VmError::RuntimeError(format!("{v}")),
+        other => other,
+    }
+}
+
 
 fn pattern_captures(subj: &[u8], m: &pattern::Match) -> Vec<Value> {
     m.captures.iter().map(|c| match c {
@@ -2707,6 +2984,9 @@ fn apply_gsub_repl(repl: Value, subj: &[u8], m: &pattern::Match, whole: &[u8]) -
         let mut result = Vec::new();
         let mut i = 0;
         while i < rb.len() {
+            if rb[i] == b'%' && i + 1 == rb.len() {
+                return Err(VmError::RuntimeError("invalid use of '%' in replacement string".into()));
+            }
             if rb[i] == b'%' && i + 1 < rb.len() {
                 let c = rb[i + 1];
                 if c == b'%' { result.push(b'%'); }
@@ -2774,7 +3054,7 @@ fn gsub_result_value(v: Value) -> VmResult<Option<Vec<u8>>> {
 fn coerce_to_concat_str(v: Value) -> String {
     if v.is_string() { unsafe { string_ref(v) }.to_owned() }
     else if v.is_int_like() { v.as_int().unwrap().to_string() }
-    else { v.as_float().unwrap().to_string() }
+    else { crate::value::lua_float_str(v.as_float().unwrap()) }
 }
 
 // __tostring-aware stringification shared by print/tostring/string.format.
@@ -2811,6 +3091,16 @@ fn int_val(v: Value) -> VmResult<i64> {
     Err(VmError::RuntimeError(format!("integer expected, got {}", v.type_name())))
 }
 
+// Strict integer argument for stdlib calls, matching Lua's luaL_checkinteger:
+// integral floats convert, anything else is an error (int_from_val silently
+// truncated non-integral floats and defaulted non-numbers to 0).
+fn int_arg(v: Value, who: &str) -> VmResult<i64> {
+    int_val(v).map_err(|e| match e {
+        VmError::RuntimeError(m) => VmError::RuntimeError(format!("{who}: {m}")),
+        other => other,
+    })
+}
+
 // Lua shift semantics: negative counts shift the other way, |n| >= 64 gives 0.
 fn lua_shl(x: i64, n: i64) -> i64 {
     if n <= -64 || n >= 64 { 0 }
@@ -2829,28 +3119,27 @@ fn to_number(v: Value, what: &str) -> VmResult<Num> {
 
 fn num_add(a: Num, b: Num) -> Value {
     match (a, b) {
-        (Num::Int(x), Num::Int(y)) => make_int_via_current_vm(x.wrapping_add(y)),
+        // Overflow pushes the candidate past every limit as +/-inf, so the
+        // loop terminates instead of wrapping the counter (Lua semantics).
+        (Num::Int(x), Num::Int(y)) => match x.checked_add(y) {
+            Some(n) => make_int_via_current_vm(n),
+            None => Value::float(if y >= 0 { f64::INFINITY } else { f64::NEG_INFINITY }),
+        },
         (Num::Float(x), Num::Float(y)) => Value::float(x + y),
         (Num::Int(x), Num::Float(y)) => Value::float(x as f64 + y),
         (Num::Float(x), Num::Int(y)) => Value::float(x + y as f64),
     }
 }
 
-fn num_sub(a: Num, b: Num) -> Value {
-    match (a, b) {
-        (Num::Int(x), Num::Int(y)) => make_int_via_current_vm(x.wrapping_sub(y)),
-        (Num::Float(x), Num::Float(y)) => Value::float(x - y),
-        (Num::Int(x), Num::Float(y)) => Value::float(x as f64 - y),
-        (Num::Float(x), Num::Int(y)) => Value::float(x - y as f64),
-    }
-}
-
 fn num_le(a: Num, b: Num) -> bool {
+    use crate::value::cmp_int_float;
     match (a, b) {
         (Num::Int(x), Num::Int(y))     => x <= y,
         (Num::Float(x), Num::Float(y)) => x <= y,
-        (Num::Int(x), Num::Float(y))   => (x as f64) <= y,
-        (Num::Float(x), Num::Int(y))   => x <= (y as f64),
+        // Exact int/float compare: `x as f64` would round e.g. i64::MAX up to
+        // 2^63 and wrongly include it in a `<= 2^63` range.
+        (Num::Int(x), Num::Float(y))   => cmp_int_float(x, y).is_some_and(|o| o.is_le()),
+        (Num::Float(x), Num::Int(y))   => cmp_int_float(y, x).is_some_and(|o| o.is_ge()),
     }
 }
 
@@ -2924,6 +3213,164 @@ fn read_line_from_file(file: &mut std::fs::File) -> VmResult<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
+// Lua's str_to_number on a maximal prefix: returns (value, bytes consumed
+// from the start of `s`, leading whitespace included). Accepts decimal
+// ints/floats, hex ints (wrapping) and hex floats, inf/nan.
+fn str_to_number_prefix(s: &str) -> Option<(Value, usize)> {
+    let ws = s.len() - s.trim_start().len();
+    let t = s.trim_start();
+    // Try every prefix length, longest first — cheap because numeric prefixes
+    // are short; stops at the first parseable one.
+    for end in (1..=t.len()).rev() {
+        if !t.is_char_boundary(end) { continue; }
+        let cand = &t[..end];
+        let (neg, body) = match cand.strip_prefix('-') { Some(r) => (true, r), None => (false, cand) };
+        let body = body.strip_prefix('+').unwrap_or(body);
+        if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            if !hex.is_empty() && hex.bytes().all(|b| (b as char).is_ascii_hexdigit()) {
+                let mut n: u64 = 0;
+                for c in hex.bytes() { n = n.wrapping_mul(16).wrapping_add((c as char).to_digit(16).unwrap() as u64); }
+                let n = n as i64;
+                return Some((make_int_via_current_vm(if neg { n.wrapping_neg() } else { n }), ws + end));
+            }
+            if let Ok(f) = crate::lexer::parse_hex_float(body) {
+                return Some((Value::float(if neg { -f } else { f }), ws + end));
+            }
+            continue;
+        }
+        if let Ok(n) = cand.parse::<i64>() {
+            return Some((make_int_via_current_vm(n), ws + end));
+        }
+        if let Ok(f) = cand.parse::<f64>() {
+            return Some((Value::float(f), ws + end));
+        }
+    }
+    None
+}
+
+// Reads a Lua "n" format from a seekable file: skip whitespace, take the
+// longest valid numeric prefix, then seek back the unread tail.
+fn read_number_from_file(file: &mut std::fs::File) -> VmResult<Value> {
+    use std::io::{Read, Seek};
+    let mut buf: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match file.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                let b = byte[0];
+                buf.push(b);
+                let numeric = b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_');
+                let still_ws = buf.iter().all(|c| c.is_ascii_whitespace());
+                if !numeric && !still_ws { break; }
+            }
+            Err(e) => return Err(VmError::RuntimeError(format!("file:read: {e}"))),
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let (v, used) = match str_to_number_prefix(&text) {
+        Some(r) => r,
+        None => (Value::nil(), 0),
+    };
+    let unread = buf.len() - used;
+    if unread > 0 {
+        let _ = file.seek(std::io::SeekFrom::Current(-(unread as i64)));
+    }
+    Ok(v)
+}
+
+fn read_file_format(file: &mut std::fs::File, fv: &Value) -> VmResult<Value> {
+    use std::io::{Read, Seek};
+    if fv.is_number() {
+        let n = int_arg(*fv, "file:read")?;
+        if n < 0 { return Err(VmError::RuntimeError("file:read: invalid length".into())); }
+        if n == 0 {
+            // Probe for EOF: empty string if more data, nil at EOF.
+            let mut b = [0u8; 1];
+            return match file.read(&mut b) {
+                Ok(0) => Ok(Value::nil()),
+                Ok(_) => {
+                    let _ = file.seek(std::io::SeekFrom::Current(-1));
+                    Ok(alloc_string_val(""))
+                }
+                Err(e) => Err(VmError::RuntimeError(format!("file:read: {e}"))),
+            };
+        }
+        let mut buf = vec![0u8; n as usize];
+        let got = file.read(&mut buf).map_err(|e| VmError::RuntimeError(format!("file:read: {e}")))?;
+        if got == 0 { return Ok(Value::nil()); }
+        buf.truncate(got);
+        return Ok(alloc_string_val(&String::from_utf8_lossy(&buf)));
+    }
+    let fmt = if fv.is_string() {
+        unsafe { string_ref(*fv) }.trim_start_matches('*').to_owned()
+    } else if fv.is_nil() {
+        "l".to_owned()
+    } else {
+        return Err(VmError::RuntimeError("file:read: invalid format".into()));
+    };
+    match fmt.as_str() {
+        "a" => {
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)
+                .map_err(|e| VmError::RuntimeError(format!("file:read: {e}")))?;
+            Ok(alloc_string_val(&buf))
+        }
+        "n" => read_number_from_file(file),
+        "l" => match read_line_from_file(file)? {
+            None => Ok(Value::nil()),
+            Some(mut l) => {
+                while l.ends_with('\n') || l.ends_with('\r') { l.pop(); }
+                Ok(alloc_string_val(&l))
+            }
+        },
+        "L" => match read_line_from_file(file)? {
+            None => Ok(Value::nil()),
+            Some(l) => Ok(alloc_string_val(&l)),
+        },
+        _ => Err(VmError::RuntimeError(format!("file:read: invalid format '{fmt}'"))),
+    }
+}
+
+fn read_stdin_format(fv: &Value) -> VmResult<Value> {
+    use std::io::Read;
+    let fmt = if fv.is_string() {
+        unsafe { string_ref(*fv) }.trim_start_matches('*').to_owned()
+    } else if fv.is_nil() {
+        "l".to_owned()
+    } else {
+        return Err(VmError::RuntimeError("io.read: invalid format".into()));
+    };
+    match fmt.as_str() {
+        "a" => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)
+                .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+            Ok(alloc_string_val(&buf))
+        }
+        "n" => {
+            // stdin isn't seekable, so the longest numeric prefix of the line
+            // is taken and the rest of the line is consumed.
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)
+                .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+            match str_to_number_prefix(&line) {
+                Some((v, _)) => Ok(v),
+                None => Ok(Value::nil()),
+            }
+        }
+        "l" | "L" => {
+            let mut line = String::new();
+            let n = std::io::stdin().read_line(&mut line)
+                .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+            if n == 0 { return Ok(Value::nil()); }
+            if fmt == "l" { while line.ends_with('\n') || line.ends_with('\r') { line.pop(); } }
+            Ok(alloc_string_val(&line))
+        }
+        _ => Err(VmError::RuntimeError(format!("io.read: invalid format '{fmt}'"))),
+    }
+}
+
 fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes { s.push_str(&format!("{b:02x}")); }
@@ -2949,9 +3396,6 @@ fn str_arg<'a>(args: &'a [Value], idx: usize, fn_name: &'static str) -> VmResult
     }
 }
 
-fn int_from_val(v: Value) -> i64 {
-    v.as_int().or_else(|| v.as_float().map(|f| f as i64)).unwrap_or(0)
-}
 
 // i64::MIN..=i64::MAX overflows i64 arithmetic directly, so the length is
 // computed in i128; returns None if the (inclusive) range exceeds MAX_ALLOC_LEN.
@@ -2995,6 +3439,91 @@ fn pad_str(s: String, width: usize, left_align: bool, zero_pad: bool) -> String 
     }
 }
 
+// C-style %e: Rust's {:e} prints "1.23e4"; C wants "1.23e+04".
+fn fmt_e(f: f64, prec: usize, upper: bool) -> String {
+    if f.is_nan() { return if upper { "NAN".into() } else { "nan".into() }; }
+    if f.is_infinite() { return if upper { "INF".into() } else { "inf".into() }; }
+    let t = format!("{:.*e}", prec, f);
+    let epos = t.rfind('e').unwrap();
+    let ex: i32 = t[epos + 1..].parse().unwrap();
+    let s = format!("{}e{}{:02}", &t[..epos], if ex < 0 { "-" } else { "+" }, ex.abs());
+    if upper { s.to_uppercase() } else { s }
+}
+
+// C-style %g: shortest of %e/%f at the given significant-digit count, with
+// trailing zeros stripped.
+fn fmt_g(f: f64, prec: usize, upper: bool) -> String {
+    if f.is_nan() { return if upper { "NAN".into() } else { "nan".into() }; }
+    if f.is_infinite() { return if upper { "INF".into() } else { "inf".into() }; }
+    let p = if prec == 0 { 1 } else { prec };
+    let e = format!("{:.*e}", p - 1, f);
+    let exp: i32 = e[e.rfind('e').unwrap() + 1..].parse().unwrap();
+    let s = if exp < -4 || exp >= p as i32 {
+        let t = format!("{:.*e}", p - 1, f);
+        let epos = t.rfind('e').unwrap();
+        let ex: i32 = t[epos + 1..].parse().unwrap();
+        let mut m: String = t[..epos].into();
+        if m.contains('.') {
+            while m.ends_with('0') { m.pop(); }
+            if m.ends_with('.') { m.pop(); }
+        }
+        format!("{}e{}{:02}", m, if ex < 0 { "-" } else { "+" }, ex.abs())
+    } else {
+        let decimals = (p as i32 - 1 - exp).max(0) as usize;
+        let mut t = format!("{:.*}", decimals, f);
+        if t.contains('.') {
+            while t.ends_with('0') { t.pop(); }
+            if t.ends_with('.') { t.pop(); }
+        }
+        t
+    };
+    if upper { s.to_uppercase() } else { s }
+}
+
+// C-style %a hex float on |f| (caller handles the sign).
+fn fmt_a(f: f64, prec: Option<usize>, upper: bool) -> String {
+    if f.is_nan() { return if upper { "NAN".into() } else { "nan".into() }; }
+    if f.is_infinite() { return if upper { "INF".into() } else { "inf".into() }; }
+    if f == 0.0 { return "0x0p+0".into(); }
+    let bits = f.abs().to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let mut frac = bits & ((1u64 << 52) - 1);
+    let (mut lead, mut e2) = if raw_exp == 0 { (0u64, -1022i64) } else { (1u64, raw_exp - 1023) };
+    let mut digits = String::new();
+    match prec {
+        None => {
+            // Minimal form: emit all 13 nibbles, then drop trailing zeros.
+            let mut ds = Vec::new();
+            let mut m = frac;
+            for _ in 0..13 { ds.push((m >> 48) & 0xf); m <<= 4; }
+            while ds.last() == Some(&0) { ds.pop(); }
+            for d in ds { digits.push(char::from_digit(d as u32, 16).unwrap()); }
+        }
+        Some(p) => {
+            if p < 13 {
+                // Round the 52-bit mantissa to p hex digits (half up).
+                let drop = 52 - p as u32 * 4;
+                frac += 1u64 << (drop - 1);
+                if frac >= 1u64 << 52 {
+                    frac = 0;
+                    if lead == 0 { lead = 1; } else { e2 += 1; }
+                }
+                frac >>= drop;
+                for k in (0..p).rev() {
+                    digits.push(char::from_digit(((frac >> (k * 4)) & 0xf) as u32, 16).unwrap());
+                }
+            } else {
+                let mut m = frac;
+                for _ in 0..13 { digits.push(char::from_digit(((m >> 48) & 0xf) as u32, 16).unwrap()); m <<= 4; }
+                for _ in 13..p { digits.push('0'); }
+            }
+        }
+    }
+    let s = if digits.is_empty() { format!("0x{lead}p{e2:+}") }
+            else { format!("0x{lead}.{digits}p{e2:+}") };
+    if upper { s.to_uppercase() } else { s }
+}
+
 fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
     let mut out = String::new();
     let bytes = fmt.as_bytes();
@@ -3009,19 +3538,23 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
             continue;
         }
         pos += 1;
-        if pos >= bytes.len() { break; }
+        if pos >= bytes.len() {
+            return Err(VmError::RuntimeError("invalid option '%' to 'format'".into()));
+        }
         if bytes[pos] == b'%' { out.push('%'); pos += 1; continue; }
 
         let mut left = false;
         let mut plus = false;
         let mut zero = false;
         let mut space = false;
+        let mut alt = false;
         loop {
             match bytes.get(pos) {
                 Some(b'-') => { left = true;  pos += 1; }
                 Some(b'+') => { plus = true;  pos += 1; }
                 Some(b'0') if !left => { zero = true; pos += 1; }
                 Some(b' ') => { space = true; pos += 1; }
+                Some(b'#') => { alt = true; pos += 1; }
                 _ => break,
             }
         }
@@ -3040,49 +3573,95 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
             }
             prec = Some(p);
         }
-        if pos >= bytes.len() { break; }
+        if pos >= bytes.len() {
+            return Err(VmError::RuntimeError("invalid option '%' to 'format'".into()));
+        }
         let spec = bytes[pos] as char; pos += 1;
 
-        let v = args.get(arg_idx).copied().unwrap_or(Value::nil());
         arg_idx += 1;
+        let v = args.get(arg_idx - 1).copied().ok_or_else(|| VmError::RuntimeError(
+            format!("bad argument #{arg_idx} to 'format' (value expected)")))?;
+        let num_err = |m: &str| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' ({m})"));
+        let fmt_int = |v: Value| -> VmResult<i64> {
+            if let Some(n) = v.as_int() { return Ok(n); }
+            if let Some(f) = v.as_float() {
+                if f.fract() == 0.0 && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+                    return Ok(f as i64);
+                }
+                return Err(num_err("number has no integer representation"));
+            }
+            Err(num_err("number expected"))
+        };
+        let fmt_num = |v: Value| -> VmResult<f64> {
+            v.to_float().ok_or_else(|| num_err("number expected"))
+        };
+        // Sign + zero-padding shared by the float conversions.
+        let float_body = |f: f64, body: String| -> String {
+            let sign = if f.is_sign_negative() { "-" }
+                       else if plus { "+" } else if space { " " } else { "" };
+            format!("{sign}{body}")
+        };
 
         let s = match spec {
             'd' | 'i' => {
-                let n = v.as_int().or_else(|| v.as_float().map(|f| f as i64))
-                    .ok_or_else(|| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' (number expected)")))?;
-                let raw = if plus && n >= 0 { format!("+{n}") }
-                          else if space && n >= 0 { format!(" {n}") }
-                          else { format!("{n}") };
-                pad_str(raw, width, left, zero)
+                let n = fmt_int(v)?;
+                let mut raw = n.unsigned_abs().to_string();
+                // Precision for integers means minimum digits (zero-filled),
+                // and it disables the '0' flag, per C rules.
+                if let Some(p) = prec {
+                    while raw.len() < p { raw.insert(0, '0'); }
+                }
+                let signed = if n < 0 { format!("-{raw}") }
+                             else if plus { format!("+{raw}") }
+                             else if space { format!(" {raw}") }
+                             else { raw };
+                pad_str(signed, width, left, zero && prec.is_none())
             }
             'u' => {
-                let n = v.as_int().or_else(|| v.as_float().map(|f| f as i64))
-                    .ok_or_else(|| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' (number expected)")))?
-                    as u64;
-                pad_str(format!("{n}"), width, left, zero)
+                let n = fmt_int(v)? as u64;
+                let mut raw = n.to_string();
+                if let Some(p) = prec { while raw.len() < p { raw.insert(0, '0'); } }
+                pad_str(raw, width, left, zero && prec.is_none())
             }
             'x' | 'X' | 'o' => {
-                let n = v.as_int().or_else(|| v.as_float().map(|f| f as i64))
-                    .ok_or_else(|| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' (number expected)")))?
-                    as u64;
-                let raw = match spec { 'x' => format!("{n:x}"), 'X' => format!("{n:X}"), _ => format!("{n:o}") };
-                pad_str(raw, width, left, zero)
+                let n = fmt_int(v)? as u64;
+                let mut raw = match spec { 'x' => format!("{n:x}"), 'X' => format!("{n:X}"), _ => format!("{n:o}") };
+                if let Some(p) = prec { while raw.len() < p { raw.insert(0, '0'); } }
+                let prefix = if alt && n != 0 {
+                    match spec { 'x' => "0x", 'X' => "0X", _ => "0" }
+                } else { "" };
+                // Zero-padding goes after the base prefix: %#08x → 0x0000ff.
+                if zero && prec.is_none() && !left && raw.len() + prefix.len() < width {
+                    let zeros = width - prefix.len() - raw.len();
+                    raw = format!("{}{raw}", "0".repeat(zeros));
+                }
+                pad_str(format!("{prefix}{raw}"), width, left, zero && prec.is_none() && prefix.is_empty())
             }
             'c' => {
-                let n = v.as_int().or_else(|| v.as_float().map(|f| f as i64))
-                    .ok_or_else(|| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' (number expected)")))?;
+                let n = fmt_int(v)?;
                 let ch = u8::try_from(n).map(|b| b as char)
-                    .map_err(|_| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' (char out of range)")))?;
+                    .map_err(|_| num_err("char out of range"))?;
                 pad_str(ch.to_string(), width, left, false)
             }
-            'f' => {
-                let f = v.to_float()
-                    .ok_or_else(|| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' (number expected)")))?;
-                let p = prec.unwrap_or(6);
-                let raw = if plus && f >= 0.0 { format!("+{:.prec$}", f, prec = p) }
-                          else if space && f >= 0.0 { format!(" {:.prec$}", f, prec = p) }
-                          else { format!("{:.prec$}", f, prec = p) };
-                pad_str(raw, width, left, zero)
+            'f' | 'F' => {
+                let f = fmt_num(v)?;
+                let body = format!("{:.*}", prec.unwrap_or(6), f.abs());
+                pad_str(float_body(f, body), width, left, zero && f.is_finite())
+            }
+            'e' | 'E' => {
+                let f = fmt_num(v)?;
+                let body = fmt_e(f.abs(), prec.unwrap_or(6), spec == 'E');
+                pad_str(float_body(f, body), width, left, zero && f.is_finite())
+            }
+            'g' | 'G' => {
+                let f = fmt_num(v)?;
+                let body = fmt_g(f.abs(), prec.unwrap_or(6), spec == 'G');
+                pad_str(float_body(f, body), width, left, zero && f.is_finite())
+            }
+            'a' | 'A' => {
+                let f = fmt_num(v)?;
+                let body = fmt_a(f.abs(), prec, spec == 'A');
+                pad_str(float_body(f, body), width, left, zero && f.is_finite())
             }
             's' => {
                 let raw = tostring_value(v)?;
@@ -3090,21 +3669,32 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
                 pad_str(raw, width, left, false)
             }
             'q' => {
-                let s = if v.is_string() { unsafe { string_ref(v) }.to_owned() } else { format!("{v}") };
-                let mut q = String::from("\"");
-                for ch in s.chars() {
-                    match ch {
-                        '"'  => q.push_str("\\\""),
-                        '\\' => q.push_str("\\\\"),
-                        '\n' => q.push_str("\\n"),
-                        '\r' => q.push_str("\\r"),
-                        '\0' => q.push_str("\\0"),
-                        _    => q.push(ch),
+                if v.is_int_like() {
+                    v.as_int().unwrap().to_string()
+                } else if v.is_float() {
+                    // {:?} prints the shortest round-trip form with a
+                    // mandatory fraction/exponent, so it re-reads as a float.
+                    format!("{:?}", v.as_float().unwrap())
+                } else if v.is_string() {
+                    let s = unsafe { string_ref(v) };
+                    let mut q = String::from("\"");
+                    for ch in s.chars() {
+                        match ch {
+                            '"'  => q.push_str("\\\""),
+                            '\\' => q.push_str("\\\\"),
+                            '\n' => q.push_str("\\n"),
+                            '\r' => q.push_str("\\r"),
+                            c if (c as u32) < 0x20 || (c as u32) == 0x7f =>
+                                q.push_str(&format!("\\{:03}", c as u32)),
+                            _    => q.push(ch),
+                        }
                     }
+                    q.push('"'); q
+                } else {
+                    return Err(num_err("value has no literal form"));
                 }
-                q.push('"'); q
             }
-            _ => format!("%{spec}"),
+            _ => return Err(VmError::RuntimeError(format!("invalid option '%{spec}' to 'format'"))),
         };
         out.push_str(&s);
     }
