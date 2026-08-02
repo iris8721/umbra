@@ -247,10 +247,10 @@ pub fn unpack(fmt: &str, data: &[u8], start: usize) -> Result<(Vec<PackValue>, u
             }
             b'x' => { read_bytes(data, &mut pos, 1)?; }
             b'z' => {
-                let end = data[*pos..].iter().position(|&b| b == 0)
-                    .map(|p| *pos + p)
+                let end = data[pos..].iter().position(|&b| b == 0)
+                    .map(|p| pos + p)
                     .ok_or("string.unpack: unfinished string for format 'z'")?;
-                results.push(PackValue::Str(data[*pos..end].to_vec()));
+                results.push(PackValue::Str(data[pos..end].to_vec()));
                 pos = end + 1;
             }
             b'X' => {
@@ -261,6 +261,7 @@ pub fn unpack(fmt: &str, data: &[u8], start: usize) -> Result<(Vec<PackValue>, u
                 i += 1;
                 while i < f.len() && f[i].is_ascii_digit() { i += 1; }
             }
+            _ => return Err(format!("string.unpack: invalid format option '{}'", c as char)),
         }
     }
     Ok((results, pos))

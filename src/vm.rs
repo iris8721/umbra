@@ -114,6 +114,7 @@ pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> String {
             Some('R') => out.push_str(&format!("{hour:02}:{min:02}")),
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
+            Some('Z') => out.push_str("UTC"),
             Some('%') => out.push('%'),
             Some(other) => { out.push('%'); out.push(other); }
             None => out.push('%'),
@@ -1388,7 +1389,6 @@ impl Vm {
             self.place_results(base_save - 1, Vec::new(), expected);
         }
     }
-
     // Writes a call's results at `at`, nil-padding to `expected` (255 = keep
     // them all and record the new top for a following b=0 Call/Return).
     fn place_results(&mut self, at: usize, results: Vec<Value>, expected: u8) {
@@ -1436,7 +1436,7 @@ impl Vm {
                 // Lua: leading space skipped, optional sign, optional 0x for
                 // base 16, then digits only — any trailing junk fails, and
                 // overflow wraps modulo 2^64.
-                let mut t = s.trim_start();
+                let mut t = s.trim();
                 let neg = t.starts_with('-');
                 if neg || t.starts_with('+') { t = &t[1..]; }
                 if base == 16 { t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t); }
@@ -2496,9 +2496,11 @@ impl Vm {
         });
         let v_io_open = self.make_cfn_val(|args| {
             let path = str_arg(args, 0, "io.open")?.to_owned();
-            let mode = args.get(1).filter(|v| v.is_string())
-                .map(|&v| unsafe { string_ref(v) }.to_owned())
-                .unwrap_or_else(|| "r".to_owned());
+            let mode = match args.get(1) {
+                None => "r".to_owned(),
+                Some(&v) if v.is_string() => unsafe { string_ref(v) }.to_owned(),
+                Some(_) => return Err(VmError::RuntimeError("io.open: string expected".into())),
+            };
             let mode = mode.trim_end_matches('b');
             let mut opts = std::fs::OpenOptions::new();
             match mode {
@@ -2687,9 +2689,11 @@ impl Vm {
             }
         });
         let v_os_date = self.make_cfn_val(|args| {
-            let mut fmt = args.first().filter(|v| v.is_string())
-                .map(|&v| unsafe { string_ref(v) }.to_owned())
-                .unwrap_or_else(|| "%c".to_owned());
+            let mut fmt = match args.first() {
+                None => "%c".to_owned(),
+                Some(&v) if v.is_string() => unsafe { string_ref(v) }.to_owned(),
+                Some(_) => return Err(VmError::RuntimeError("os.date: string expected".into())),
+            };
             // '!' selects UTC; Umbra only has UTC, so it's a no-op marker.
             if let Some(rest) = fmt.strip_prefix('!') { fmt = rest.to_owned(); }
             let secs = match args.get(1) {
@@ -3334,6 +3338,16 @@ fn read_file_format(file: &mut std::fs::File, fv: &Value) -> VmResult<Value> {
 
 fn read_stdin_format(fv: &Value) -> VmResult<Value> {
     use std::io::Read;
+    if fv.is_number() {
+        let n = int_arg(*fv, "io.read")?;
+        if n < 0 { return Err(VmError::RuntimeError("io.read: invalid length".into())); }
+        let mut buf = vec![0u8; n as usize];
+        let got = std::io::stdin().read(&mut buf)
+            .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+        if got == 0 && n > 0 { return Ok(Value::nil()); }
+        buf.truncate(got);
+        return Ok(alloc_string_val(&String::from_utf8_lossy(&buf)));
+    }
     let fmt = if fv.is_string() {
         unsafe { string_ref(*fv) }.trim_start_matches('*').to_owned()
     } else if fv.is_nil() {
@@ -3607,8 +3621,9 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
                 let n = fmt_int(v)?;
                 let mut raw = n.unsigned_abs().to_string();
                 // Precision for integers means minimum digits (zero-filled),
-                // and it disables the '0' flag, per C rules.
+                // disables the '0' flag, and %.0d of zero prints nothing.
                 if let Some(p) = prec {
+                    if p == 0 && n == 0 { raw.clear(); }
                     while raw.len() < p { raw.insert(0, '0'); }
                 }
                 let signed = if n < 0 { format!("-{raw}") }
@@ -3620,15 +3635,23 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
             'u' => {
                 let n = fmt_int(v)? as u64;
                 let mut raw = n.to_string();
-                if let Some(p) = prec { while raw.len() < p { raw.insert(0, '0'); } }
+                if let Some(p) = prec {
+                    if p == 0 && n == 0 { raw.clear(); }
+                    while raw.len() < p { raw.insert(0, '0'); }
+                }
                 pad_str(raw, width, left, zero && prec.is_none())
             }
             'x' | 'X' | 'o' => {
                 let n = fmt_int(v)? as u64;
                 let mut raw = match spec { 'x' => format!("{n:x}"), 'X' => format!("{n:X}"), _ => format!("{n:o}") };
-                if let Some(p) = prec { while raw.len() < p { raw.insert(0, '0'); } }
+                if let Some(p) = prec {
+                    if p == 0 && n == 0 { raw.clear(); }
+                    while raw.len() < p { raw.insert(0, '0'); }
+                }
+                // For octal, '#' forces a leading zero even at precision 0.
+                if alt && spec == 'o' && raw.is_empty() { raw = "0".into(); }
                 let prefix = if alt && n != 0 {
-                    match spec { 'x' => "0x", 'X' => "0X", _ => "0" }
+                    match spec { 'x' => "0x", 'X' => "0X", _ => "" }
                 } else { "" };
                 // Zero-padding goes after the base prefix: %#08x → 0x0000ff.
                 if zero && prec.is_none() && !left && raw.len() + prefix.len() < width {

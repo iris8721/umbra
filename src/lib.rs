@@ -264,7 +264,7 @@ mod tests {
         assert_output("print(2 * 6)",   &["12"]);
         assert_output("print(7 / 2)",   &["3.5"]);
         assert_output("print(10 % 3)",  &["1"]);
-        assert_output("print(2 ^ 10)",  &["1024"]);
+        assert_output("print(2 ^ 10)",  &["1024.0"]);
     }
 
     #[test]
@@ -957,7 +957,7 @@ mod tests {
             x %= 4   print(x)
             x = 2
             x ^= 8   print(x)",
-            &["15", "12", "24", "6", "3", "3", "256"],
+            &["15", "12", "24", "6.0", "3", "3", "256.0"],
         );
     }
 
@@ -1204,7 +1204,7 @@ mod tests {
     fn vm_idiv_floor_division() {
         assert_output("print(7 // 2)", &["3"]);
         assert_output("print(-7 // 2)", &["-4"]);
-        assert_output("print(7.5 // 2)", &["3"]);
+        assert_output("print(7.5 // 2)", &["3.0"]);
     }
 
     #[test]
@@ -2582,7 +2582,7 @@ print(s:len())"#, &["5"]);
 
     #[test]
     fn stdlib_math_sqrt() {
-        assert_output(r#"print(math.sqrt(4.0))"#, &["2"]);
+        assert_output(r#"print(math.sqrt(4.0))"#, &["2.0"]);
     }
 
     #[test]
@@ -3734,5 +3734,228 @@ print(coroutine.isyieldable())"#,
         assert_output("print(unpack({1,2,3}, 2, 3))", &["2\t3"]);
         assert_output("print(unpack({1,2,3}, 2))", &["2\t3"]);
         assert_output("print(select('#', unpack({1,2,3}, 3, 1)))", &["0"]);
+    }
+}
+
+#[cfg(test)]
+mod stdlib_second_pass_tests {
+    use super::*;
+
+    fn assert_output(src: &str, expected: &[&str]) {
+        assert_eq!(run_capture(src).unwrap(), expected, "script: {src}");
+    }
+
+    #[test]
+    fn string_find_init_past_end_finds_nothing() {
+        // Lua: init > len+1 fails even for an empty pattern.
+        assert_output(r#"print(string.find("abc", "", 5))"#, &["nil"]);
+        assert_output(r#"print(string.find("abc", "", 4))"#, &["4\t3"]);
+        assert_output(r#"print(string.find("abc", "", 10, true))"#, &["nil"]);
+        assert_output(r#"print(string.match("abc", "", 5))"#, &["nil"]);
+        assert_output(r#"print(string.find("abc", "b", 5))"#, &["nil"]);
+    }
+
+    #[test]
+    fn string_gmatch_honors_init_argument() {
+        assert_output(
+            r#"for w in string.gmatch("a1b2", "%a", 3) { print(w) }"#,
+            &["b"],
+        );
+        assert_output(
+            r#"for w in string.gmatch("abc", "%a", 10) { print(w) }"#,
+            &[],
+        );
+    }
+
+    #[test]
+    fn string_gsub_rejects_trailing_percent_in_replacement() {
+        assert!(run(r#"string.gsub("abc", "%w", "abc%")"#).is_err());
+        assert!(run(r#"string.gsub("abc", "%w", "%")"#).is_err());
+        assert_output(r#"print(string.gsub("abc", "%w", "%%"))"#, &["%%%\t3"]);
+    }
+
+    #[test]
+    fn pattern_backreference_to_position_capture_fails_match() {
+        // Lua: %1 against a () capture fails the match rather than erroring.
+        assert_output(r#"print(string.find("aa", "()a%1"))"#, &["nil"]);
+        assert_output(r#"print(string.find("aa", "(a)%1"))"#, &["1\t2\ta"]);
+    }
+
+    #[test]
+    fn string_format_rejects_non_integral_and_unknown() {
+        assert!(run(r#"string.format("%d", 3.7)"#).is_err());
+        assert!(run(r#"string.format("%z", 1)"#).is_err());
+        assert!(run(r#"string.format("abc%")"#).is_err());
+        assert!(run(r#"string.format("%s")"#).is_err());
+        assert_output(r#"print(string.format("%d", 3.0))"#, &["3"]);
+        assert_output(r#"print(string.format("%.3d", 5))"#, &["005"]);
+        assert_output(r#"print(string.format("%#08x", 255))"#, &["0x0000ff"]);
+    }
+
+    #[test]
+    fn string_format_float_specifiers() {
+        assert_output(r#"print(string.format("%e", 12345.6789))"#, &["1.234568e+04"]);
+        assert_output(r#"print(string.format("%g", 0.00001))"#, &["1e-05"]);
+        assert_output(r#"print(string.format("%.3g", 3.14159))"#, &["3.14"]);
+        assert_output(r#"print(string.format("%a", 1.5))"#, &["0x1.8p+0"]);
+        assert_output(r#"print(string.format("%.3a", 1.5))"#, &["0x1.800p+0"]);
+    }
+
+    #[test]
+    fn string_format_q_quotes_only_literal_forms() {
+        assert_output(r#"print(string.format("%q", 42))"#, &["42"]);
+        assert_output(r#"print(string.format("%q", 4.5))"#, &["4.5"]);
+        assert_output(r#"print(string.format("%q", "tab\there"))"#, &[r#""tab\009here""#]);
+        assert!(run(r#"string.format("%q", true)"#).is_err());
+        assert!(run(r#"string.format("%q", {})"#).is_err());
+    }
+
+    #[test]
+    fn tonumber_wraps_hex_and_reads_hex_floats() {
+        assert_output(r#"print(tonumber("0xFFFFFFFFFFFFFFFF"))"#, &["-1"]);
+        assert_output(r#"print(tonumber("0x8000000000000000"))"#, &["-9223372036854775808"]);
+        assert_output(r#"print(tonumber("0x1.8p1"))"#, &["3.0"]);
+        assert_output(r#"print(tonumber("0x.8"))"#, &["0.5"]);
+        assert_output(r#"print(tonumber("0x10", 16))"#, &["16"]);
+        assert_output(r#"print(tonumber("ff ", 16))"#, &["255"]);
+        assert!(run(r#"tonumber(10, 16)"#).is_err());
+        assert!(run(r#"tonumber("ff", 1.5)"#).is_err());
+    }
+
+    #[test]
+    fn string_pack_extra_formats_and_strict_ints() {
+        assert_output(r#"print(string.unpack("j", string.pack("j", -5)))"#, &["-5\t9"]);
+        assert_output(r#"print(string.unpack("n", string.pack("n", 1.5)))"#, &["1.5\t9"]);
+        assert_output(r#"print(string.unpack("z", string.pack("z", "abc")))"#, &["abc\t5"]);
+        assert!(run(r#"string.pack("z", "a\0b")"#).is_err());
+        assert!(run(r#"string.pack("b", 1.9)"#).is_err());
+        assert_output(r#"print(string.pack("b", 1.0))"#, &["01"]);
+        assert_output(r#"print(string.unpack("Xi4", string.pack("i4", 7)))"#, &["1"]);
+    }
+
+    #[test]
+    fn string_unpack_position_argument_bounds() {
+        assert_output(r#"print(string.unpack("b", string.pack("b", 1), -1))"#, &["1\t2"]);
+        assert!(run(r#"string.unpack("b", string.pack("b", 1), 0)"#).is_err());
+        assert!(run(r#"string.unpack("b", string.pack("b", 1), 3)"#).is_err());
+        assert_output(r#"print(string.unpack("", string.pack("b", 1), 2))"#, &["2"]);
+    }
+
+    #[test]
+    fn math_fmod_and_ult() {
+        assert_output("print(math.fmod(5, 3))", &["2"]);
+        assert_output("print(math.fmod(-5, 3))", &["-2"]);
+        assert_output("print(math.fmod(5.5, 2))", &["1.5"]);
+        assert!(run("math.fmod(5, 0)").is_err());
+        assert_output("print(math.ult(1, 2), math.ult(-1, 2), math.ult(2, -1))", &["true\tfalse\ttrue"]);
+    }
+
+    #[test]
+    fn math_random_full_range_and_arg_errors() {
+        assert_output(
+            "let r = math.random(math.mininteger, math.maxinteger)\nprint(math.type(r))",
+            &["integer"],
+        );
+        assert!(run("math.random(1, 2, 3)").is_err());
+        assert!(run("math.random(1.5)").is_err());
+        assert!(run("math.random(0)").is_err());
+    }
+
+    #[test]
+    fn table_sort_rejects_inconsistent_comparator() {
+        assert!(run(r#"table.sort({3, 1, 2}, fn(a, b) { return true })"#).is_err());
+        assert_output(
+            r#"let t = {3, 1, 2}
+            table.sort(t, fn(a, b) { return a < b })
+            print(table.concat(t, ","))"#,
+            &["1,2,3"],
+        );
+    }
+
+    #[test]
+    fn table_unpack_requires_table() {
+        assert!(run(r#"table.unpack("x")"#).is_err());
+        assert!(run(r#"unpack("x")"#).is_err());
+        assert!(run(r#"table.move({1, 2}, 1, 2, 1, "x")"#).is_err());
+        assert!(run(r#"table.insert({1, 2}, 1.5, "x")"#).is_err());
+    }
+
+    #[test]
+    fn os_time_from_table_and_date_table_form() {
+        assert_output(
+            "print(os.time({year=1970, month=1, day=1, hour=0, min=0, sec=0}))",
+            &["0"],
+        );
+        assert_output(
+            "print(os.time({year=1970, month=1, day=1}))",
+            &["43200"],
+        );
+        assert!(run("os.time({})").is_err());
+        assert_output(
+            r#"let t = os.date("*t", 0)
+            print(t.year, t.month, t.day, t.wday, t.yday)"#,
+            &["1970\t1\t1\t5\t1"],
+        );
+        assert_output(r#"print(os.date("%A %j", 0))"#, &["Thursday 001"]);
+        assert_output(r#"print(os.date("%I %p", 43200))"#, &["12 PM"]);
+    }
+
+    #[test]
+    fn io_file_write_returns_handle_and_read_formats() {
+        assert_output(
+            r#"let f = io.open("/tmp/umbra_test_handle.txt", "w")
+            print(f:write("3.5 42 rest\nlast") == f)
+            f:close()
+            let r = io.open("/tmp/umbra_test_handle.txt", "r")
+            print(r:read("n"))
+            print(r:read("n"))
+            print(r:read("l"))
+            print(r:read("l"))
+            print(r:read("l"))
+            r:close()"#,
+            &["true", "3.5", "42", " rest", "last", "nil"],
+        );
+        assert_output(
+            r#"let r = io.open("/tmp/umbra_test_handle.txt", "r")
+            print(r:read("L"))
+            r:close()
+            let r2 = io.open("/tmp/umbra_test_handle.txt", "r")
+            print(r2:read(3))
+            r2:close()"#,
+            &["3.5 42 rest\n", "3.5"],
+        );
+        assert_output(
+            r#"for l in io.lines("/tmp/umbra_test_handle.txt") { print(l) }"#,
+            &["3.5 42 rest", "last"],
+        );
+        assert!(run(r#"io.lines("/nonexistent_umbra_path")"#).is_err());
+    }
+
+    #[test]
+    fn utf8_len_empty_range_and_strict_args() {
+        assert_output(r#"print(utf8.len("héllo", 3, 1))"#, &["0"]);
+        assert_output(r#"print(utf8.codepoint("héllo", 3, 1))"#, &[""]);
+        assert!(run(r#"utf8.len("héllo", 1.5)"#).is_err());
+        assert!(run(r#"utf8.char(65.5)"#).is_err());
+    }
+
+    #[test]
+    fn tostring_floats_print_lua_style() {
+        assert_output("print(3.0)", &["3.0"]);
+        assert_output("print(0.5)", &["0.5"]);
+        assert_output("print(-0.0)", &["-0.0"]);
+        assert_output("print(1/0)", &["inf"]);
+        assert_output("print(2.5 .. '')", &["2.5"]);
+        assert_output("print(1e300)", &["1e+300"]);
+    }
+
+    #[test]
+    fn stdlib_integer_args_reject_non_integral() {
+        assert!(run(r#"string.sub("abc", 1.5)"#).is_err());
+        assert!(run(r#"string.find("abc", "b", 2.5)"#).is_err());
+        assert!(run(r#"string.rep("x", 2.5)"#).is_err());
+        assert!(run(r#"string.char(65.5)"#).is_err());
+        assert!(run(r#"table.remove({1, 2}, 1.5)"#).is_err());
+        assert_output(r#"print(string.sub("abc", 2.0))"#, &["bc"]);
     }
 }

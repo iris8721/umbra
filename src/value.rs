@@ -278,7 +278,7 @@ pub fn lua_float_str(f: f64) -> String {
         }
         t
     } else {
-        let mut t = e;
+        let t = e;
         let epos = t.rfind('e').unwrap();
         let mut mantissa: String = t[..epos].into();
         while mantissa.ends_with('0') { mantissa.pop(); }
