@@ -49,11 +49,14 @@ const char *umbra_tostring(const umbra_State *U, int idx);
 void umbra_getglobal(umbra_State *U, const char *name);
 void umbra_setglobal(umbra_State *U, const char *name);
 
-/** Compile and run source string. On error pushes message and returns non-zero. */
+/** Compile and run source string. On error pushes the error value
+    (message string, or the object passed to error()) and returns non-zero:
+    UMBRA_ERR_SYNTAX for parse/compile failures, UMBRA_ERR_RUNTIME otherwise. */
 int umbra_dostring(umbra_State *U, const char *src);
 
 /** Protected call: calls function at -(nargs+1) with nargs args.
-    On success pushes nres results (-1 = all). On error pushes message.
+    On success pushes nres results (-1 = all). On error pushes the error
+    value (a string message, or whatever object error() was given).
     Returns 0 on success, non-zero on error. */
 int umbra_pcall(umbra_State *U, int nargs, int nres);
 

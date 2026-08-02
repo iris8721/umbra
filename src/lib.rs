@@ -3640,4 +3640,99 @@ print(coroutine.isyieldable())"#,
         unsafe { api::umbra_close(inner) };
         unsafe { api::umbra_close(outer) };
     }
+    #[test]
+    fn vm_error_level_0_has_no_line_prefix() {
+        assert_output(
+            "let ok, msg = pcall(fn() { error(\"bare\", 0) })
+            print(ok)
+            print(msg)",
+            &["false", "bare"],
+        );
+    }
+
+    #[test]
+    fn vm_error_non_string_values_reach_pcall_unchanged() {
+        // Lua: error(v) propagates v itself, so pcall returns the object.
+        assert_output(
+            "let ok, err = pcall(fn() { error({code = 42}) })
+            print(ok)
+            print(type(err))
+            print(err.code)",
+            &["false", "table", "42"],
+        );
+        assert_output(
+            "let ok, err = pcall(fn() { error(42) })
+            print(ok, err)",
+            &["false\t42"],
+        );
+    }
+
+    #[test]
+    fn vm_xpcall_handler_receives_error_object() {
+        assert_output(
+            "let ok, code = xpcall(fn() { error({code = 7}) }, fn(m) { return m.code })
+            print(ok, code)",
+            &["false\t7"],
+        );
+    }
+
+    #[test]
+    fn vm_coroutine_error_object_reaches_resume() {
+        assert_output(
+            "let co = coroutine.create(fn() { error({why = \"x\"}) })
+            let ok, err = coroutine.resume(co)
+            print(ok, type(err), err.why)",
+            &["false\ttable\tx"],
+        );
+    }
+
+    #[test]
+    fn vm_assert_throws_non_string_message() {
+        assert_output(
+            "let ok, err = pcall(fn() { assert(false, {n = 1}) })
+            print(ok, type(err), err.n)",
+            &["false\ttable\t1"],
+        );
+    }
+
+    #[test]
+    fn vm_math_tointeger_rejects_out_of_range_floats() {
+        // i64::MAX as f64 is exactly 2^63, so a bare `f as i64` round-trip
+        // check would wrongly accept 2^63; the bounds check must run first.
+        assert_output("print(math.tointeger(2^63))", &["nil"]);
+        assert_output("print(math.tointeger(0.0 - 9223372036854777856.0))", &["nil"]);
+        assert_output("print(math.tointeger(3.0))", &["3"]);
+        assert_output("print(math.tointeger(3.5))", &["nil"]);
+    }
+
+    #[test]
+    fn vm_for_num_integer_overflow_terminates() {
+        // The counter must not wrap i64::MAX back to i64::MIN (infinite loop).
+        assert_output(
+            "var n = 0
+            for i = math.maxinteger - 2, math.maxinteger { n += 1 }
+            print(n)",
+            &["3"],
+        );
+        assert_output(
+            "var n = 0
+            for i = math.mininteger + 2, math.mininteger, -1 { n += 1 }
+            print(n)",
+            &["3"],
+        );
+        // An integer counter against a float limit above i64::MAX still stops.
+        assert_output(
+            "var n = 0
+            for i = math.maxinteger - 1, 2^63 { n += 1 }
+            print(n)",
+            &["2"],
+        );
+    }
+
+    #[test]
+    fn vm_unpack_honors_range_args() {
+        assert_output("print(unpack({1,2,3}, 2, 3))", &["2\t3"]);
+        assert_output("print(unpack({1,2,3}, 2))", &["2\t3"]);
+        assert_output("print(select('#', unpack({1,2,3}, 3, 1)))", &["0"]);
+    }
 }
