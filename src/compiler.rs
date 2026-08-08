@@ -215,7 +215,6 @@ struct LoopScope {
 struct LabelInfo {
     pc: usize,
     block: usize,
-    tail: bool,
     locals: usize,
 }
 
@@ -1156,8 +1155,7 @@ impl FnComp {
                     return Err(err(format!("label '{name}' already defined in this function"), *line));
                 }
                 self.labels.insert(name.clone(), LabelInfo {
-                    pc: self.pc(), block: self.cur_block(),
-                    tail: self.tail_stmt, locals: self.locals_top(),
+                    pc: self.pc(), block: self.cur_block(), locals: self.locals_top(),
                 });
             }
         }
