@@ -3640,6 +3640,93 @@ print(coroutine.isyieldable())"#,
         unsafe { api::umbra_close(inner) };
         unsafe { api::umbra_close(outer) };
     }
+
+    #[test]
+    fn unop_on_constant_does_not_clobber_result() {
+        // Regression: Expr::Unop freed the result register after emitting,
+        // so the next temporary overwrote it (-7 + -3 evaluated to 0).
+        assert_output(
+            r#"print(-7 + -3)
+print(-7 * -3)
+print(-7 // -3)
+print(-7 - -3)
+print(#"abc" + 0)
+print(- -3)
+var x = 5
+print(-x + -x)"#,
+            &["-10", "21", "2", "-4", "3", "3", "-10"],
+        );
+    }
+
+    #[test]
+    fn too_many_locals_is_compile_error_not_panic() {
+        // Regression: 256+ names in one declaration overflowed the u8
+        // register field and panicked instead of erroring.
+        let names: Vec<String> = (1..=256).map(|i| format!("v{i}")).collect();
+        let src = format!("let {} = 1", names.join(","));
+        assert!(run(&src).unwrap_err().contains("too many registers"));
+
+        let targets: Vec<String> = (1..=256).map(|i| format!("v{i}")).collect();
+        let src = format!("{} = 1", targets.join(","));
+        assert!(run(&src).unwrap_err().contains("too many registers"));
+    }
+
+    #[test]
+    fn oversized_table_constructor_is_compile_error() {
+        // Regression: SetList's batch operand is a u8; >255 batches of 50
+        // wrapped it to 0 and the VM panicked on (c - 1) * 50.
+        let items: Vec<String> = (1..=12800).map(|i| i.to_string()).collect();
+        let src = format!("let t = {{{}}}", items.join(","));
+        assert!(run(&src).unwrap_err().contains("table constructor too large"));
+    }
+
+    #[test]
+    fn jump_past_sbx_range_is_compile_error() {
+        // Regression: an if-body longer than the signed 16-bit jump range
+        // silently truncated the offset and executed the block anyway.
+        let body = "  x = x + 1\n".repeat(33000);
+        let src = format!("var x = 0\nif x == 1 {{\n{body}}}\nprint(x)");
+        assert!(run(&src).unwrap_err().contains("jump out of range"));
+    }
+
+    #[test]
+    fn goto_into_nested_block_is_rejected() {
+        // Lua: a label is only visible inside its own block (plus the
+        // enclosing block when it's the block's last statement).
+        assert!(run("goto inner\nif true {\n  ::inner::\n}\nprint(1)")
+            .unwrap_err().contains("no visible label"));
+        // The end-of-block label idiom stays legal.
+        assert_output(
+            "var n = 0\nfor i = 1, 5 {\n  if i == 3 { goto cont }\n  n = n + i\n  ::cont::\n}\nprint(n)",
+            &["12"],
+        );
+    }
+
+    #[test]
+    fn goto_out_of_scope_runs_close() {
+        // A goto that leaves a <close> local's scope must run close() first.
+        assert_output(
+            r#"fn res(name) { return { close = fn(self) { print("close " .. name) } } }
+if true {
+    let r <close> = res("x")
+    goto out
+}
+::out::
+print("after")"#,
+            &["close x", "after"],
+        );
+    }
+
+    #[test]
+    fn vararg_outside_vararg_function_is_compile_error() {
+        assert!(run("fn f() { return ... }").unwrap_err().contains("vararg"));
+        assert!(run("fn f() { let a = ... }").unwrap_err().contains("vararg"));
+        assert!(run("fn f() { return {...} }").unwrap_err().contains("vararg"));
+        assert!(run("fn f() { return g(...) }").unwrap_err().contains("vararg"));
+        // Vararg functions still work.
+        assert_output("fn f(...) { return ... }\nprint(f(1, 2))", &["1\t2"]);
+    }
+
     #[test]
     fn vm_error_level_0_has_no_line_prefix() {
         assert_output(
@@ -3736,6 +3823,7 @@ print(coroutine.isyieldable())"#,
         assert_output("print(select('#', unpack({1,2,3}, 3, 1)))", &["0"]);
     }
 }
+
 
 #[cfg(test)]
 mod stdlib_second_pass_tests {

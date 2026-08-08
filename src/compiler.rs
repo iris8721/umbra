@@ -7,6 +7,10 @@ const MAX_REGS: u8 = 128;
 const MAX_RK_CONSTS: usize = 128;
 // Call/Return operand meaning "as many results as the callee produced".
 const MULTRET: u8 = 255;
+// Recursion budget shared by the capture scan and the compiler proper; the
+// parser enforces its own limit, but this guards ASTs from any source
+// against overflowing the native stack.
+const MAX_DEPTH: u32 = 100;
 
 #[derive(Debug, Clone)]
 pub struct CompileError {
@@ -33,101 +37,115 @@ fn err(msg: impl Into<String>, line: u32) -> CompileError {
 // still gets counted), but over-boxing a name that's never actually
 // captured only costs an extra indirection, never correctness. Boxing
 // itself is a separate decision, made where each Local is declared.
-fn collect_captured_names(body: &FuncBody) -> std::collections::HashSet<String> {
+//
+// The scan recurses at the same points compile_expr/compile_stmt do, so it
+// shares their depth budget: past MAX_DEPTH it stops early and sets
+// `overflow`, which collect_captured_names turns into a compile error —
+// silently dropping names here would under-box and miscompile captures.
+fn collect_captured_names(body: &FuncBody) -> CResult<std::collections::HashSet<String>> {
     let mut out = std::collections::HashSet::new();
-    scan_block(&body.body, false, &mut out);
-    out
+    let mut overflow = false;
+    scan_block(&body.body, false, 0, &mut out, &mut overflow);
+    if overflow {
+        return Err(err("chunk too deeply nested", body.line));
+    }
+    Ok(out)
 }
 
-fn scan_block(block: &Block, in_closure: bool, out: &mut std::collections::HashSet<String>) {
-    for stmt in &block.stmts { scan_stmt(stmt, in_closure, out); }
+fn scan_block(block: &Block, in_closure: bool, depth: u32, out: &mut std::collections::HashSet<String>, overflow: &mut bool) {
+    if depth >= MAX_DEPTH { *overflow = true; return; }
+    for stmt in &block.stmts { scan_stmt(stmt, in_closure, depth + 1, out, overflow); }
     if let Some(ret) = &block.ret {
-        for e in ret { scan_expr(e, in_closure, out); }
+        for e in ret { scan_expr(e, in_closure, depth + 1, out, overflow); }
     }
 }
 
-fn scan_funcbody(body: &FuncBody, out: &mut std::collections::HashSet<String>) {
-    scan_block(&body.body, true, out);
+fn scan_funcbody(body: &FuncBody, depth: u32, out: &mut std::collections::HashSet<String>, overflow: &mut bool) {
+    scan_block(&body.body, true, depth, out, overflow);
 }
 
-fn scan_stmt(stmt: &Stmt, in_closure: bool, out: &mut std::collections::HashSet<String>) {
+fn scan_stmt(stmt: &Stmt, in_closure: bool, depth: u32, out: &mut std::collections::HashSet<String>, overflow: &mut bool) {
+    if depth >= MAX_DEPTH { *overflow = true; return; }
     match stmt {
         Stmt::Assign { targets, values, .. } => {
-            for e in targets { scan_expr(e, in_closure, out); }
-            for e in values { scan_expr(e, in_closure, out); }
+            for e in targets { scan_expr(e, in_closure, depth + 1, out, overflow); }
+            for e in values { scan_expr(e, in_closure, depth + 1, out, overflow); }
         }
-        Stmt::Local { values, .. } => for e in values { scan_expr(e, in_closure, out); },
-        Stmt::Destructure { value, .. } => scan_expr(value, in_closure, out),
-        Stmt::Do { body, .. } => scan_block(body, in_closure, out),
-        Stmt::While { cond, body, .. } => { scan_expr(cond, in_closure, out); scan_block(body, in_closure, out); }
-        Stmt::RepeatUntil { body, cond, .. } => { scan_block(body, in_closure, out); scan_expr(cond, in_closure, out); }
+        Stmt::Local { values, .. } => for e in values { scan_expr(e, in_closure, depth + 1, out, overflow); },
+        Stmt::Destructure { value, .. } => scan_expr(value, in_closure, depth + 1, out, overflow),
+        Stmt::Do { body, .. } => scan_block(body, in_closure, depth + 1, out, overflow),
+        Stmt::While { cond, body, .. } => { scan_expr(cond, in_closure, depth + 1, out, overflow); scan_block(body, in_closure, depth + 1, out, overflow); }
+        Stmt::RepeatUntil { body, cond, .. } => { scan_block(body, in_closure, depth + 1, out, overflow); scan_expr(cond, in_closure, depth + 1, out, overflow); }
         Stmt::If { cond, then, elseifs, else_, .. } => {
-            scan_expr(cond, in_closure, out);
-            scan_block(then, in_closure, out);
-            for (c, b) in elseifs { scan_expr(c, in_closure, out); scan_block(b, in_closure, out); }
-            if let Some(b) = else_ { scan_block(b, in_closure, out); }
+            scan_expr(cond, in_closure, depth + 1, out, overflow);
+            scan_block(then, in_closure, depth + 1, out, overflow);
+            for (c, b) in elseifs { scan_expr(c, in_closure, depth + 1, out, overflow); scan_block(b, in_closure, depth + 1, out, overflow); }
+            if let Some(b) = else_ { scan_block(b, in_closure, depth + 1, out, overflow); }
         }
         Stmt::ForNum { start, limit, step, body, .. } => {
-            scan_expr(start, in_closure, out);
-            scan_expr(limit, in_closure, out);
-            if let Some(s) = step { scan_expr(s, in_closure, out); }
-            scan_block(body, in_closure, out);
+            scan_expr(start, in_closure, depth + 1, out, overflow);
+            scan_expr(limit, in_closure, depth + 1, out, overflow);
+            if let Some(s) = step { scan_expr(s, in_closure, depth + 1, out, overflow); }
+            scan_block(body, in_closure, depth + 1, out, overflow);
         }
         Stmt::ForIn { iters, body, .. } => {
-            for e in iters { scan_expr(e, in_closure, out); }
-            scan_block(body, in_closure, out);
+            for e in iters { scan_expr(e, in_closure, depth + 1, out, overflow); }
+            scan_block(body, in_closure, depth + 1, out, overflow);
         }
-        Stmt::FuncDef { body, .. } => scan_funcbody(body, out),
-        Stmt::LocalFunc { body, .. } => scan_funcbody(body, out),
-        Stmt::Call(c) => scan_call(c, in_closure, out),
-        Stmt::MethodCall(m) => scan_methodcall(m, in_closure, out),
-        Stmt::ExprStmt(e) => scan_expr(e, in_closure, out),
+        Stmt::FuncDef { body, .. } => scan_funcbody(body, depth + 1, out, overflow),
+        Stmt::LocalFunc { body, .. } => scan_funcbody(body, depth + 1, out, overflow),
+        Stmt::Call(c) => scan_call(c, in_closure, depth + 1, out, overflow),
+        Stmt::MethodCall(m) => scan_methodcall(m, in_closure, depth + 1, out, overflow),
+        Stmt::ExprStmt(e) => scan_expr(e, in_closure, depth + 1, out, overflow),
         Stmt::Break(_) | Stmt::Continue(_) | Stmt::Goto(_, _) | Stmt::Label(_, _) => {}
     }
 }
 
-fn scan_call(c: &CallExpr, in_closure: bool, out: &mut std::collections::HashSet<String>) {
-    scan_expr(&c.callee, in_closure, out);
-    scan_args(&c.args, in_closure, out);
+fn scan_call(c: &CallExpr, in_closure: bool, depth: u32, out: &mut std::collections::HashSet<String>, overflow: &mut bool) {
+    scan_expr(&c.callee, in_closure, depth, out, overflow);
+    scan_args(&c.args, in_closure, depth, out, overflow);
 }
 
-fn scan_methodcall(m: &MethodCallExpr, in_closure: bool, out: &mut std::collections::HashSet<String>) {
-    scan_expr(&m.receiver, in_closure, out);
-    scan_args(&m.args, in_closure, out);
+fn scan_methodcall(m: &MethodCallExpr, in_closure: bool, depth: u32, out: &mut std::collections::HashSet<String>, overflow: &mut bool) {
+    scan_expr(&m.receiver, in_closure, depth, out, overflow);
+    scan_args(&m.args, in_closure, depth, out, overflow);
 }
 
-fn scan_args(args: &Args, in_closure: bool, out: &mut std::collections::HashSet<String>) {
-    if let Args::Exprs(exprs) = args {
-        for e in exprs { scan_expr(e, in_closure, out); }
+fn scan_args(args: &Args, in_closure: bool, depth: u32, out: &mut std::collections::HashSet<String>, overflow: &mut bool) {
+    match args {
+        Args::Exprs(exprs) => for e in exprs { scan_expr(e, in_closure, depth, out, overflow); },
+        Args::Table(tc) => scan_expr(&Expr::Table(tc.clone()), in_closure, depth, out, overflow),
+        Args::String(_) => {}
     }
 }
 
-fn scan_expr(expr: &Expr, in_closure: bool, out: &mut std::collections::HashSet<String>) {
+fn scan_expr(expr: &Expr, in_closure: bool, depth: u32, out: &mut std::collections::HashSet<String>, overflow: &mut bool) {
+    if depth >= MAX_DEPTH { *overflow = true; return; }
     match expr {
         Expr::Nil(_) | Expr::True(_) | Expr::False(_) | Expr::Int(_, _) | Expr::Float(_, _)
         | Expr::String(_, _) | Expr::Vararg(_) => {}
         Expr::Ident(id) => { if in_closure { out.insert(id.name.clone()); } }
-        Expr::Index { table, key, .. } => { scan_expr(table, in_closure, out); scan_expr(key, in_closure, out); }
-        Expr::Field { table, .. } => scan_expr(table, in_closure, out),
-        Expr::Unop { operand, .. } => scan_expr(operand, in_closure, out),
-        Expr::Binop { lhs, rhs, .. } => { scan_expr(lhs, in_closure, out); scan_expr(rhs, in_closure, out); }
-        Expr::Concat { parts, .. } => for e in parts { scan_expr(e, in_closure, out); },
-        Expr::Call(c) => scan_call(c, in_closure, out),
-        Expr::MethodCall(m) => scan_methodcall(m, in_closure, out),
-        Expr::Function(body) => scan_funcbody(body, out),
+        Expr::Index { table, key, .. } => { scan_expr(table, in_closure, depth + 1, out, overflow); scan_expr(key, in_closure, depth + 1, out, overflow); }
+        Expr::Field { table, .. } => scan_expr(table, in_closure, depth + 1, out, overflow),
+        Expr::Unop { operand, .. } => scan_expr(operand, in_closure, depth + 1, out, overflow),
+        Expr::Binop { lhs, rhs, .. } => { scan_expr(lhs, in_closure, depth + 1, out, overflow); scan_expr(rhs, in_closure, depth + 1, out, overflow); }
+        Expr::Concat { parts, .. } => for e in parts { scan_expr(e, in_closure, depth + 1, out, overflow); },
+        Expr::Call(c) => scan_call(c, in_closure, depth + 1, out, overflow),
+        Expr::MethodCall(m) => scan_methodcall(m, in_closure, depth + 1, out, overflow),
+        Expr::Function(body) => scan_funcbody(body, depth + 1, out, overflow),
         Expr::Table(tc) => for f in &tc.fields {
             match f {
-                TableField::Indexed { key, val } => { scan_expr(key, in_closure, out); scan_expr(val, in_closure, out); }
-                TableField::Named { val, .. } => scan_expr(val, in_closure, out),
-                TableField::Positional(e) => scan_expr(e, in_closure, out),
+                TableField::Indexed { key, val } => { scan_expr(key, in_closure, depth + 1, out, overflow); scan_expr(val, in_closure, depth + 1, out, overflow); }
+                TableField::Named { val, .. } => scan_expr(val, in_closure, depth + 1, out, overflow),
+                TableField::Positional(e) => scan_expr(e, in_closure, depth + 1, out, overflow),
             }
         },
         Expr::Ternary { cond, then, else_, .. } => {
-            scan_expr(cond, in_closure, out);
-            scan_expr(then, in_closure, out);
-            scan_expr(else_, in_closure, out);
+            scan_expr(cond, in_closure, depth + 1, out, overflow);
+            scan_expr(then, in_closure, depth + 1, out, overflow);
+            scan_expr(else_, in_closure, depth + 1, out, overflow);
         }
-        Expr::IncrDecr { target, .. } => scan_expr(target, in_closure, out),
+        Expr::IncrDecr { target, .. } => scan_expr(target, in_closure, depth + 1, out, overflow),
     }
 }
 
@@ -188,6 +206,35 @@ struct LoopScope {
     locals_top: usize,
 }
 
+// A label records where it sits: the block that owns it, whether that block
+// is the last statement of its own parent (Lua's "label at the end of a
+// block is visible in the enclosing block" rule, applied transitively), and
+// how many locals were live at that point — a goto may not jump into the
+// scope of a local declared after the label.
+#[derive(Debug, Clone)]
+struct LabelInfo {
+    pc: usize,
+    block: usize,
+    tail: bool,
+    locals: usize,
+}
+
+// A goto records everything needed to resolve it once the whole function is
+// compiled: its jump slot, the block it appears in, the locals live there
+// (count for the scope check, plus each <close> local's index/register so a
+// jump that leaves their scope can run close() first), and the free
+// register at that point so the close stub's scratch registers can't
+// clobber live values.
+struct PendingGoto {
+    name: String,
+    jump: usize,
+    line: u32,
+    block: usize,
+    locals: usize,
+    closers: Vec<(usize, u8, bool)>,
+    free_reg: u8,
+}
+
 struct FnComp {
     proto: Proto,
     locals: Vec<Local>,
@@ -201,10 +248,21 @@ struct FnComp {
     free_reg: u8,
     loops: Vec<LoopScope>,
     line: u32,
-    // Label -> (pc, active local count); gotos record their own local count
-    // so a jump into a later local's scope can be rejected.
-    labels: std::collections::HashMap<String, (usize, usize)>,
-    pending_gotos: Vec<(String, usize, u32, usize)>,
+    labels: std::collections::HashMap<String, LabelInfo>,
+    pending_gotos: Vec<PendingGoto>,
+    // Block ancestry for label visibility: block_parent[i] is the block that
+    // lexically contains block i, block_tail[i] is whether block i was the
+    // last statement of that parent. Block 0 is the function body. `blocks`
+    // is the stack of currently open block ids.
+    block_parent: Vec<Option<usize>>,
+    block_tail: Vec<bool>,
+    blocks: Vec<usize>,
+    // statement of its block. Read by new_block for block_tail.
+    tail_stmt: bool,
+    // Recursion depth across compile_stmt/compile_expr and nested function
+    // compilation; guards the native stack against pathological nesting.
+    depth: u32,
+    is_vararg: bool,
     // Names any nested closure in this function references — see
     // collect_captured_names. Consulted when a local/param is declared to
     // decide whether it needs boxing.
@@ -212,15 +270,33 @@ struct FnComp {
 }
 
 impl FnComp {
-    fn new(source: Option<String>, outer: Option<*mut FnComp>, captured: std::collections::HashSet<String>) -> Self {
+    fn new(source: Option<String>, outer: Option<*mut FnComp>, captured: std::collections::HashSet<String>, depth: u32, is_vararg: bool) -> Self {
         let mut proto = Proto::new();
         proto.source = source;
         Self {
             proto, locals: Vec::new(), upvals: Vec::new(), outer_scope: outer,
             free_reg: 0, loops: Vec::new(), line: 1,
             labels: std::collections::HashMap::new(), pending_gotos: Vec::new(),
+            block_parent: vec![None], block_tail: vec![false], blocks: vec![0],
+            tail_stmt: true, depth, is_vararg,
             captured,
         }
+    }
+
+    // Opens a lexical block and returns its id. `tail_stmt` (set by the
+    // caller before compiling the statement that contains this block)
+    // decides whether labels at this block's end are also visible in the
+    // enclosing block, matching Lua's end-of-block label rule.
+    fn new_block(&mut self) -> usize {
+        let id = self.block_parent.len();
+        self.block_parent.push(self.blocks.last().copied());
+        self.block_tail.push(self.tail_stmt);
+        self.blocks.push(id);
+        id
+    }
+
+    fn end_block(&mut self) {
+        self.blocks.pop();
     }
 
     fn alloc_reg(&mut self) -> CResult<u8> {
@@ -319,24 +395,33 @@ impl FnComp {
             .collect();
         let saved_free = self.free_reg;
         for (reg, boxed) in closers.into_iter().rev() {
-            // A <close> local that's also captured by a nested closure holds
-            // a box (see the `boxed` field), not the resource itself — unbox
-            // first so `close` is looked up on the real value.
-            let value_reg = if boxed {
-                let dst = self.alloc_reg()?;
-                self.unbox_into(dst, reg)?;
-                dst
-            } else {
-                reg
-            };
-            let fki = self.rk_str("close")?;
-            let fn_reg = self.alloc_reg()?;
-            self.reserve(fn_reg as usize + 2)?;
-            self.emit(enc_abc(Op::GetTable, fn_reg, value_reg, fki));
-            self.emit_move(fn_reg + 1, value_reg);
-            self.emit(enc_abc(Op::Call, fn_reg, 2, 1));
+            self.emit_close_one(reg, boxed)?;
             self.free_reg = saved_free;
         }
+        Ok(())
+    }
+
+    // Emits one `local:close()` call; the value lives in `reg` (or in the
+    // box `reg` points at when `boxed`). Scratch registers come from
+    // alloc_reg, so the caller must ensure free_reg sits above every live
+    // value and restore it afterwards.
+    fn emit_close_one(&mut self, reg: u8, boxed: bool) -> CResult<()> {
+        // A <close> local that's also captured by a nested closure holds
+        // a box (see the `boxed` field), not the resource itself — unbox
+        // first so `close` is looked up on the real value.
+        let value_reg = if boxed {
+            let dst = self.alloc_reg()?;
+            self.unbox_into(dst, reg)?;
+            dst
+        } else {
+            reg
+        };
+        let fki = self.rk_str("close")?;
+        let fn_reg = self.alloc_reg()?;
+        self.reserve(fn_reg as usize + 2)?;
+        self.emit(enc_abc(Op::GetTable, fn_reg, value_reg, fki));
+        self.emit_move(fn_reg + 1, value_reg);
+        self.emit(enc_abc(Op::Call, fn_reg, 2, 1));
         Ok(())
     }
 
@@ -375,6 +460,68 @@ impl FnComp {
 
     fn emit_load_nil(&mut self, r: u8) { self.emit(enc_abc(Op::LoadNil, r, 0, 0)); }
     fn emit_move(&mut self, dst: u8, src: u8) { self.emit(enc_abc(Op::Move, dst, src, 0)); }
+
+    // sBx jump offsets are signed 16-bit; a function body larger than that
+    // must fail to compile instead of silently patching a truncated offset.
+    fn patch(&mut self, idx: usize, target: usize) -> CResult<()> {
+        if self.proto.patch_jump(idx, target) {
+            Ok(())
+        } else {
+            Err(err("function too large (jump out of range)", self.line))
+        }
+    }
+
+    fn patch_here(&mut self, idx: usize) -> CResult<()> {
+        let here = self.pc();
+        self.patch(idx, here)
+    }
+
+    // Emits a Jmp/ForLoop back-edge to `target`; same range check as patch.
+    fn emit_back(&mut self, op: Op, a: u8, target: usize) -> CResult<()> {
+        let off = target as i64 - self.pc() as i64 - 1;
+        if off < -BIAS as i64 || off > u16::MAX as i64 - BIAS as i64 {
+            return Err(err("function too large (jump out of range)", self.line));
+        }
+        self.emit(enc_asbx(op, a, off as i32));
+        Ok(())
+    }
+
+    fn check_vararg(&self, line: u32) -> CResult<()> {
+        if self.is_vararg {
+            Ok(())
+        } else {
+            Err(err("cannot use '...' outside a vararg function", line))
+        }
+    }
+
+    fn cur_block(&self) -> usize { *self.blocks.last().unwrap_or(&0) }
+
+    // Lua label visibility: a label is visible in its own block and every
+    // nested block, plus — when its block is the last statement of the
+    // parent — in the enclosing block too (transitively). Anything else
+    // (sibling blocks, outer blocks) can't be jumped to.
+    fn label_visible(&self, label: &LabelInfo, from_block: usize) -> bool {
+        let mut b = label.block;
+        loop {
+            let mut f = from_block;
+            loop {
+                if f == b { return true; }
+                match self.block_parent[f] {
+                    Some(p) => f = p,
+                    None => break,
+                }
+            }
+            if self.block_tail[b] {
+                match self.block_parent[b] {
+                    Some(p) => b = p,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
+        false
+    }
 
     fn to_reg(&mut self, e: Expr2, hint: Option<u8>) -> CResult<u8> {
         let dst = hint.unwrap_or_else(|| self.free_reg);
@@ -462,9 +609,12 @@ impl FnComp {
     }
 
     fn compile_block(&mut self, block: &Block) -> CResult<()> {
+        self.new_block();
         let locals_top = self.locals_top();
         let reg_top = self.free_reg;
-        for stmt in &block.stmts {
+        let last = block.stmts.len().saturating_sub(1);
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            self.tail_stmt = i == last;
             self.compile_stmt(stmt)?;
         }
         if let Some(ret) = &block.ret {
@@ -474,6 +624,7 @@ impl FnComp {
         }
         self.pop_locals_to(locals_top);
         self.free_reg_to(reg_top);
+        self.end_block();
         Ok(())
     }
 
@@ -493,6 +644,7 @@ impl FnComp {
         let base = self.free_reg;
         let n = vals.len();
         let tail_vararg = matches!(vals[n - 1], Expr::Vararg(_));
+        if tail_vararg { self.check_vararg(line)?; }
         let tail_call = !closes && matches!(vals[n - 1], Expr::Call(_) | Expr::MethodCall(_));
         let fixed = if tail_vararg || tail_call { n - 1 } else { n };
         for (i, v) in vals[..fixed].iter().enumerate() {
@@ -503,6 +655,7 @@ impl FnComp {
         }
         if tail_vararg {
             if closes { self.emit_closes(0)?; }
+            self.reserve(base as usize + fixed + 1)?;
             self.emit(enc_abc(Op::Vararg, base + fixed as u8, 0, 0));
             self.emit(enc_abc(Op::Return, base, 0, 0));
         } else if tail_call {
@@ -520,6 +673,16 @@ impl FnComp {
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> CResult<()> {
+        if self.depth >= MAX_DEPTH {
+            return Err(err("chunk too deeply nested", self.line));
+        }
+        self.depth += 1;
+        let r = self.compile_stmt_inner(stmt);
+        self.depth -= 1;
+        r
+    }
+
+    fn compile_stmt_inner(&mut self, stmt: &Stmt) -> CResult<()> {
         match stmt {
             Stmt::Local { mutable, names, closes, values, line } => {
                 self.line = *line;
@@ -527,38 +690,43 @@ impl FnComp {
                 let nv = values.len();
                 let nn = names.len();
                 for (i, val) in values.iter().enumerate() {
-                    let dst = base + i as u8;
+                    let dst = base as usize + i;
                     let is_last = i + 1 == nv;
-                    let want = if is_last && nn > i { (nn - i) as u8 } else { 1 };
+                    let want = if is_last && nn > i { nn - i } else { 1 };
                     if want > 1 {
+                        // The whole `want`-wide result window must fit before
+                        // any operand is truncated to u8.
+                        self.reserve(dst + want)?;
                         match val {
-                            Expr::Call(c) => { self.compile_call(c, dst, want)?; }
-                            Expr::MethodCall(m) => { self.compile_method_call(m, dst, want)?; }
+                            Expr::Call(c) => { self.compile_call(c, dst as u8, want as u8)?; }
+                            Expr::MethodCall(m) => { self.compile_method_call(m, dst as u8, want as u8)?; }
                             Expr::Vararg(_) => {
-                                self.emit(enc_abc(Op::Vararg, dst, want + 1, 0));
+                                self.check_vararg(*line)?;
+                                self.emit(enc_abc(Op::Vararg, dst as u8, want as u8 + 1, 0));
                             }
                             _ => {
                                 let e = self.compile_expr(val)?;
-                                self.to_reg(e, Some(dst))?;
-                                for j in 1..want { self.emit_load_nil(dst + j); }
+                                self.to_reg(e, Some(dst as u8))?;
+                                for j in 1..want { self.emit_load_nil((dst + j) as u8); }
                             }
                         }
-                        if self.free_reg < dst + want { self.free_reg = dst + want; }
+                        if (self.free_reg as usize) < dst + want { self.free_reg = (dst + want) as u8; }
                     } else {
                         let e = self.compile_expr(val)?;
-                        self.to_reg(e, Some(dst))?;
-                        if self.free_reg <= dst { self.free_reg = dst + 1; }
+                        self.to_reg(e, Some(dst as u8))?;
+                        if self.free_reg as usize <= dst { self.free_reg = (dst + 1) as u8; }
                     }
                 }
                 let filled = if nv > 0 {
                     let last_i = nv - 1;
-                    let last_want = if nn > last_i { (nn - last_i) as u8 } else { 1 };
-                    last_i as u8 + last_want
+                    let last_want = if nn > last_i { nn - last_i } else { 1 };
+                    last_i + last_want
                 } else { 0 };
-                for i in (filled as usize)..nn {
-                    let dst = base + i as u8;
-                    if self.free_reg <= dst { self.free_reg = dst + 1; }
-                    self.emit_load_nil(dst);
+                for i in filled..nn {
+                    let dst = base as usize + i;
+                    self.reserve(dst + 1)?;
+                    if self.free_reg as usize <= dst { self.free_reg = (dst + 1) as u8; }
+                    self.emit_load_nil(dst as u8);
                 }
                 for (i, name) in names.iter().enumerate() {
                     let boxed = self.captured.contains(name);
@@ -592,37 +760,40 @@ impl FnComp {
                 let nv = values.len();
                 let nt = targets.len();
                 for i in 0..nv {
-                    let dst = tmp_base + i as u8;
+                    let dst = tmp_base as usize + i;
                     let is_last = i + 1 == nv;
-                    let want = if is_last && nt > i { (nt - i) as u8 } else { 1 };
+                    let want = if is_last && nt > i { nt - i } else { 1 };
                     if want > 1 {
+                        self.reserve(dst + want)?;
                         match &values[i] {
-                            Expr::Call(c) => { self.compile_call(c, dst, want)?; }
-                            Expr::MethodCall(m) => { self.compile_method_call(m, dst, want)?; }
+                            Expr::Call(c) => { self.compile_call(c, dst as u8, want as u8)?; }
+                            Expr::MethodCall(m) => { self.compile_method_call(m, dst as u8, want as u8)?; }
                             Expr::Vararg(_) => {
-                                self.emit(enc_abc(Op::Vararg, dst, want + 1, 0));
+                                self.check_vararg(*line)?;
+                                self.emit(enc_abc(Op::Vararg, dst as u8, want as u8 + 1, 0));
                             }
                             val => {
                                 let e = self.compile_expr(val)?;
-                                self.to_reg(e, Some(dst))?;
-                                for j in 1..want { self.emit_load_nil(dst + j); }
+                                self.to_reg(e, Some(dst as u8))?;
+                                for j in 1..want { self.emit_load_nil((dst + j) as u8); }
                             }
                         }
-                        if self.free_reg < dst + want { self.free_reg = dst + want; }
+                        if (self.free_reg as usize) < dst + want { self.free_reg = (dst + want) as u8; }
                     } else {
                         let e = self.compile_expr(&values[i])?;
-                        self.to_reg(e, Some(dst))?;
-                        if self.free_reg <= dst { self.free_reg = dst + 1; }
+                        self.to_reg(e, Some(dst as u8))?;
+                        if self.free_reg as usize <= dst { self.free_reg = (dst + 1) as u8; }
                     }
                 }
                 let filled = if nv > 0 {
-                    let last_want = if nt > nv - 1 { (nt - (nv - 1)) as u8 } else { 1 };
-                    (nv - 1) as u8 + last_want
+                    let last_want = if nt > nv - 1 { nt - (nv - 1) } else { 1 };
+                    (nv - 1) + last_want
                 } else { 0 };
-                for i in (filled as usize)..nt {
-                    let dst = tmp_base + i as u8;
-                    if self.free_reg <= dst { self.free_reg = dst + 1; }
-                    self.emit_load_nil(dst);
+                for i in filled..nt {
+                    let dst = tmp_base as usize + i;
+                    self.reserve(dst + 1)?;
+                    if self.free_reg as usize <= dst { self.free_reg = (dst + 1) as u8; }
+                    self.emit_load_nil(dst as u8);
                 }
                 self.reserve(self.free_reg as usize)?;
                 for (i, tgt) in targets.iter().enumerate() {
@@ -653,14 +824,13 @@ impl FnComp {
                 // continue jumps straight to the backedge — same target the loop's
                 // own fallthrough uses, so it re-checks cond exactly like a normal iteration.
                 let back_pos = self.pc();
-                for cj in scope.continue_jumps { self.proto.patch_jump(cj, back_pos); }
+                for cj in scope.continue_jumps { self.patch(cj, back_pos)?; }
 
-                let back = loop_top as i32 - self.pc() as i32 - 1;
-                self.emit(enc_asbx(Op::Jmp, 0, back));
+                self.emit_back(Op::Jmp, 0, loop_top)?;
                 let here = self.pc();
-                self.proto.patch_jump(exit_jump, here);
+                self.patch(exit_jump, here)?;
                 for bj in scope.break_jumps {
-                    self.proto.patch_jump(bj, here);
+                    self.patch(bj, here)?;
                 }
             }
 
@@ -669,8 +839,13 @@ impl FnComp {
                 let loop_top = self.pc();
                 let reg_top = self.free_reg;
                 self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
+                self.new_block();
                 let locals_top = self.locals_top();
-                for stmt in &body.stmts { self.compile_stmt(stmt)?; }
+                let last = body.stmts.len().saturating_sub(1);
+                for (i, stmt) in body.stmts.iter().enumerate() {
+                    self.tail_stmt = i == last;
+                    self.compile_stmt(stmt)?;
+                }
                 if let Some(r) = &body.ret { self.compile_return(r, body.line)?; }
 
                 // cond is compiled before popping the body's locals — Lua's repeat-until
@@ -681,17 +856,17 @@ impl FnComp {
                 let r = self.to_reg(e, Some(cond_reg))?;
                 if self.free_reg <= r { self.free_reg = r + 1; }
                 self.emit(enc_abc(Op::Test, r as u8, 0, 0));
-                let back = loop_top as i32 - self.pc() as i32 - 1;
-                self.emit(enc_asbx(Op::Jmp, 0, back));
+                self.emit_back(Op::Jmp, 0, loop_top)?;
 
                 self.emit_closes(locals_top)?;
                 self.pop_locals_to(locals_top);
                 self.free_reg_to(reg_top);
+                self.end_block();
                 let scope = self.loops.pop().unwrap();
 
                 let here = self.pc();
-                for cj in scope.continue_jumps { self.proto.patch_jump(cj, cond_pos); }
-                for bj in scope.break_jumps { self.proto.patch_jump(bj, here); }
+                for cj in scope.continue_jumps { self.patch(cj, cond_pos)?; }
+                for bj in scope.break_jumps { self.patch(bj, here)?; }
             }
 
             Stmt::If { cond, then, elseifs, else_, line } => {
@@ -714,19 +889,19 @@ impl FnComp {
                 if !elseifs.is_empty() || else_.is_some() {
                     exit_jumps.push(self.proto.emit_jump(*line));
                 }
-                self.proto.patch_jump_here(fail);
+                self.patch_here(fail)?;
 
                 for (ei_cond, ei_body) in elseifs {
                     let f2 = test(self, ei_cond)?;
                     self.compile_block(ei_body)?;
                     exit_jumps.push(self.proto.emit_jump(*line));
-                    self.proto.patch_jump_here(f2);
+                    self.patch_here(f2)?;
                 }
                 if let Some(eb) = else_ {
                     self.compile_block(eb)?;
                 }
                 let here = self.pc();
-                for j in exit_jumps { self.proto.patch_jump(j, here); }
+                for j in exit_jumps { self.patch(j, here)?; }
             }
 
             Stmt::ForNum { var, start, limit, step, body, line } => {
@@ -758,8 +933,11 @@ impl FnComp {
                 let locals_save = self.locals.len() - 1;
 
                 self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
+                self.new_block();
                 let inner_locals = self.locals_top();
-                for stmt in &body.stmts {
+                let last = body.stmts.len().saturating_sub(1);
+                for (i, stmt) in body.stmts.iter().enumerate() {
+                    self.tail_stmt = i == last;
                     self.compile_stmt(stmt)?;
                 }
                 if let Some(r) = &body.ret {
@@ -768,21 +946,26 @@ impl FnComp {
                     self.emit_closes(inner_locals)?;
                 }
                 self.pop_locals_to(inner_locals);
+                self.end_block();
                 let scope = self.loops.pop().unwrap();
 
                 // continue jumps to the ForLoop step/condition-check itself.
                 let step_pos = self.pc();
-                for cj in scope.continue_jumps { self.proto.patch_jump(cj, step_pos); }
+                for cj in scope.continue_jumps { self.patch(cj, step_pos)?; }
 
-                let back = loop_top as i32 - self.pc() as i32 - 1;
-                self.emit(enc_asbx(Op::ForLoop, base as u8, back));
+                self.emit_back(Op::ForLoop, base as u8, loop_top)?;
                 let here = self.pc();
 
-                let prep_off = here as i32 - prep as i32 - 1;
-                self.proto.code[prep] = enc_asbx(Op::ForPrep, base as u8, prep_off - 1);
+                // ForPrep skips the body straight to the ForLoop instruction
+                // when the range is empty; same signed-offset range check.
+                let prep_off = here as i64 - prep as i64 - 2;
+                if prep_off < -BIAS as i64 || prep_off > u16::MAX as i64 - BIAS as i64 {
+                    return Err(err("function too large (jump out of range)", *line));
+                }
+                self.proto.code[prep] = enc_asbx(Op::ForPrep, base as u8, prep_off as i32);
 
                 self.locals.truncate(locals_save);
-                for bj in scope.break_jumps { self.proto.patch_jump(bj, here); }
+                for bj in scope.break_jumps { self.patch(bj, here)?; }
                 self.free_reg_to(base);
             }
 
@@ -825,31 +1008,36 @@ impl FnComp {
                 }
 
                 self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
+                self.new_block();
                 let inner_locals = self.locals_top();
-                for s in &body.stmts { self.compile_stmt(s)?; }
+                let last = body.stmts.len().saturating_sub(1);
+                for (i, s) in body.stmts.iter().enumerate() {
+                    self.tail_stmt = i == last;
+                    self.compile_stmt(s)?;
+                }
                 if let Some(r) = &body.ret { self.compile_return(r, body.line)?; } else { self.emit_closes(inner_locals)?; }
                 self.pop_locals_to(inner_locals);
+                self.end_block();
                 let scope = self.loops.pop().unwrap();
 
                 // continue jumps to the TForCall/TForLoop pair that advances the iterator.
                 let advance_pos = self.pc();
-                for cj in scope.continue_jumps { self.proto.patch_jump(cj, advance_pos); }
+                for cj in scope.continue_jumps { self.patch(cj, advance_pos)?; }
 
-                self.proto.patch_jump_here(loop_jmp);
+                self.patch_here(loop_jmp)?;
                 self.emit(enc_abc(Op::TForCall, base as u8, 0, vars.len() as u8));
-                let back = loop_top as i32 - self.pc() as i32 - 1;
-                self.emit(enc_asbx(Op::TForLoop, base as u8, back));
+                self.emit_back(Op::TForLoop, base as u8, loop_top)?;
 
                 let here = self.pc();
                 self.locals.truncate(lv_base);
-                for bj in scope.break_jumps { self.proto.patch_jump(bj, here); }
+                for bj in scope.break_jumps { self.patch(bj, here)?; }
                 self.free_reg_to(base);
             }
 
             Stmt::FuncDef { name, body, line } => {
                 self.line = *line;
                 let outer = Some(self as *mut FnComp);
-                let proto = compile_fn(body, self.proto.source.clone(), outer)?;
+                let proto = compile_fn(body, self.proto.source.clone(), outer, self.depth)?;
                 let pi = self.proto.protos.len();
                 self.proto.protos.push(proto);
                 let dst = self.alloc_reg()?;
@@ -905,7 +1093,7 @@ impl FnComp {
                 let boxed = self.captured.contains(name);
                 if boxed { self.emit(enc_abc(Op::NewTable, r, 0, 0)); }
                 self.locals.push(Local { name: name.clone(), reg: r, mutable: true, close: false, boxed });
-                let proto = compile_fn(body, self.proto.source.clone(), outer)?;
+                let proto = compile_fn(body, self.proto.source.clone(), outer, self.depth)?;
                 let pi = self.proto.protos.len();
                 self.proto.protos.push(proto);
                 if boxed {
@@ -952,14 +1140,25 @@ impl FnComp {
             Stmt::Goto(name, line) => {
                 self.line = *line;
                 let j = self.proto.emit_jump(*line);
-                self.pending_gotos.push((name.clone(), j, *line, self.locals_top()));
+                let closers = self.locals.iter().enumerate()
+                    .filter(|(_, l)| l.close)
+                    .map(|(i, l)| (i, l.reg, l.boxed))
+                    .collect();
+                self.pending_gotos.push(PendingGoto {
+                    name: name.clone(), jump: j, line: *line,
+                    block: self.cur_block(), locals: self.locals_top(),
+                    closers, free_reg: self.free_reg,
+                });
             }
             Stmt::Label(name, line) => {
                 self.line = *line;
                 if self.labels.contains_key(name) {
                     return Err(err(format!("label '{name}' already defined in this function"), *line));
                 }
-                self.labels.insert(name.clone(), (self.pc(), self.locals_top()));
+                self.labels.insert(name.clone(), LabelInfo {
+                    pc: self.pc(), block: self.cur_block(),
+                    tail: self.tail_stmt, locals: self.locals_top(),
+                });
             }
         }
         Ok(())
@@ -1020,6 +1219,16 @@ impl FnComp {
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> CResult<Expr2> {
+        if self.depth >= MAX_DEPTH {
+            return Err(err("chunk too deeply nested", expr.line()));
+        }
+        self.depth += 1;
+        let r = self.compile_expr_inner(expr);
+        self.depth -= 1;
+        r
+    }
+
+    fn compile_expr_inner(&mut self, expr: &Expr) -> CResult<Expr2> {
         let line = expr.line();
         self.line = line;
         match expr {
@@ -1056,7 +1265,8 @@ impl FnComp {
                     Ok(Expr2 { kind: ExprKind::Global(ki), line })
                 }
             }
-            Expr::Vararg(_) => {
+            Expr::Vararg(l) => {
+                self.check_vararg(*l)?;
                 let r = self.alloc_reg()?;
                 self.emit(enc_abc(Op::Vararg, r, 2, 0));
                 Ok(Expr2::reg(r, line))
@@ -1065,16 +1275,17 @@ impl FnComp {
                 self.line = *line;
                 let e = self.compile_expr(operand)?;
                 let r = self.to_reg(e, None)?;
-                let dst = self.alloc_reg()?;
+                // When the operand landed in a scratch register (anything
+                // that isn't a named local's slot), the result can reuse it —
+                // same convention Expr::Field uses — instead of allocating a
+                // fresh register and then freeing the result slot by mistake.
+                let dst = if matches!(e.kind, ExprKind::Reg(_)) { self.alloc_reg()? } else { r };
                 let instr = match op {
                     Unop::Neg  => enc_abc(Op::Unm,  dst, r, 0),
                     Unop::Not  => enc_abc(Op::Not,  dst, r, 0),
                     Unop::Len  => enc_abc(Op::Len,  dst, r, 0),
                     Unop::BNot => enc_abc(Op::BNot, dst, r, 0),
                 };
-                if !matches!(e.kind, ExprKind::Reg(_)) {
-                    self.free_reg = dst;
-                }
                 self.emit(instr);
                 Ok(Expr2::reg(dst, *line))
             }
@@ -1101,7 +1312,7 @@ impl FnComp {
             }
             Expr::Function(body) => {
                 let outer = Some(self as *mut FnComp);
-                let proto = compile_fn(body, self.proto.source.clone(), outer)?;
+                let proto = compile_fn(body, self.proto.source.clone(), outer, self.depth)?;
                 let pi = self.proto.protos.len();
                 self.proto.protos.push(proto);
                 let r = self.alloc_reg()?;
@@ -1164,14 +1375,14 @@ impl FnComp {
                 self.free_reg = dst + 1;
                 let end_jump = self.proto.emit_jump(*line);
 
-                self.proto.patch_jump_here(else_jump);
+                self.patch_here(else_jump)?;
                 self.free_reg = dst;
                 let ee = self.compile_expr(else_)?;
                 let er = self.to_reg(ee, Some(dst))?;
                 if er != dst { self.emit_move(dst, er); }
                 self.free_reg = dst + 1;
 
-                self.proto.patch_jump_here(end_jump);
+                self.patch_here(end_jump)?;
                 Ok(Expr2::reg(dst, *line))
             }
             Expr::IncrDecr { target, delta, prefix, line } => {
@@ -1259,7 +1470,7 @@ impl FnComp {
     fn emit_bool_from_cmp(&mut self, dst: u8, line: u32) -> CResult<Expr2> {
         let to_true = self.proto.emit_jump(line);
         self.emit(enc_abc(Op::LoadBool, dst, 0, 1));
-        self.proto.patch_jump_here(to_true);
+        self.patch_here(to_true)?;
         self.emit(enc_abc(Op::LoadBool, dst, 1, 0));
         Ok(Expr2::reg(dst, line))
     }
@@ -1279,7 +1490,7 @@ impl FnComp {
         let rr = self.to_reg(re, Some(base))?;
         if rr != base { self.emit_move(base, rr); }
 
-        self.proto.patch_jump_here(skip);
+        self.patch_here(skip)?;
         self.free_reg = base + 1;
         Ok(Expr2::reg(base, line))
     }
@@ -1294,6 +1505,12 @@ impl FnComp {
         let mut arr_idx: usize = 0;
         let field_base = self.free_reg;
         let nfields = tc.fields.len();
+        // SetList's C operand is the 1-based batch number in a u8, so the
+        // array part can't exceed 255 batches of 50.
+        let arr_total = tc.fields.iter().filter(|f| matches!(f, TableField::Positional(_))).count();
+        if arr_total > 255 * 50 {
+            return Err(err("table constructor too large", tc.line));
+        }
         // Like Lua, `...` or a call as the very last field contributes every
         // value it produces (SetList b=0 reads up to frame.top).
         let mut open_tail = false;
@@ -1320,6 +1537,7 @@ impl FnComp {
                     let is_last = fi + 1 == nfields;
                     match val {
                         Expr::Vararg(_) if is_last => {
+                            self.check_vararg(tc.line)?;
                             self.reserve(slot as usize + 1)?;
                             self.emit(enc_abc(Op::Vararg, slot, 0, 0));
                             open_tail = true;
@@ -1399,7 +1617,7 @@ impl FnComp {
             Args::Exprs(exprs) => {
                 let n = exprs.len();
                 if n == 0 { return Ok((0, false)); }
-                if n > MAX_REGS as usize { return Err(err("too many arguments", self.line)); }
+                if arg_base as usize + n > MAX_REGS as usize { return Err(err("too many arguments", self.line)); }
                 let variable = matches!(exprs[n - 1], Expr::Vararg(_) | Expr::Call(_) | Expr::MethodCall(_));
                 let fixed = if variable { n - 1 } else { n };
                 for (i, e) in exprs[..fixed].iter().enumerate() {
@@ -1411,7 +1629,7 @@ impl FnComp {
                 if !variable { return Ok((n as u8, false)); }
                 let slot = arg_base + fixed as u8;
                 match &exprs[n - 1] {
-                    Expr::Vararg(_) => { self.emit(enc_abc(Op::Vararg, slot, 0, 0)); }
+                    Expr::Vararg(_) => { self.check_vararg(self.line)?; self.emit(enc_abc(Op::Vararg, slot, 0, 0)); }
                     Expr::Call(c) => self.compile_call(c, slot, MULTRET)?,
                     Expr::MethodCall(m) => self.compile_method_call(m, slot, MULTRET)?,
                     _ => unreachable!(),
@@ -1435,9 +1653,9 @@ impl FnComp {
     }
 }
 
-fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp>) -> CResult<Proto> {
-    let captured = collect_captured_names(body);
-    let mut fc = FnComp::new(source, outer, captured);
+fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp>, depth: u32) -> CResult<Proto> {
+    let captured = collect_captured_names(body)?;
+    let mut fc = FnComp::new(source, outer, captured, depth, body.vararg);
     if body.params.len() > MAX_REGS as usize {
         return Err(err("too many parameters", body.line));
     }
@@ -1460,15 +1678,51 @@ fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp
 
     fc.compile_block(&body.body)?;
 
-    for (name, jump_idx, line, goto_locals) in &fc.pending_gotos {
-        match fc.labels.get(name) {
-            Some(&(target, label_locals)) => {
-                if label_locals > *goto_locals {
-                    return Err(err(format!("goto '{name}' jumps into the scope of a local"), *line));
+    // The implicit return must precede any goto stubs: a stub is only
+    // reachable through its patched jump, so it has to live past the point
+    // where normal fall-through exits the function.
+    if fc.proto.code.last().map(|&i| iop(i)) != Some(Op::Return as u8) {
+        fc.emit(enc_abc(Op::Return, 0, 1, 0));
+    }
+
+    // Resolve gotos now that every label is known. A goto may only reach a
+    // label visible from its block (Lua's scoping rule) and may not enter
+    // the scope of a local declared after the label. When the jump leaves
+    // the scope of <close> locals, it is retargeted at a stub appended here
+    // that runs their close() calls before jumping on to the label.
+    let gotos = std::mem::take(&mut fc.pending_gotos);
+    for g in &gotos {
+        match fc.labels.get(&g.name).cloned() {
+            Some(l) => {
+                if !fc.label_visible(&l, g.block) {
+                    return Err(err(format!("no visible label '{}' for goto", g.name), g.line));
                 }
-                fc.proto.patch_jump(*jump_idx, target);
+                if l.locals > g.locals {
+                    return Err(err(format!("goto '{}' jumps into the scope of a local", g.name), g.line));
+                }
+                let leavers: Vec<(u8, bool)> = g.closers.iter()
+                    .filter(|(i, _, _)| *i >= l.locals)
+                    .map(|(_, r, b)| (*r, *b))
+                    .collect();
+                if leavers.is_empty() {
+                    fc.patch(g.jump, l.pc)?;
+                } else {
+                    let stub = fc.pc();
+                    fc.patch(g.jump, stub)?;
+                    let saved_free = fc.free_reg;
+                    let saved_line = fc.line;
+                    fc.free_reg = g.free_reg;
+                    fc.line = g.line;
+                    for (reg, boxed) in leavers.into_iter().rev() {
+                        fc.emit_close_one(reg, boxed)?;
+                        fc.free_reg = g.free_reg;
+                    }
+                    fc.free_reg = saved_free;
+                    fc.line = saved_line;
+                    fc.emit_back(Op::Jmp, 0, l.pc)?;
+                }
             }
-            None => return Err(err(format!("no visible label '{name}' for goto"), *line)),
+            None => return Err(err(format!("no visible label '{}' for goto", g.name), g.line)),
         }
     }
 
@@ -1488,9 +1742,6 @@ fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp
         crate::chunk::UpvalDesc { name: u.name.clone(), in_stack: u.in_stack, idx: u.outer_idx }
     }).collect();
 
-    if fc.proto.code.last().map(|&i| iop(i)) != Some(Op::Return as u8) {
-        fc.emit(enc_abc(Op::Return, 0, 1, 0));
-    }
     Ok(fc.proto)
 }
 
@@ -1502,5 +1753,5 @@ pub fn compile(block: Block, source: Option<String>) -> CResult<Proto> {
         body: block,
         line,
     };
-    compile_fn(&chunk_body, source, None)
+    compile_fn(&chunk_body, source, None, 0)
 }

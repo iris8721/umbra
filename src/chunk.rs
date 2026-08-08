@@ -142,15 +142,22 @@ impl Proto {
         self.emit(enc_asbx(Op::Jmp, 0, 0), line)
     }
 
-    pub fn patch_jump(&mut self, idx: usize, target: usize) {
+    // Returns false when the target is out of the signed 16-bit sBx range;
+    // callers must turn that into a compile error rather than emit a
+    // truncated offset that would jump somewhere arbitrary.
+    pub fn patch_jump(&mut self, idx: usize, target: usize) -> bool {
         let offset = target as i32 - idx as i32 - 1;
+        if offset < -BIAS || offset > u16::MAX as i32 - BIAS {
+            return false;
+        }
         let a = ia(self.code[idx]) as u8;
         self.code[idx] = enc_asbx(Op::Jmp, a, offset);
+        true
     }
 
-    pub fn patch_jump_here(&mut self, idx: usize) {
+    pub fn patch_jump_here(&mut self, idx: usize) -> bool {
         let here = self.code.len();
-        self.patch_jump(idx, here);
+        self.patch_jump(idx, here)
     }
 
     pub fn add_const(&mut self, c: Const) -> usize {
