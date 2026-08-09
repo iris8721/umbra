@@ -1375,17 +1375,18 @@ impl Vm {
 
                     Op::Return => {
                         let nv = if b == 0 { frame.top.saturating_sub(base + a) } else { b - 1 };
-                        let results: Vec<Value> = (0..nv).map(|i| self.regs[base + a + i]).collect();
                         let expected = frame.expected_results;
                         let base_save = base;
                         self.frames.pop();
                         if self.frames.is_empty() {
-                            self.top_level_results = results;
+                            self.top_level_results =
+                                self.regs[base_save + a..base_save + a + nv].to_vec();
                             return Ok(());
                         }
                         // The frame was pushed at (call site A) + 1, so results land
-                        // back on the calling instruction's A register.
-                        self.place_results(base_save - 1, results, expected);
+                        // back on the calling instruction's A register. Source and
+                        // destination overlap (dst < src), so move in place.
+                        self.place_results_from(base_save - 1, base_save + a, nv, expected);
                         continue 'outer;
                     }
 
@@ -1517,6 +1518,20 @@ impl Vm {
         if at + fill > self.regs.len() { self.regs.resize(at + fill + 64, Value::nil()); }
         for (i, v) in results.into_iter().take(fill).enumerate() { self.regs[at + i] = v; }
         for i in nr..fill { self.regs[at + i] = Value::nil(); }
+        if expected == 255 {
+            if let Some(f) = self.frames.last_mut() { f.top = at + nr; }
+        }
+    }
+
+    // Same contract as place_results, but the results already sit in the
+    // register window at `src..src+nr` (a returning frame's values), so they
+    // move in place instead of round-tripping through a Vec.
+    fn place_results_from(&mut self, at: usize, src: usize, nr: usize, expected: u8) {
+        let fill = if expected == 255 { nr } else { expected as usize };
+        if at + fill > self.regs.len() { self.regs.resize(at + fill + 64, Value::nil()); }
+        let n = nr.min(fill);
+        if n > 0 && src != at { self.regs.copy_within(src..src + n, at); }
+        for i in n..fill { self.regs[at + i] = Value::nil(); }
         if expected == 255 {
             if let Some(f) = self.frames.last_mut() { f.top = at + nr; }
         }
