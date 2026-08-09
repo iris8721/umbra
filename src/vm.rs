@@ -129,24 +129,79 @@ use crate::value::Value;
 // range ops) — an allocator failure on an oversized request aborts the
 // process unconditionally and can't be caught, unlike a normal panic.
 pub(crate) const MAX_ALLOC_LEN: usize = 64 * 1024 * 1024;
+// Multiply-rotate hasher for the VM's internal maps; SipHash's DoS resistance
+// buys nothing for script tables and intern caches, and it dominated the
+// profile on global/table lookups.
+#[derive(Default, Clone, Copy)]
+pub struct FxHasher { hash: u64 }
+
+impl FxHasher {
+    #[inline(always)]
+    fn add(&mut self, w: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(0x517cc1b727220a95);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks { self.add(u64::from_ne_bytes(c.try_into().unwrap())); }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut w = [0u8; 8];
+            w[..rem.len()].copy_from_slice(rem);
+            self.add(u64::from_ne_bytes(w));
+        }
+    }
+    #[inline(always)] fn write_u8(&mut self, n: u8)       { self.add(n as u64); }
+    #[inline(always)] fn write_u32(&mut self, n: u32)     { self.add(n as u64); }
+    #[inline(always)] fn write_u64(&mut self, n: u64)     { self.add(n); }
+    #[inline(always)] fn write_i64(&mut self, n: i64)     { self.add(n as u64); }
+    #[inline(always)] fn write_usize(&mut self, n: usize) { self.add(n as u64); }
+    #[inline(always)] fn finish(&self) -> u64 { self.hash }
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct FxBuild;
+
+impl std::hash::BuildHasher for FxBuild {
+    type Hasher = FxHasher;
+    #[inline(always)]
+    fn build_hasher(&self) -> FxHasher { FxHasher::default() }
+}
+
+pub type FxMap<K, V> = HashMap<K, V, FxBuild>;
+
+fn fx_str_hash(s: &str) -> u64 {
+    let mut h = FxHasher::default();
+    std::hash::Hasher::write(&mut h, s.as_bytes());
+    std::hash::Hasher::finish(&h)
+}
+
 
 // bytes[..len] is valid UTF-8; bytes[len] == 0. The trailing NUL makes
 // as_c_ptr() safe to hand to a C host expecting a NUL-terminated string
-// (a plain Rust String's buffer has no such guarantee).
+// (a plain Rust String's buffer has no such guarantee). `hash` is the
+// FxHash of the bytes, precomputed so table-key hashing is O(1).
 pub struct RtString {
     pub len: usize,
+    pub hash: u64,
     bytes: Box<[u8]>,
 }
 
 impl RtString {
     pub fn as_c_ptr(&self) -> *const u8 { self.bytes.as_ptr() }
+    fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[..self.len]) }
+    }
 }
 
 fn alloc_string_raw(s: &str) -> *mut u8 {
     let mut bytes = Vec::with_capacity(s.len() + 1);
     bytes.extend_from_slice(s.as_bytes());
     bytes.push(0);
-    let rt = RtString { len: s.len(), bytes: bytes.into_boxed_slice() };
+    let rt = RtString { len: s.len(), hash: fx_str_hash(s), bytes: bytes.into_boxed_slice() };
     Box::into_raw(Box::new(rt)) as *mut u8
 }
 
@@ -187,16 +242,47 @@ pub(crate) unsafe fn string_ref<'a>(v: Value) -> &'a str {
 
 pub struct Table {
     pub array: Vec<Value>,
-    pub hash: HashMap<TableKey, Value>,
+    pub hash: FxMap<TableKey, Value>,
     pub metatable: Option<*mut Table>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+// Str carries the interned string's pointer, not an owned String: lookups
+// hash the precomputed RtString::hash and compare contents only on a probe
+// hit, so a string-keyed raw_get no longer allocates or rehashes bytes.
+// Keys keep their strings alive via propagate_table marking.
+#[derive(Debug, Clone)]
 pub enum TableKey {
     Int(i64),
-    Str(String),
+    Str(*mut u8),
     Bool(bool),
     Ptr(u64),
+}
+
+impl PartialEq for TableKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TableKey::Int(a), TableKey::Int(b))   => a == b,
+            (TableKey::Str(a), TableKey::Str(b))   =>
+                a == b || unsafe { (*a as *const RtString).as_ref().unwrap().as_str()
+                    == (*b as *const RtString).as_ref().unwrap().as_str() },
+            (TableKey::Bool(a), TableKey::Bool(b)) => a == b,
+            (TableKey::Ptr(a), TableKey::Ptr(b))   => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TableKey {}
+
+impl std::hash::Hash for TableKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            TableKey::Int(n)  => { state.write_u8(0); state.write_i64(*n); }
+            TableKey::Str(p)  => { state.write_u8(1); state.write_u64(unsafe { (*(*p as *const RtString)).hash }); }
+            TableKey::Bool(b) => { state.write_u8(2); state.write_u8(*b as u8); }
+            TableKey::Ptr(p)  => { state.write_u8(3); state.write_u64(*p); }
+        }
+    }
 }
 
 impl TableKey {
@@ -212,8 +298,7 @@ impl TableKey {
         }
         if v.is_bool() { return Some(TableKey::Bool(v.as_bool().unwrap())); }
         if v.is_string() {
-            let s = unsafe { string_ref(v) };
-            return Some(TableKey::Str(s.to_owned()));
+            return Some(TableKey::Str(v.as_string().unwrap()));
         }
         Some(TableKey::Ptr(v.raw_bits()))
     }
@@ -221,9 +306,8 @@ impl TableKey {
 
 impl Table {
     pub fn new() -> Self {
-        Table { array: Vec::new(), hash: HashMap::new(), metatable: None }
+        Table { array: Vec::new(), hash: FxMap::default(), metatable: None }
     }
-
     pub fn raw_get(&self, key: Value) -> Value {
         if key.is_int() {
             let i = key.as_int().unwrap();
@@ -235,6 +319,15 @@ impl Table {
             return self.hash.get(&k).copied().unwrap_or(Value::nil());
         }
         Value::nil()
+    }
+
+    // String lookup without a Value at hand (GC metatable checks); metatables
+    // are tiny, so a linear scan beats fabricating a key.
+    pub fn get_str(&self, name: &str) -> Option<Value> {
+        self.hash.iter().find_map(|(k, v)| match k {
+            TableKey::Str(p) if unsafe { (*(*p as *const RtString)).as_str() == name } => Some(*v),
+            _ => None,
+        })
     }
 
     pub fn raw_set(&mut self, key: Value, val: Value) {
@@ -308,7 +401,7 @@ pub struct Vm {
     regs: Vec<Value>,
     frames: Vec<Frame>,
     pub globals: Table,
-    string_cache: HashMap<String, Value>,
+    string_cache: FxMap<String, Value>,
     // Interned string constants resolved from live Protos; rooted for the
     // VM's lifetime so the per-constant cache in StrConst can never dangle.
     const_strings: Vec<Value>,
@@ -331,7 +424,7 @@ pub struct Vm {
     // Not script-settable — only the embedder (via the C API) controls this.
     pub step_limit: u64,
     pub step_count: u64,
-    pub loaded_modules: HashMap<String, Value>,
+    pub loaded_modules: FxMap<String, Value>,
     // Frame stacks parked by run_isolated while a nested isolated call
     // (metamethod, pcall target, __gc) runs; their varargs must stay
     // reachable to the collector.
@@ -407,7 +500,7 @@ impl Vm {
             regs: vec![Value::nil(); 256],
             frames: Vec::with_capacity(64),
             globals: Table::new(),
-            string_cache: HashMap::new(),
+            string_cache: FxMap::default(),
             const_strings: Vec::new(),
             top_level_results: Vec::new(),
             gc: Gc::new(),
@@ -421,7 +514,7 @@ impl Vm {
             last_traceback: None,
             step_limit: 0,
             step_count: 0,
-            loaded_modules: HashMap::new(),
+            loaded_modules: FxMap::default(),
             saved_frames: Vec::new(),
             coroutine_depth: 0,
         };
@@ -469,7 +562,16 @@ impl Vm {
             roots.extend(f.varargs.iter().copied());
         }
         roots.extend(self.globals.array.iter().copied());
-        roots.extend(self.globals.hash.values().copied());
+        // globals isn't a GC object, so propagate_table never sees it: root
+        // its hash keys (strings keep the key's pointer alive) and values.
+        for (k, v) in &self.globals.hash {
+            match k {
+                TableKey::Str(p) => roots.push(Value::string(*p)),
+                TableKey::Ptr(bits) => roots.push(Value::from_raw(*bits)),
+                _ => {}
+            }
+            roots.push(*v);
+        }
         if let Some(mt) = self.globals.metatable {
             roots.push(Value::table(mt as *mut u8));
         }
@@ -1686,7 +1788,7 @@ impl Vm {
                     let k = match tk {
                         TableKey::Int(n)  => make_int_via_current_vm(*n),
                         TableKey::Bool(b) => Value::bool(*b),
-                        TableKey::Str(s)  => with_current_vm(|vm| vm.intern(s)).unwrap_or_else(|| alloc_string_val(s)),
+                        TableKey::Str(p)  => Value::string(*p),
                         TableKey::Ptr(p)  => Value::from_raw(*p),
                     };
                     if found { return Ok(vec![k, v]); }
@@ -1757,7 +1859,7 @@ impl Vm {
             let t = unsafe { table_ref(v) };
             let mt_ptr = match t.metatable { None => return Ok(vec![Value::nil()]), Some(p) => p };
             let mt = unsafe { &*mt_ptr };
-            if let Some(&guard) = mt.hash.get(&TableKey::Str("__metatable".to_owned())) {
+            if let Some(guard) = mt.get_str("__metatable") {
                 return Ok(vec![guard]);
             }
             Ok(vec![Value::table(mt_ptr as *mut u8)])

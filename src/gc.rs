@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::value::Value;
+use crate::vm::FxMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcColor { White, Gray, Black }
@@ -10,7 +10,7 @@ enum GcKind { Str, Table, Closure, BigInt }
 struct GcEntry { color: GcColor, kind: GcKind, finalized: bool }
 
 pub struct Gc {
-    objects:     HashMap<usize, GcEntry>,
+    objects:     FxMap<usize, GcEntry>,
     gray_list:   Vec<usize>,
     // Allocations since the last collection; a cycle is due once this
     // reaches threshold or the live count at the end of the previous cycle,
@@ -32,7 +32,7 @@ pub struct Gc {
 impl Gc {
     pub fn new() -> Self {
         Gc {
-            objects:     HashMap::new(),
+            objects:     FxMap::default(),
             gray_list:   Vec::new(),
             alloc_count: 0,
             live_after_collect: 0,
@@ -63,7 +63,7 @@ impl Gc {
     pub fn collect(
         &mut self,
         roots: impl Iterator<Item = Value>,
-        string_cache: &mut HashMap<String, Value>,
+        string_cache: &mut FxMap<String, Value>,
     ) {
         for entry in self.objects.values_mut() { entry.color = GcColor::White; }
 
@@ -76,7 +76,7 @@ impl Gc {
         // through normal propagation, so __gc(table) can run after this sweep.
         // An object is finalized at most once.
         {
-            use crate::vm::{Table, TableKey};
+            use crate::vm::Table;
             let white_tables: Vec<usize> = self.objects.iter()
                 .filter(|(_, e)| e.color == GcColor::White && !e.finalized && matches!(e.kind, GcKind::Table))
                 .map(|(&ptr, _)| ptr)
@@ -86,7 +86,7 @@ impl Gc {
                 let mt_ptr = match t.metatable { Some(p) => p, None => continue };
                 if !self.objects.contains_key(&(mt_ptr as usize)) { continue; }
                 let mt = unsafe { &*mt_ptr };
-                if let Some(&gc_fn) = mt.hash.get(&TableKey::Str("__gc".to_owned())) {
+                if let Some(gc_fn) = mt.get_str("__gc") {
                     self.objects.get_mut(&ptr).unwrap().finalized = true;
                     self.mark_value(Value::table(ptr as *mut u8));
                     self.pending_finalizers.push((ptr, gc_fn));
@@ -122,6 +122,9 @@ impl Gc {
                     if weak_keys {
                         if let TableKey::Ptr(bits) = k {
                             if self.is_dead_value(Value::from_raw(*bits)) { return false; }
+                        }
+                        if let TableKey::Str(p) = k {
+                            if self.is_dead_value(Value::string(*p)) { return false; }
                         }
                     }
                     true
@@ -185,7 +188,7 @@ impl Gc {
         }
     }
 
-    fn mark_ptr_gray(objects: &mut HashMap<usize, GcEntry>, gray: &mut Vec<usize>, ptr: usize) {
+    fn mark_ptr_gray(objects: &mut FxMap<usize, GcEntry>, gray: &mut Vec<usize>, ptr: usize) {
         if let Some(e) = objects.get_mut(&ptr) {
             if e.color == GcColor::White {
                 e.color = GcColor::Gray;
@@ -217,13 +220,18 @@ impl Gc {
                     // here may be marked later; mark_ephemerons revisits them.
                     let key_live = match k {
                         TableKey::Ptr(bits) => !self.is_dead_value(Value::from_raw(*bits)),
+                        TableKey::Str(p)    => !self.is_dead_value(Value::string(*p)),
                         _ => true,
                     };
                     if key_live && !weak_values {
                         vs.push(*v);
                     }
                 } else {
-                    if let TableKey::Ptr(bits) = k { vs.push(Value::from_raw(*bits)); }
+                    match k {
+                        TableKey::Ptr(bits) => vs.push(Value::from_raw(*bits)),
+                        TableKey::Str(p)    => vs.push(Value::string(*p)),
+                        _ => {}
+                    }
                     if !weak_values { vs.push(*v); }
                 }
             }
@@ -256,6 +264,7 @@ impl Gc {
                     .filter(|(k, v)| {
                         let key_live = match k {
                             TableKey::Ptr(bits) => !self.is_dead_value(Value::from_raw(*bits)),
+                            TableKey::Str(p)    => !self.is_dead_value(Value::string(*p)),
                             _ => true,
                         };
                         key_live && self.is_dead_value(**v)
@@ -301,11 +310,11 @@ fn free_object(ptr: usize, kind: GcKind) {
 }
 
 fn table_weak_mode(t: &crate::vm::Table) -> (bool, bool) {
-    use crate::vm::{TableKey, string_ref};
+    use crate::vm::string_ref;
     let mt_ptr = match t.metatable { Some(p) => p, None => return (false, false) };
     let mt = unsafe { &*mt_ptr };
-    match mt.hash.get(&TableKey::Str("__mode".to_owned())) {
-        Some(&v) if v.is_string() => {
+    match mt.get_str("__mode") {
+        Some(v) if v.is_string() => {
             let s = unsafe { string_ref(v) };
             (s.contains('k'), s.contains('v'))
         }
