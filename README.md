@@ -106,7 +106,7 @@ umbra_close(U);
 script file, and runs it. `example/Makefile` builds it against the cdylib:
 
 ```sh
-cargo build            # produces target/debug/libumbra.so
+cargo build --release  # produces target/release/libumbra.so
 cd example && make run-word-count
 ```
 

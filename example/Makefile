@@ -1,4 +1,4 @@
-LIB_DIR = ../target/debug
+LIB_DIR = ../target/release
 
 .PHONY: all run run-word-count run-scheduler run-bank-account clean
 
