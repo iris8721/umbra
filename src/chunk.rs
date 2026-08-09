@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 // ABC format:  [ op:8 | A:8 | B:8  | C:8  ]
 // ABx format:  [ op:8 | A:8 | Bx:16       ]  (Bx unsigned)
 // AsBx format: [ op:8 | A:8 | sBx:16      ]  (sBx = raw - BIAS)
@@ -93,7 +95,34 @@ pub enum Const {
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(String),
+    Str(StrConst),
+}
+
+// The interned Value is filled in by the first VM that resolves the constant;
+// the owner tag keeps a Proto shared across VMs from handing back a pointer
+// into another VM's heap. The VM keeps interned constants alive for its whole
+// lifetime (Vm::const_strings), so a cached pointer never dangles.
+#[derive(Debug)]
+pub struct StrConst {
+    pub s: String,
+    cached: Cell<(usize, u64)>,
+}
+
+impl StrConst {
+    pub fn new(s: String) -> Self {
+        StrConst { s, cached: Cell::new((0, 0)) }
+    }
+
+    pub fn cached(&self) -> (usize, u64) { self.cached.get() }
+    pub fn set_cached(&self, owner: usize, bits: u64) { self.cached.set((owner, bits)); }
+}
+
+impl Clone for StrConst {
+    fn clone(&self) -> Self { StrConst::new(self.s.clone()) }
+}
+
+impl PartialEq for StrConst {
+    fn eq(&self, other: &Self) -> bool { self.s == other.s }
 }
 
 #[derive(Debug, Clone)]
@@ -141,8 +170,9 @@ impl Proto {
     pub fn emit_jump(&mut self, line: u32) -> usize {
         self.emit(enc_asbx(Op::Jmp, 0, 0), line)
     }
-
-    // Returns false when the target is out of the signed 16-bit sBx range;
+    pub fn add_string(&mut self, s: &str) -> usize {
+        self.add_const(Const::Str(StrConst::new(s.to_owned())))
+    }
     // callers must turn that into a compile error rather than emit a
     // truncated offset that would jump somewhere arbitrary.
     pub fn patch_jump(&mut self, idx: usize, target: usize) -> bool {
@@ -169,9 +199,6 @@ impl Proto {
         i
     }
 
-    pub fn add_string(&mut self, s: &str) -> usize {
-        self.add_const(Const::Str(s.to_owned()))
-    }
 
     pub fn current_pc(&self) -> usize { self.code.len() }
 }

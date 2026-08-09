@@ -309,6 +309,9 @@ pub struct Vm {
     frames: Vec<Frame>,
     pub globals: Table,
     string_cache: HashMap<String, Value>,
+    // Interned string constants resolved from live Protos; rooted for the
+    // VM's lifetime so the per-constant cache in StrConst can never dangle.
+    const_strings: Vec<Value>,
     pub top_level_results: Vec<Value>,
     pub gc: Gc,
     pub coroutines: Vec<*mut Coroutine>,
@@ -405,6 +408,7 @@ impl Vm {
             frames: Vec::with_capacity(64),
             globals: Table::new(),
             string_cache: HashMap::new(),
+            const_strings: Vec::new(),
             top_level_results: Vec::new(),
             gc: Gc::new(),
             coroutines: Vec::new(),
@@ -470,6 +474,7 @@ impl Vm {
             roots.push(Value::table(mt as *mut u8));
         }
         roots.extend(self.host_stack.iter().copied());
+        roots.extend(self.const_strings.iter().copied());
         roots.extend(self.loaded_modules.values().copied());
         roots.push(self.string_lib);
         for &ptr in &self.coroutines {
@@ -822,7 +827,20 @@ impl Vm {
             Const::Bool(b)   => Value::bool(*b),
             Const::Int(n)    => self.make_int(*n),
             Const::Float(f)  => Value::float(*f),
-            Const::Str(s)    => self.intern(s),
+            Const::Str(sc)   => {
+                let (owner, bits) = sc.cached();
+                if bits != 0 && owner == self as *const Vm as usize {
+                    return Value::from_raw(bits);
+                }
+                let v = self.intern(&sc.s);
+                sc.set_cached(self as *const Vm as usize, v.raw_bits());
+                // Interned constants are rooted for the VM's lifetime: a
+                // borrowed Proto (exec) can outlive a collection, and a
+                // collected-then-reused address would resurrect the cache
+                // pointing at an unrelated string.
+                self.const_strings.push(v);
+                v
+            }
         }
     }
 
@@ -1202,19 +1220,19 @@ impl Vm {
 
                     Op::GetGlobal => {
                         let k = self.resolve_const(proto, bx);
-                        let name = if k.is_string() { unsafe { string_ref(k) }.to_owned() }
-                                   else { return Err(VmError::RuntimeError("invalid global name".into())); };
-                        let key = self.intern(&name);
-                        let v = self.globals.raw_get(key);
+                        if !k.is_string() {
+                            return Err(VmError::RuntimeError("invalid global name".into()));
+                        }
+                        let v = self.globals.raw_get(k);
                         self.regs[base + a] = v;
                     }
                     Op::SetGlobal => {
                         let k = self.resolve_const(proto, bx);
-                        let name = if k.is_string() { unsafe { string_ref(k) }.to_owned() }
-                                   else { return Err(VmError::RuntimeError("invalid global name".into())); };
-                        let key = self.intern(&name);
+                        if !k.is_string() {
+                            return Err(VmError::RuntimeError("invalid global name".into()));
+                        }
                         let v = self.regs[base + a];
-                        self.globals.raw_set(key, v);
+                        self.globals.raw_set(k, v);
                     }
 
                     Op::Call => {

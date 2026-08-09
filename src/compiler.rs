@@ -335,7 +335,7 @@ impl FnComp {
     }
 
     fn rk_str(&mut self, s: &str) -> CResult<u8> {
-        Ok(self.rk_const(Const::Str(s.to_owned()))? as u8)
+        Ok(self.rk_const(Const::Str(crate::chunk::StrConst::new(s.to_owned())))? as u8)
     }
 
     // Returns (register, boxed).
