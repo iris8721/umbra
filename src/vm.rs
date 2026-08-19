@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use crate::chunk::{Const, Op, Proto, ia, ib, ic, ibx, isbx, iop, is_rk, rk_idx};
+use crate::chunk::{Const, Op, Proto, StrConst, ia, ib, ic, ibx, isbx, iop, is_rk, rk_idx};
 use crate::gc::Gc;
 use crate::pack;
 use crate::pattern;
@@ -259,6 +259,7 @@ pub enum TableKey {
 }
 
 impl PartialEq for TableKey {
+    #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (TableKey::Int(a), TableKey::Int(b))   => a == b,
@@ -308,12 +309,18 @@ impl Table {
     pub fn new() -> Self {
         Table { array: Vec::new(), hash: FxMap::default(), metatable: None }
     }
+    #[inline(always)]
     pub fn raw_get(&self, key: Value) -> Value {
         if key.is_int() {
             let i = key.as_int().unwrap();
             if i >= 1 && (i as usize) <= self.array.len() {
                 return self.array[(i - 1) as usize];
             }
+        }
+        // String keys dominate; skip the full from_value cascade for them.
+        if key.is_string() {
+            return self.hash.get(&TableKey::Str(key.as_string().unwrap()))
+                .copied().unwrap_or(Value::nil());
         }
         if let Some(k) = TableKey::from_value(key) {
             return self.hash.get(&k).copied().unwrap_or(Value::nil());
@@ -490,7 +497,6 @@ impl Vm {
     pub fn new() -> Self {
         Self::new_inner(None)
     }
-
     pub fn new_with_print(hook: impl Fn(String) + 'static) -> Self {
         Self::new_inner(Some(Box::new(hook)))
     }
@@ -498,7 +504,7 @@ impl Vm {
     fn new_inner(print_hook: Option<Box<dyn Fn(String)>>) -> Self {
         let mut vm = Vm {
             regs: vec![Value::nil(); 256],
-            frames: Vec::with_capacity(64),
+            frames: Vec::with_capacity(200),
             globals: Table::new(),
             string_cache: FxMap::default(),
             const_strings: Vec::new(),
@@ -923,8 +929,9 @@ impl Vm {
             "attempt to compare {} with {}", a.type_name(), b.type_name())))
     }
 
+    #[inline(always)]
     fn resolve_const(&mut self, proto: &Proto, idx: usize) -> Value {
-        match &proto.consts[idx] {
+        match unsafe { proto.consts.get_unchecked(idx) } {
             Const::Nil       => Value::nil(),
             Const::Bool(b)   => Value::bool(*b),
             Const::Int(n)    => self.make_int(*n),
@@ -932,18 +939,24 @@ impl Vm {
             Const::Str(sc)   => {
                 let (owner, bits) = sc.cached();
                 if bits != 0 && owner == self as *const Vm as usize {
-                    return Value::from_raw(bits);
+                    Value::from_raw(bits)
+                } else {
+                    self.intern_const_str(sc)
                 }
-                let v = self.intern(&sc.s);
-                sc.set_cached(self as *const Vm as usize, v.raw_bits());
-                // Interned constants are rooted for the VM's lifetime: a
-                // borrowed Proto (exec) can outlive a collection, and a
-                // collected-then-reused address would resurrect the cache
-                // pointing at an unrelated string.
-                self.const_strings.push(v);
-                v
             }
         }
+    }
+
+    // First-touch path for a string constant; interned constants are rooted
+    // for the VM's lifetime (const_strings): a borrowed Proto (exec) can
+    // outlive a collection, and a collected-then-reused address would
+    // resurrect the cache pointing at an unrelated string.
+    #[cold]
+    fn intern_const_str(&mut self, sc: &StrConst) -> Value {
+        let v = self.intern(&sc.s);
+        sc.set_cached(self as *const Vm as usize, v.raw_bits());
+        self.const_strings.push(v);
+        v
     }
 
     // Chunks run in an isolated frame too, so a host calling back into the VM
@@ -963,6 +976,7 @@ impl Vm {
             .map_err(thrown_to_runtime)
     }
 
+    #[inline(always)]
     pub fn push_frame(&mut self, proto: *const Proto, upvals_ptr: *mut Value, upvals_len: usize, base: usize, nargs: u8, expected: u8) -> VmResult<()> {
         if self.frames.len() >= 200 { return Err(VmError::StackOverflow); }
         let p = unsafe { &*proto };
@@ -977,7 +991,17 @@ impl Vm {
         } else {
             Box::new([])
         };
-        self.frames.push(Frame { proto, pc: 0, base, expected_results: expected, upvals_ptr, upvals_len, varargs, top: base });
+        // Manual push: Vec::push_mut's grow path never inlines and dominated
+        // the call profile; capacity is preallocated to the 200-frame limit.
+        let f = Frame { proto, pc: 0, base, expected_results: expected, upvals_ptr, upvals_len, varargs, top: base };
+        if self.frames.len() == self.frames.capacity() {
+            self.frames.reserve(8);
+        }
+        unsafe {
+            let end = self.frames.as_mut_ptr().add(self.frames.len());
+            std::ptr::write(end, f);
+            self.frames.set_len(self.frames.len() + 1);
+        }
         Ok(())
     }
 
@@ -1026,6 +1050,9 @@ impl Vm {
         e
     }
 
+    // R!/RK! expand to unchecked accesses; a few call sites already sit inside
+    // unsafe blocks, which would warn without this.
+    #[allow(unused_unsafe)]
     pub fn run_inner(&mut self) -> VmResult<()> {
         'outer: loop {
             // GC runs here, before `frame` becomes a raw pointer into self.frames:
@@ -1043,17 +1070,21 @@ impl Vm {
             }
 
             let frame = self.frames.last_mut().unwrap() as *mut Frame;
-            let frame = unsafe { &mut *frame };
-            let proto = unsafe { &*frame.proto };
-            let base = frame.base;
+            let mut frame = unsafe { &mut *frame };
+            let mut proto = unsafe { &*frame.proto };
+            let mut base = frame.base;
 
+            // Register and constant indices come from the compiler's own
+            // bytecode (register allocation is bounded by max_regs, which
+            // push_frame sizes the window for), so indexing is unchecked —
+            // the bounds checks were a measurable slice of dispatch cost.
             macro_rules! R {
-                ($r:expr) => { self.regs[base + $r] }
+                ($r:expr) => { *unsafe { self.regs.get_unchecked_mut(base + $r) } }
             }
             macro_rules! RK {
                 ($x:expr) => {
                     if is_rk($x) { self.resolve_const(proto, rk_idx($x)) }
-                    else { self.regs[base + $x] }
+                    else { unsafe { *self.regs.get_unchecked(base + $x) } }
                 }
             }
             macro_rules! arith_op {
@@ -1092,7 +1123,7 @@ impl Vm {
                     continue 'outer;
                 }
 
-                let instr = proto.code[frame.pc];
+                let instr = unsafe { *proto.code.get_unchecked(frame.pc) };
                 frame.pc += 1;
                 let a  = ia(instr);
                 let b  = ib(instr);
@@ -1232,7 +1263,7 @@ impl Vm {
                         }
                     }
                     Op::Concat => {
-                        let mut vals: Vec<Value> = (b..=c).map(|i| self.regs[base + i]).collect();
+                        let mut vals: Vec<Value> = (b..=c).map(|i| unsafe { *self.regs.get_unchecked(base + i) }).collect();
                         let mut acc = vals.pop().unwrap_or(Value::nil());
                         for &left in vals.iter().rev() {
                             acc = self.concat_two(left, acc)?;
@@ -1243,21 +1274,47 @@ impl Vm {
 
                     Op::Eq => {
                         let bv = RK!(b); let cv = RK!(c);
-                        let eq = self.values_eq_mm(bv, cv)?;
-                        if eq != (a != 0) { frame.pc += 1; }
-                        continue 'outer;
+                        if bv.raw_bits() == cv.raw_bits() {
+                            if a == 0 { frame.pc += 1; }
+                        } else {
+                            let eq = self.values_eq_mm(bv, cv)?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            if eq != (a != 0) { frame.pc += 1; }
+                        }
                     }
+
                     Op::Lt => {
                         let bv = RK!(b); let cv = RK!(c);
-                        let lt = self.value_lt_mm(bv, cv)?;
-                        if lt != (a != 0) { frame.pc += 1; }
-                        continue 'outer;
+                        // Numbers compare inline (floats can never be NaN here —
+                        // Value::float maps NaN to nil); only non-numbers take
+                        // the metamethod path, which may swap frames.
+                        if bv.is_int() && cv.is_int() {
+                            if (bv.as_int().unwrap() < cv.as_int().unwrap()) != (a != 0) { frame.pc += 1; }
+                        } else if bv.is_number() && cv.is_number() {
+                            if value_lt(bv, cv)? != (a != 0) { frame.pc += 1; }
+                        } else {
+                            let lt = self.value_lt_mm(bv, cv)?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            if lt != (a != 0) { frame.pc += 1; }
+                        }
                     }
                     Op::Le => {
                         let bv = RK!(b); let cv = RK!(c);
-                        let le = self.value_le_mm(bv, cv)?;
-                        if le != (a != 0) { frame.pc += 1; }
-                        continue 'outer;
+                        if bv.is_int() && cv.is_int() {
+                            if (bv.as_int().unwrap() <= cv.as_int().unwrap()) != (a != 0) { frame.pc += 1; }
+                        } else if bv.is_number() && cv.is_number() {
+                            if value_le(bv, cv)? != (a != 0) { frame.pc += 1; }
+                        } else {
+                            let le = self.value_le_mm(bv, cv)?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            if le != (a != 0) { frame.pc += 1; }
+                        }
                     }
 
                     Op::Test => {
@@ -1283,31 +1340,48 @@ impl Vm {
                     Op::GetTable => {
                         let tv = R!(b);
                         let kv = RK!(c);
+                        if tv.is_table() {
+                            let t = unsafe { &*(tv.as_table().unwrap() as *const Table) };
+                            let raw = t.raw_get(kv);
+                            if !raw.is_nil() || t.metatable.is_none() {
+                                R!(a) = raw;
+                                continue;
+                            }
+                            let result = self.table_index_chain(tv, kv)?;
+                            self.regs[base + a] = result;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            continue;
+                        }
                         if tv.is_string() {
                             let result = if self.string_lib.is_table() {
                                 unsafe { &*(self.string_lib.as_table().unwrap() as *const Table) }.raw_get(kv)
                             } else {
                                 Value::nil()
                             };
-                            self.regs[base + a] = result;
-                            continue 'outer;
+                            R!(a) = result;
+                            continue;
                         }
-                        if !tv.is_table() {
-                            return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
-                        }
-                        let result = self.table_index_chain(tv, kv)?;
-                        self.regs[base + a] = result;
-                        continue 'outer;
+                        return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
                     }
                     Op::SetTable => {
                         let tv = R!(a);
                         let kv = RK!(b);
                         let vv = RK!(c);
-                        if !tv.is_table() {
-                            return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
+                        if tv.is_table() {
+                            let t = unsafe { &*(tv.as_table().unwrap() as *const Table) };
+                            if t.metatable.is_none() || !t.raw_get(kv).is_nil() {
+                                unsafe { table_ref(tv) }.raw_set(kv, vv);
+                                continue;
+                            }
+                            self.table_newindex_chain(tv, kv, vv)?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            continue;
                         }
-                        self.table_newindex_chain(tv, kv, vv)?;
-                        continue 'outer;
+                        return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
                     }
                     Op::SetList => {
                         let tv = R!(a);
@@ -1342,7 +1416,18 @@ impl Vm {
                         let nargs = if b == 0 { frame.top.saturating_sub(base + a + 1) as u8 } else { (b - 1) as u8 };
                         let nresults = if c == 0 { 255 } else { (c - 1) as u8 };
 
-                        if let Some(cfn) = get_cfn(fn_val) {
+                        // Proto-callables (script functions/closures) are the
+                        // common case; cfn and __call checks come after.
+                        if let Some(cp) = get_proto_callable(fn_val) {
+                            self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, base + a + 1, nargs, nresults)?;
+                            // Refresh in place instead of re-entering 'outer:
+                            // the GC/budget checks there also run at the top of
+                            // the inner loop, so nothing is skipped.
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            continue;
+                        } else if let Some(cfn) = get_cfn(fn_val) {
                             let args_base = base + a + 1;
                             let args: Vec<Value> = (0..nargs as usize)
                                 .map(|i| self.regs[args_base + i])
@@ -1366,10 +1451,7 @@ impl Vm {
                             self.place_results(base + a, results, nresults);
                             continue 'outer;
                         } else {
-                            let cp = get_proto_callable(fn_val)
-                                .ok_or_else(|| VmError::RuntimeError(format!("attempt to call a {}", fn_val.type_name())))?;
-                            self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, base + a + 1, nargs, nresults)?;
-                            continue 'outer;
+                            return Err(VmError::RuntimeError(format!("attempt to call a {}", fn_val.type_name())));
                         }
                     }
 
@@ -1387,7 +1469,10 @@ impl Vm {
                         // back on the calling instruction's A register. Source and
                         // destination overlap (dst < src), so move in place.
                         self.place_results_from(base_save - 1, base_save + a, nv, expected);
-                        continue 'outer;
+                        frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                        proto = unsafe { &*frame.proto };
+                        base = frame.base;
+                        continue;
                     }
 
                     Op::ForPrep => {
@@ -1443,7 +1528,10 @@ impl Vm {
                             self.regs[new_base] = state;
                             self.regs[new_base + 1] = ctrl;
                             self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, new_base, 2, nresults)?;
-                            continue 'outer;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            continue;
                         }
                     }
                     Op::TForLoop => {
@@ -1454,13 +1542,13 @@ impl Vm {
                     }
 
                     Op::Closure => {
-                        let inner_proto = &proto.protos[bx];
+                        let inner_proto = unsafe { proto.protos.get_unchecked(bx) };
                         let closure_val = if inner_proto.upvals.is_empty() {
                             Value::userdata(inner_proto as *const Proto as *mut u8)
                         } else {
                             let upvals: Vec<Value> = inner_proto.upvals.iter().map(|desc| {
                                 if desc.in_stack {
-                                    self.regs[base + desc.idx as usize]
+                                    unsafe { *self.regs.get_unchecked(base + desc.idx as usize) }
                                 } else if (desc.idx as usize) < frame.upvals_len {
                                     unsafe { *frame.upvals_ptr.add(desc.idx as usize) }
                                 } else {
@@ -1530,7 +1618,12 @@ impl Vm {
         let fill = if expected == 255 { nr } else { expected as usize };
         if at + fill > self.regs.len() { self.regs.resize(at + fill + 64, Value::nil()); }
         let n = nr.min(fill);
-        if n > 0 && src != at { self.regs.copy_within(src..src + n, at); }
+        // dst < src always (results land one slot below the callee's base),
+        // so a forward copy is safe; a plain loop beats memmove's call
+        // overhead for the 0-2 results most returns carry.
+        if src != at {
+            for i in 0..n { self.regs[at + i] = self.regs[src + i]; }
+        }
         for i in n..fill { self.regs[at + i] = Value::nil(); }
         if expected == 255 {
             if let Some(f) = self.frames.last_mut() { f.top = at + nr; }
