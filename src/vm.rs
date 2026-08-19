@@ -1565,7 +1565,6 @@ impl Vm {
                         };
                         self.regs[base + a] = closure_val;
                     }
-
                     Op::GetUpval => {
                         let v = if b < frame.upvals_len {
                             unsafe { *frame.upvals_ptr.add(b) }
@@ -1614,6 +1613,7 @@ impl Vm {
     // Same contract as place_results, but the results already sit in the
     // register window at `src..src+nr` (a returning frame's values), so they
     // move in place instead of round-tripping through a Vec.
+    #[inline(always)]
     fn place_results_from(&mut self, at: usize, src: usize, nr: usize, expected: u8) {
         let fill = if expected == 255 { nr } else { expected as usize };
         if at + fill > self.regs.len() { self.regs.resize(at + fill + 64, Value::nil()); }
