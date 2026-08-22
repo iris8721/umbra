@@ -798,7 +798,7 @@ impl Vm {
     }
 
     fn new_coroutine(&mut self, fn_val: Value, who: &str) -> VmResult<Value> {
-        if get_closure(fn_val).is_none() {
+        if get_closure(fn_val).is_none() && get_cfn(fn_val).is_none() {
             return Err(VmError::RuntimeError(format!("{who}: expected function")));
         }
         let co = Box::new(Coroutine {
@@ -834,14 +834,28 @@ impl Vm {
         std::mem::swap(&mut self.tbc, &mut co.tbc);
         self.coroutine_depth += 1;
 
+        // A host function can't yield (there's no frame to suspend), so it
+        // runs to completion inside this one resume; its results become the
+        // coroutine's return values and the coroutine ends dead.
         let setup: VmResult<()> = if !co.started {
             co.started = true;
-            let cp = get_proto_callable(co.fn_val).unwrap();
-            let base = 1usize;
-            let needed = base + unsafe { &*cp.proto }.max_regs as usize + 8;
-            if self.regs.len() < needed { self.regs.resize(needed + 64, Value::nil()); }
-            for (i, &v) in args.iter().enumerate() { self.regs[base + i] = v; }
-            self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, base, args.len() as u8, 255)
+            if let Some(cfn) = get_cfn(co.fn_val) {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cfn(args))) {
+                    Ok(Ok(vals)) => { self.top_level_results = vals; Ok(()) }
+                    Ok(Err(e)) => Err(e),
+                    Err(payload) => {
+                        self.poisoned = true;
+                        Err(VmError::RuntimeError(format!("internal error (panic): {}", panic_message(&*payload))))
+                    }
+                }
+            } else {
+                let cp = get_proto_callable(co.fn_val).unwrap();
+                let base = 1usize;
+                let needed = base + unsafe { &*cp.proto }.max_regs as usize + 8;
+                if self.regs.len() < needed { self.regs.resize(needed + 64, Value::nil()); }
+                for (i, &v) in args.iter().enumerate() { self.regs[base + i] = v; }
+                self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, base, args.len() as u8, 255)
+            }
         } else {
             if co.yield_result_base > 0 {
                 self.place_results(co.yield_result_base, args.to_vec(), co.yield_nresults);
@@ -850,13 +864,20 @@ impl Vm {
             Ok(())
         };
         let run_result = match setup {
-            Ok(()) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner())) {
-                Ok(r) => r.map_err(|e| self.enrich_error_line(e)),
-                Err(payload) => {
-                    self.poisoned = true;
-                    Err(VmError::RuntimeError(format!("internal error (panic): {}", panic_message(&*payload))))
-                }
-            },
+            Ok(()) if !self.frames.is_empty() =>
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner())) {
+                    Ok(r) => r.map_err(|e| self.enrich_error_line(e)),
+                    Err(payload) => {
+                        self.poisoned = true;
+                        Err(VmError::RuntimeError(format!("internal error (panic): {}", panic_message(&*payload))))
+                    }
+                },
+            Ok(()) => Ok(()),
+            // A host-function coroutine that calls yield() can't suspend —
+            // there's no frame to park — so report it like any other yield
+            // across a C-call boundary.
+            Err(VmError::Yield(_)) if self.frames.is_empty() =>
+                Err(VmError::RuntimeError("attempt to yield across a C-call boundary".into())),
             Err(e) => Err(e),
         };
         let co_results = std::mem::take(&mut self.top_level_results);

@@ -141,7 +141,6 @@ API, and stdlib edge cases.
   is ignored and native endianness is treated as little-endian
 - `yield` can't cross a `pcall`, metamethod or `table.sort` comparator
   boundary; it fails with "attempt to yield across a C-call boundary"
-- `coroutine.create`/`wrap` take script functions only, not host functions
 - Floating-point NaN is represented as `none` (the NaN bit patterns are the
   value encoding), so `0/0` yields `none`
 - Strings are UTF-8, not byte strings: `string.char(200)` produces a two-byte

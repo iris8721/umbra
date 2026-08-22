@@ -1884,6 +1884,34 @@ print(ok)
     }
 
     #[test]
+    fn coroutine_wrap_accepts_host_functions() {
+        // A host function can't yield, so it runs to completion on the first
+        // resume and the coroutine ends dead.
+        assert_output(
+            r#"
+let w = coroutine.wrap(print)
+w("a", "b")
+let co = coroutine.create(print)
+print(coroutine.status(co))
+print(coroutine.resume(co, "x"))
+print(coroutine.status(co))
+print(coroutine.resume(co))
+let w2 = coroutine.wrap(tostring)
+print(w2(42))
+"#,
+            &[
+                "a\tb",
+                "suspended",
+                "x",
+                "true",
+                "dead",
+                "false\tcannot resume dead coroutine",
+                "42",
+            ],
+        );
+    }
+
+    #[test]
     fn stdlib_ipairs() {
         assert_output(
             r#"
