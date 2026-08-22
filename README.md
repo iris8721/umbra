@@ -22,7 +22,8 @@ Familiar to anyone who knows Lua, with a C-flavored syntax:
   (`+=`, `-=`, …); note `!=` is not-equal and `~=` is xor-assign
 - String interpolation: `"balance: ${account.balance}"`
 - `<close>` variable attribute: `close()` runs when the scope exits, whether
-  by fall-through, `break`, `continue` or `return`
+  by fall-through, `break`, `continue`, `return` or an error unwinding
+  through it (the error is passed as close's second argument)
 - `none` instead of `nil`; `not`/`and`/`or`; `@` line comments and
   `/* */` block comments
 - Integers and floats as distinct types; integers are full 64-bit (values
@@ -138,7 +139,6 @@ API, and stdlib edge cases.
 - `string.pack` returns the packed bytes hex-encoded (strings must be valid
   UTF-8), so its output isn't interchangeable with real Lua; alignment (`!`)
   is ignored and native endianness is treated as little-endian
-- `<close>` cleanup does not run when an error unwinds through the scope
 - `yield` can't cross a `pcall`, metamethod or `table.sort` comparator
   boundary; it fails with "attempt to yield across a C-call boundary"
 - `coroutine.create`/`wrap` take script functions only, not host functions

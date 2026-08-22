@@ -386,6 +386,9 @@ pub struct Coroutine {
     pub started: bool,
     pub yield_result_base: usize,
     pub yield_nresults: u8,
+    // The coroutine's pending <close> marks; swapped in and out of Vm::tbc
+    // with its regs/frames on resume.
+    pub tbc: Vec<(usize, bool)>,
 }
 
 pub struct LuaClosure {
@@ -436,6 +439,11 @@ pub struct Vm {
     // (metamethod, pcall target, __gc) runs; their varargs must stay
     // reachable to the collector.
     saved_frames: Vec<Vec<Frame>>,
+    // Registers marked to-be-closed by Op::Tbc, innermost last: (absolute
+    // register index, boxed flag). Op::TbcPop drops the newest mark on a
+    // normal scope exit; unwind_closes drains the rest when an error
+    // discards frames. Kept off Frame so the hot call path stays small.
+    tbc: Vec<(usize, bool)>,
     coroutine_depth: usize,
 }
 
@@ -522,6 +530,7 @@ impl Vm {
             step_count: 0,
             loaded_modules: FxMap::default(),
             saved_frames: Vec::new(),
+            tbc: Vec::new(),
             coroutine_depth: 0,
         };
         vm.register_stdlib();
@@ -627,6 +636,77 @@ impl Vm {
         self.gc.collect(roots.into_iter(), &mut self.string_cache);
     }
 
+
+    // Runs close() on every to-be-closed register of the frames an error is
+    // about to discard: innermost frame first, innermost local first, each
+    // call receiving the pending error as its second argument (Lua 5.4's
+    // __close(value, err)). A close that fails replaces the pending error and
+    // unwinding continues with the new one. Marks below `floor` belong to
+    // frames that survive the unwind (parked by run_isolated) and are left
+    // alone. Call while self.frames/self.regs still hold the dying stack.
+    fn unwind_closes(&mut self, err: VmError, floor: usize) -> VmError {
+        if self.poisoned { self.tbc.truncate(floor); return err; }
+        let mut err = err;
+        // The error object is handed to each close call; a close that fails
+        // replaces it (and the pending error) for the rest of the unwind.
+        let mut err_val = match err {
+            VmError::Thrown(v) => v,
+            ref other => self.intern(&other.to_string()),
+        };
+        let close_key = self.intern("close");
+        // The close calls can collect; the error object and key must stay
+        // reachable across them.
+        self.host_stack.push(err_val);
+        self.host_stack.push(close_key);
+        macro_rules! replace_err {
+            ($e:expr) => {{
+                err = $e;
+                err_val = match err {
+                    VmError::Thrown(v) => v,
+                    ref other => self.intern(&other.to_string()),
+                };
+                let n = self.host_stack.len();
+                self.host_stack[n - 2] = err_val;
+            }};
+        }
+        while self.tbc.len() > floor {
+            let (reg, boxed) = self.tbc.pop().unwrap();
+            if self.poisoned { break; }
+            let mut v = self.regs[reg];
+            if boxed && v.is_table() {
+                v = unsafe { &*(v.as_table().unwrap() as *const Table) }.raw_get(Value::int(1));
+            }
+            let close = if v.is_table() {
+                let t = unsafe { &*(v.as_table().unwrap() as *const Table) };
+                let raw = t.raw_get(close_key);
+                if !raw.is_nil() || t.metatable.is_none() {
+                    raw
+                } else {
+                    match self.table_index_chain(v, close_key) {
+                        Ok(r) => r,
+                        Err(e) => { replace_err!(e); continue; }
+                    }
+                }
+            } else if v.is_string() {
+                if self.string_lib.is_table() {
+                    unsafe { &*(self.string_lib.as_table().unwrap() as *const Table) }.raw_get(close_key)
+                } else {
+                    Value::nil()
+                }
+            } else {
+                replace_err!(VmError::RuntimeError(
+                    format!("attempt to index a {} value", v.type_name())));
+                continue;
+            };
+            if let Err(e) = self.call_value_isolated(close, &[v, err_val]) {
+                replace_err!(e);
+            }
+        }
+        self.tbc.truncate(floor);
+        self.host_stack.pop();
+        self.host_stack.pop();
+        err
+    }
     // First register above every live frame; scratch space for calls that
     // must not clobber the running function's registers.
     fn scratch_base(&self) -> usize {
@@ -688,6 +768,9 @@ impl Vm {
     // isolated frames are discarded on return, so there'd be nothing to resume.
     fn run_isolated(&mut self, proto: *const Proto, upvals_ptr: *mut Value, upvals_len: usize, args: &[Value]) -> VmResult<Vec<Value>> {
         let base = self.scratch_base();
+        // Marks below the floor belong to the parked frames; only the
+        // isolated run's own <close> locals unwind here.
+        let tbc_floor = self.tbc.len();
         self.saved_frames.push(std::mem::take(&mut self.frames));
         let needed = base + unsafe { &*proto }.max_regs as usize + 8;
         if needed > self.regs.len() { self.regs.resize(needed + 64, Value::nil()); }
@@ -698,13 +781,20 @@ impl Vm {
         }
         let run_result = self.run();
         let results = std::mem::take(&mut self.top_level_results);
+        let run_result = match run_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // The isolated frames are about to be dropped: run their
+                // pending <close> locals first, while self.frames/self.regs
+                // still hold them.
+                let e = if matches!(e, VmError::Yield(_)) && self.coroutine_depth > 0 {
+                    VmError::RuntimeError("attempt to yield across a C-call boundary".into())
+                } else { e };
+                Err(self.unwind_closes(e, tbc_floor))
+            }
+        };
         self.frames = self.saved_frames.pop().unwrap();
-        match run_result {
-            Ok(()) => Ok(results),
-            Err(VmError::Yield(_)) if self.coroutine_depth > 0 =>
-                Err(VmError::RuntimeError("attempt to yield across a C-call boundary".into())),
-            Err(e) => Err(e),
-        }
+        run_result.map(|_| results)
     }
 
     fn new_coroutine(&mut self, fn_val: Value, who: &str) -> VmResult<Value> {
@@ -719,6 +809,7 @@ impl Vm {
             started: false,
             yield_result_base: 0,
             yield_nresults: 0,
+            tbc: Vec::new(),
         });
         let ptr = Box::into_raw(co);
         self.coroutines.push(ptr);
@@ -740,6 +831,7 @@ impl Vm {
         co.status = CoStatus::Running;
         std::mem::swap(&mut self.regs, &mut co.regs);
         std::mem::swap(&mut self.frames, &mut co.frames);
+        std::mem::swap(&mut self.tbc, &mut co.tbc);
         self.coroutine_depth += 1;
 
         let setup: VmResult<()> = if !co.started {
@@ -768,10 +860,17 @@ impl Vm {
             Err(e) => Err(e),
         };
         let co_results = std::mem::take(&mut self.top_level_results);
-
+        // A dead coroutine's frames are dropped below; run their pending
+        // <close> locals while they're still swapped in.
+        let run_result = match run_result {
+            Err(e @ VmError::Yield(_)) => Err(e),
+            Err(e) => Err(self.unwind_closes(e, 0)),
+            ok => ok,
+        };
         self.coroutine_depth -= 1;
         std::mem::swap(&mut self.regs, &mut co.regs);
         std::mem::swap(&mut self.frames, &mut co.frames);
+        std::mem::swap(&mut self.tbc, &mut co.tbc);
 
         match run_result {
             Err(VmError::Yield(values)) => {
@@ -1587,6 +1686,9 @@ impl Vm {
                         }
                         if b == 0 { frame.top = base + a + n; }
                     }
+
+                    Op::Tbc    => self.tbc.push((base + a, b != 0)),
+                    Op::TbcPop => { self.tbc.pop(); }
                 }
             }
 

@@ -3168,6 +3168,67 @@ for i = 1, 2 {
     }
 
     #[test]
+    fn close_runs_when_error_unwinds_scope() {
+        // The pending error reaches close() as its second argument, and
+        // nested scopes close innermost-first.
+        assert_output(
+            r#"fn res(name) { return { close = fn(self, e) { print("close " .. name .. " got " .. tostring(e)) } } }
+let ok, err = pcall(fn() {
+    let a <close> = res("a")
+    let b <close> = res("b")
+    error("x")
+})
+print(ok, err)"#,
+            &[
+                "close b got line 5: x",
+                "close a got line 5: x",
+                "false\tline 5: x",
+            ],
+        );
+    }
+
+    #[test]
+    fn close_error_replaces_pending_error() {
+        // Lua 5.4: a close() that throws replaces the error being unwound.
+        assert_output(
+            r#"let ok, err = pcall(fn() {
+    let a <close> = { close = fn(self, e) { error("close-fail") } }
+    error("orig")
+})
+print(ok, err)"#,
+            &["false\tline 2: close-fail"],
+        );
+    }
+
+    #[test]
+    fn close_runs_before_error_reaches_host() {
+        // No pcall at all: closes still run before the error surfaces.
+        let mut vm = vm::Vm::new();
+        let err = run_with_vm(
+            r#"let f <close> = { close = fn(self, e) { seen = tostring(e) } }
+error("toplevel")"#,
+            &mut vm,
+        )
+        .unwrap_err();
+        assert!(err.contains("toplevel"), "{err}");
+        let key = vm.intern_pub("seen");
+        let seen = vm.globals.raw_get(key);
+        assert_eq!(unsafe { vm::string_ref(seen) }, "line 2: toplevel");
+    }
+
+    #[test]
+    fn close_runs_when_coroutine_dies() {
+        assert_output(
+            r#"let co = coroutine.create(fn() {
+    let r <close> = { close = fn(self, e) { print("closed " .. tostring(e)) } }
+    error("co-boom")
+})
+print(coroutine.resume(co))"#,
+            &["closed line 3: co-boom", "false\tline 3: co-boom"],
+        );
+    }
+
+    #[test]
     fn goto_into_local_scope_is_rejected() {
         assert!(run("goto skip\nlet x = 1\n::skip::\nprint(x)").unwrap_err().contains("scope"));
         assert_output("var n = 0\n::top::\nn = n + 1\nif n < 3 { goto top }\nprint(n)", &["3"]);

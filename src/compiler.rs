@@ -385,8 +385,9 @@ impl FnComp {
 
     // Emits `local:close()` calls (LIFO) for the <close> locals in
     // locals[from_top..]. Called at a scope's fall-through end and before
-    // break/continue/return; an error unwinding through the scope skips it,
-    // since there's no unwind-time hook here (unlike real Lua's __close).
+    // break/continue/return; each close is preceded by a TbcPop so the
+    // register's unwind-time mark (see Op::Tbc) is dropped before the call —
+    // an error propagating out of close() must not close it a second time.
     fn emit_closes(&mut self, from_top: usize) -> CResult<()> {
         let closers: Vec<(u8, bool)> = self.locals[from_top..].iter()
             .filter(|l| l.close)
@@ -405,6 +406,7 @@ impl FnComp {
     // alloc_reg, so the caller must ensure free_reg sits above every live
     // value and restore it afterwards.
     fn emit_close_one(&mut self, reg: u8, boxed: bool) -> CResult<()> {
+        self.emit(enc_abc(Op::TbcPop, 0, 0, 0));
         // A <close> local that's also captured by a nested closure holds
         // a box (see the `boxed` field), not the resource itself — unbox
         // first so `close` is looked up on the real value.
@@ -732,9 +734,12 @@ impl FnComp {
                     self.locals.push(Local { name: name.clone(), reg: base + i as u8, mutable: *mutable, close: closes[i], boxed });
                 }
                 if self.free_reg < base + nn as u8 { self.free_reg = base + nn as u8; }
-                self.reserve(self.free_reg as usize)?;
                 for (i, name) in names.iter().enumerate() {
                     if self.captured.contains(name) { self.box_in_place(base + i as u8)?; }
+                    if closes[i] {
+                        let boxed = self.captured.contains(name) as u8;
+                        self.emit(enc_abc(Op::Tbc, base + i as u8, boxed, 0));
+                    }
                 }
             }
 

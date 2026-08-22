@@ -72,12 +72,18 @@ pub enum Op {
 
     GetUpval,
     SetUpval,
+
+    // Tbc marks register A as to-be-closed (B != 0 when it holds an upvalue
+    // box); TbcPop unmarks the most recent mark. The marks let an error
+    // unwinding through a frame run close() on the locals it tears down.
+    Tbc,
+    TbcPop,
 }
 
 impl Op {
     #[inline(always)]
     pub fn from_u8(b: u8) -> Option<Self> {
-        if b <= Op::SetUpval as u8 {
+        if b <= Op::TbcPop as u8 {
             Some(unsafe { std::mem::transmute(b) })
         } else {
             None
