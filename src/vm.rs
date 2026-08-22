@@ -1155,7 +1155,11 @@ impl Vm {
                         let proto = unsafe { &*frame.proto };
                         let pc = frame.pc.saturating_sub(1);
                         if let Some(&line) = proto.lines.get(pc) {
-                            return VmError::RuntimeError(format!("line {line}: {msg}"));
+                            let at = match &proto.source {
+                                Some(name) => format!("line {line} ({name})"),
+                                None => format!("line {line}"),
+                            };
+                            return VmError::RuntimeError(format!("{at}: {msg}"));
                         }
                     }
                 }
@@ -1975,6 +1979,35 @@ impl Vm {
                 let result = results.first().copied().unwrap_or(Value::bool(true));
                 vm.loaded_modules.insert(name, result);
                 Ok(vec![result])
+            })
+        });
+
+        // Compiles a source string into a callable chunk; on a syntax error
+        // returns none plus the message, Lua-style. The chunk's Proto is
+        // owned by the VM (owned_protos) so the returned value stays valid.
+        self.set_global_cfn("load", |args| {
+            let src = str_arg(args, 0, "load")?.to_owned();
+            let chunkname = match args.get(1) {
+                Some(v) if v.is_string() => Some(unsafe { string_ref(*v) }.to_owned()),
+                _ => None,
+            };
+            CURRENT_VM.with(|c| {
+                let vm_ptr = c.get();
+                if vm_ptr.is_null() { return Err(VmError::RuntimeError("no VM context".into())); }
+                let vm = unsafe { &mut *vm_ptr };
+                let (block, parse_errs) = crate::parse(&src);
+                if let Some(e) = parse_errs.first() {
+                    return Ok(vec![Value::nil(), vm.intern(&e.to_string())]);
+                }
+                match crate::compile(block, chunkname) {
+                    Err(e) => Ok(vec![Value::nil(), vm.intern(&e.to_string())]),
+                    Ok(proto) => {
+                        let boxed = Box::new(proto);
+                        let ptr: *const crate::chunk::Proto = &*boxed;
+                        vm.owned_protos.push(boxed);
+                        Ok(vec![Value::userdata(ptr as *mut u8)])
+                    }
+                }
             })
         });
 

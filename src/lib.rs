@@ -856,6 +856,34 @@ mod tests {
     }
 
     #[test]
+    fn load_compiles_source_into_a_callable() {
+        assert_output(
+            r#"print(load("return 1+1")())
+print(load("return ...")(7, 8))
+print(type(load("let x = 1")))"#,
+            &["2", "7\t8", "function"],
+        );
+    }
+
+    #[test]
+    fn load_returns_none_and_message_on_syntax_error() {
+        assert_output(
+            r#"let f, msg = load("syntax error here")
+print(f, type(msg))"#,
+            &["nil\tstring"],
+        );
+    }
+
+    #[test]
+    fn load_chunkname_appears_in_error_lines() {
+        assert_output(
+            r#"let f = load("error('boom')", "mychunk")
+print(pcall(f))"#,
+            &["false\tline 1 (mychunk): boom"],
+        );
+    }
+
+    #[test]
     fn io_open_writes_then_reads_a_file() {
         let path = "umbra_test_io_open_rw_xyz.txt";
         let result = run_capture(&format!(

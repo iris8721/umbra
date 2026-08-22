@@ -49,7 +49,7 @@ Familiar to anyone who knows Lua, with a C-flavored syntax:
   randomseed` and constants
 - `debug.traceback`, plus the base functions (`print tostring tonumber type
   assert error pcall xpcall ipairs pairs unpack select setmetatable
-  getmetatable rawget rawset rawequal require`)
+  getmetatable rawget rawset rawequal require load`)
 
 ## Architecture
 
@@ -145,7 +145,6 @@ API, and stdlib edge cases.
   value encoding), so `0/0` yields `none`
 - Strings are UTF-8, not byte strings: `string.char(200)` produces a two-byte
   character and `string.sub`/`reverse` slice on bytes but re-validate
-- No `load`/`dofile` beyond `require`
 - Expressions and blocks nest at most 100 levels; deeper sources are a
   parse error ("expected fewer nesting levels"), not a crash
 
