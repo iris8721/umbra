@@ -131,22 +131,61 @@ The suite covers the lexer, parser, value representation, VM semantics,
 GC behavior (finalizers, weak tables, coroutines), panic containment, the C
 API, and stdlib edge cases.
 
-## Known limitations
+## Performance
 
-- `require` and `io`/`os` do real filesystem and environment access — don't
-  expose them to untrusted scripts (the step limit and object ceiling are the
-  intended sandboxing knobs)
-- `string.pack` returns the packed bytes hex-encoded (strings must be valid
-  UTF-8), so its output isn't interchangeable with real Lua; alignment (`!`)
-  is ignored and native endianness is treated as little-endian
+Release build, same machine, against PUC Lua 5.4:
+
+| | umbra | lua 5.4 | |
+|---|---|---|---|
+| `fib(30)` — call overhead | 0.083s | 0.030s | 2.8× |
+| 2M array writes + reads | 0.057s | 0.031s | 1.8× |
+| 200k string concat + `gmatch` | 0.091s | 0.059s | 1.5× |
+
+The remaining gap is dispatch: the VM is a `match` loop over a `Vec` of
+instructions, not computed goto, and there is no JIT. No attempt has been
+made to compete with LuaJIT.
+
+## Differences from Lua
+
+These are deliberate and won't change:
+
+- **Strings are UTF-8, not bytes.** `string.char(200)` produces a two-byte
+  character; `string.sub`/`reverse` slice on bytes and re-validate. As a
+  consequence `string.pack` returns its output hex-encoded rather than as
+  raw bytes, alignment (`!`) is ignored, and native endianness is treated as
+  little-endian — its output isn't interchangeable with real Lua's.
+- **NaN is `none`.** The value representation is NaN-boxed, so the NaN bit
+  patterns carry the other types; `0/0` yields `none`.
+- **`none` instead of `nil`; `!=` is not-equal; `~=` is xor-assign.**
+- **No `dofile`.** `load` compiles strings; `require` loads files. That's
+  the whole filesystem surface for code.
+
+## Limitations
+
 - `yield` can't cross a `pcall`, metamethod or `table.sort` comparator
-  boundary; it fails with "attempt to yield across a C-call boundary"
-- Floating-point NaN is represented as `none` (the NaN bit patterns are the
-  value encoding), so `0/0` yields `none`
-- Strings are UTF-8, not byte strings: `string.char(200)` produces a two-byte
-  character and `string.sub`/`reverse` slice on bytes but re-validate
+  boundary; it fails with "attempt to yield across a C-call boundary". Lua
+  5.1 had the same restriction; 5.2 lifted it with continuation-passing
+  (`lua_pcallk`), which this VM doesn't implement.
+- The GC is stop-the-world. Large heaps will see pauses; Lua 5.4's
+  generational collector doesn't have this problem.
 - Expressions and blocks nest at most 100 levels; deeper sources are a
-  parse error ("expected fewer nesting levels"), not a crash
+  parse error ("expected fewer nesting levels") rather than a stack overflow.
+
+## Sandboxing
+
+`require`, `io` and `os` do real filesystem and environment access, the same
+as Lua's. To run untrusted code, clear them from the globals before
+executing:
+
+```c
+umbra_pushnil(U); umbra_setglobal(U, "io");
+umbra_pushnil(U); umbra_setglobal(U, "os");
+umbra_pushnil(U); umbra_setglobal(U, "require");
+```
+
+and bound CPU and memory with `umbra_set_step_limit` and
+`umbra_set_max_objects`. Panics inside the VM are caught and surfaced as
+script errors; they don't unwind into the host.
 
 ## License
 
