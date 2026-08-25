@@ -1257,35 +1257,35 @@ impl Vm {
 
                 let instr = unsafe { *proto.code.get_unchecked(frame.pc) };
                 frame.pc += 1;
-                let a  = ia(instr);
-                let b  = ib(instr);
-                let c  = ic(instr);
-                let bx = ibx(instr);
-                let sbx= isbx(instr);
+                let a   = || ia(instr);
+                let b   = || ib(instr);
+                let c   = || ic(instr);
+                let bx  = || ibx(instr);
+                let sbx = || isbx(instr);
 
                 // Op is #[repr(u8)] with contiguous variants 0..=TbcPop and the
                 // compiler only emits valid opcodes, so decode unchecked.
                 debug_assert!(iop(instr) <= Op::TbcPop as u8);
                 match unsafe { std::mem::transmute::<u8, Op>(iop(instr)) } {
-                    Op::LoadNil  => R!(a) = Value::nil(),
+                    Op::LoadNil  => R!(a()) = Value::nil(),
                     Op::LoadBool => {
-                        R!(a) = Value::bool(b != 0);
-                        if c != 0 { frame.pc += 1; }
+                        R!(a()) = Value::bool(b() != 0);
+                        if c() != 0 { frame.pc += 1; }
                     }
-                    Op::LoadInt  => R!(a) = Value::int(sbx as i64),
+                    Op::LoadInt  => R!(a()) = Value::int(sbx() as i64),
                     Op::LoadK    => {
-                        let v = self.resolve_const(proto, bx);
-                        self.regs[base + a] = v;
+                        let v = self.resolve_const(proto, bx());
+                        self.regs[base + a()] = v;
                     }
-                    Op::Move     => R!(a) = R!(b),
+                    Op::Move     => R!(a()) = R!(b()),
 
-                    Op::Add  => arith_op!(a, b, c, |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_add(y)) }, |x: f64, y: f64| x + y, "__add"),
-                    Op::Sub  => arith_op!(a, b, c, |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_sub(y)) }, |x: f64, y: f64| x - y, "__sub"),
-                    Op::Mul  => arith_op!(a, b, c, |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_mul(y)) }, |x: f64, y: f64| x * y, "__mul"),
+                    Op::Add  => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_add(y)) }, |x: f64, y: f64| x + y, "__add"),
+                    Op::Sub  => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_sub(y)) }, |x: f64, y: f64| x - y, "__sub"),
+                    Op::Mul  => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_mul(y)) }, |x: f64, y: f64| x * y, "__mul"),
                     Op::Div  => {
-                        let bv = RK!(b); let cv = RK!(c);
+                        let bv = RK!(b()); let cv = RK!(c());
                         if bv.is_number() && cv.is_number() {
-                            R!(a) = Value::float(bv.to_float().unwrap() / cv.to_float().unwrap());
+                            R!(a()) = Value::float(bv.to_float().unwrap() / cv.to_float().unwrap());
                         } else {
                             let mm = self.get_mm2(bv, cv, "__div");
                             if mm.is_nil() {
@@ -1294,24 +1294,24 @@ impl Vm {
                                     "attempt to perform arithmetic on a {} value", bad.type_name())));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
-                            self.regs[base + a] = res.into_iter().next().unwrap_or(Value::nil());
+                            self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
                             continue 'outer;
                         }
                     }
-                    Op::IDiv => arith_op!(a, b, c,
+                    Op::IDiv => arith_op!(a(), b(), c(),
                         |x: i64, y: i64| -> VmResult<i64> {
                             if y == 0 { Err(VmError::RuntimeError("attempt to perform 'n//0'".into())) } else { Ok(lua_idiv(x, y)) }
                         },
                         |x: f64, y: f64| (x / y).floor(), "__idiv"),
-                    Op::Mod  => arith_op!(a, b, c,
+                    Op::Mod  => arith_op!(a(), b(), c(),
                         |x: i64, y: i64| -> VmResult<i64> {
                             if y == 0 { Err(VmError::RuntimeError("attempt to perform 'n%0'".into())) } else { Ok(lua_mod(x, y)) }
                         },
                         |x: f64, y: f64| x - (x / y).floor() * y, "__mod"),
                     Op::Pow  => {
-                        let bv = RK!(b); let cv = RK!(c);
+                        let bv = RK!(b()); let cv = RK!(c());
                         if bv.is_number() && cv.is_number() {
-                            R!(a) = Value::float(bv.to_float().unwrap().powf(cv.to_float().unwrap()));
+                            R!(a()) = Value::float(bv.to_float().unwrap().powf(cv.to_float().unwrap()));
                         } else {
                             let mm = self.get_mm2(bv, cv, "__pow");
                             if mm.is_nil() {
@@ -1320,17 +1320,17 @@ impl Vm {
                                     "attempt to perform arithmetic on a {} value", bad.type_name())));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
-                            self.regs[base + a] = res.into_iter().next().unwrap_or(Value::nil());
+                            self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
                             continue 'outer;
                         }
                     }
                     Op::Unm => {
-                        let v = R!(b);
+                        let v = R!(b());
                         if v.is_int_like() {
                             let n = self.make_int(v.as_int().unwrap().wrapping_neg());
-                            R!(a) = n;
+                            R!(a()) = n;
                         } else if v.is_float() {
-                            R!(a) = Value::float(-v.as_float().unwrap());
+                            R!(a()) = Value::float(-v.as_float().unwrap());
                         } else {
                             let mm = self.get_mm(v, "__unm");
                             if mm.is_nil() {
@@ -1338,46 +1338,46 @@ impl Vm {
                                     "attempt to perform arithmetic on a {} value", v.type_name())));
                             }
                             let res = self.call_value_isolated(mm, &[v, v])?;
-                            self.regs[base + a] = res.into_iter().next().unwrap_or(Value::nil());
+                            self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
                             continue 'outer;
                         }
                     }
                     Op::BAnd => {
-                        let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
+                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
                         let res = self.make_int(bv & cv);
-                        R!(a) = res;
+                        R!(a()) = res;
                     }
                     Op::BOr  => {
-                        let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
+                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
                         let res = self.make_int(bv | cv);
-                        R!(a) = res;
+                        R!(a()) = res;
                     }
                     Op::BXor => {
-                        let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
+                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
                         let res = self.make_int(bv ^ cv);
-                        R!(a) = res;
+                        R!(a()) = res;
                     }
                     Op::Shl  => {
-                        let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
+                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
                         let res = self.make_int(lua_shl(bv, cv));
-                        R!(a) = res;
+                        R!(a()) = res;
                     }
                     Op::Shr  => {
-                        let bv = int_val(RK!(b))?; let cv = int_val(RK!(c))?;
+                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
                         let res = self.make_int(lua_shl(bv, cv.wrapping_neg()));
-                        R!(a) = res;
+                        R!(a()) = res;
                     }
                     Op::BNot => {
-                        let v = int_val(R!(b))?;
+                        let v = int_val(R!(b()))?;
                         let res = self.make_int(!v);
-                        R!(a) = res;
+                        R!(a()) = res;
                     }
-                    Op::Not  => R!(a) = Value::bool(!R!(b).is_truthy()),
+                    Op::Not  => R!(a()) = Value::bool(!R!(b()).is_truthy()),
                     Op::Len  => {
-                        let v = R!(b);
+                        let v = R!(b());
                         if v.is_string() {
                             let s = unsafe { string_ref(v) };
-                            R!(a) = Value::int(s.len() as i64);
+                            R!(a()) = Value::int(s.len() as i64);
                         } else if v.is_table() {
                             let (len, mt_ptr) = {
                                 let t = unsafe { &*(v.as_table().unwrap() as *const Table) };
@@ -1388,107 +1388,107 @@ impl Vm {
                                 let mm = unsafe { (*mt).raw_get(key) };
                                 if !mm.is_nil() {
                                     let res = self.call_value_isolated(mm, &[v])?;
-                                    self.regs[base + a] = res.into_iter().next().unwrap_or(Value::nil());
+                                    self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
                                     continue 'outer;
                                 }
                             }
-                            self.regs[base + a] = Value::int(len);
+                            self.regs[base + a()] = Value::int(len);
                         } else {
                             return Err(VmError::RuntimeError(format!("attempt to get length of a {} value", v.type_name())));
                         }
                     }
                     Op::Concat => {
-                        let mut vals: Vec<Value> = (b..=c).map(|i| unsafe { *self.regs.get_unchecked(base + i) }).collect();
+                        let mut vals: Vec<Value> = (b()..=c()).map(|i| unsafe { *self.regs.get_unchecked(base + i) }).collect();
                         let mut acc = vals.pop().unwrap_or(Value::nil());
                         for &left in vals.iter().rev() {
                             acc = self.concat_two(left, acc)?;
                         }
-                        self.regs[base + a] = acc;
+                        self.regs[base + a()] = acc;
                         continue 'outer;
                     }
 
                     Op::Eq => {
-                        let bv = RK!(b); let cv = RK!(c);
+                        let bv = RK!(b()); let cv = RK!(c());
                         if bv.raw_bits() == cv.raw_bits() {
-                            if a == 0 { frame.pc += 1; }
+                            if a() == 0 { frame.pc += 1; }
                         } else {
                             let eq = self.values_eq_mm(bv, cv)?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
                             ck!();
-                            if eq != (a != 0) { frame.pc += 1; }
+                            if eq != (a() != 0) { frame.pc += 1; }
                         }
                     }
 
                     Op::Lt => {
-                        let bv = RK!(b); let cv = RK!(c);
+                        let bv = RK!(b()); let cv = RK!(c());
                         // Numbers compare inline (floats can never be NaN here —
                         // Value::float maps NaN to nil); only non-numbers take
                         // the metamethod path, which may swap frames.
                         if bv.is_int() && cv.is_int() {
-                            if (bv.as_int().unwrap() < cv.as_int().unwrap()) != (a != 0) { frame.pc += 1; }
+                            if (bv.as_int().unwrap() < cv.as_int().unwrap()) != (a() != 0) { frame.pc += 1; }
                         } else if bv.is_number() && cv.is_number() {
-                            if value_lt(bv, cv)? != (a != 0) { frame.pc += 1; }
+                            if value_lt(bv, cv)? != (a() != 0) { frame.pc += 1; }
                         } else {
                             let lt = self.value_lt_mm(bv, cv)?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
                             ck!();
-                            if lt != (a != 0) { frame.pc += 1; }
+                            if lt != (a() != 0) { frame.pc += 1; }
                         }
                     }
                     Op::Le => {
-                        let bv = RK!(b); let cv = RK!(c);
+                        let bv = RK!(b()); let cv = RK!(c());
                         if bv.is_int() && cv.is_int() {
-                            if (bv.as_int().unwrap() <= cv.as_int().unwrap()) != (a != 0) { frame.pc += 1; }
+                            if (bv.as_int().unwrap() <= cv.as_int().unwrap()) != (a() != 0) { frame.pc += 1; }
                         } else if bv.is_number() && cv.is_number() {
-                            if value_le(bv, cv)? != (a != 0) { frame.pc += 1; }
+                            if value_le(bv, cv)? != (a() != 0) { frame.pc += 1; }
                         } else {
                             let le = self.value_le_mm(bv, cv)?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
                             ck!();
-                            if le != (a != 0) { frame.pc += 1; }
+                            if le != (a() != 0) { frame.pc += 1; }
                         }
                     }
 
                     Op::Test => {
-                        if R!(a).is_truthy() != (c != 0) { frame.pc += 1; }
+                        if R!(a()).is_truthy() != (c() != 0) { frame.pc += 1; }
                     }
                     Op::TestSet => {
-                        let bv = R!(b);
-                        if bv.is_truthy() == (c != 0) {
-                            R!(a) = bv;
+                        let bv = R!(b());
+                        if bv.is_truthy() == (c() != 0) {
+                            R!(a()) = bv;
                         } else {
                             frame.pc += 1;
                         }
                     }
                     Op::Jmp => {
-                        frame.pc = (frame.pc as i32 + sbx) as usize;
-                        if sbx < 0 { ck!(); }
+                        frame.pc = (frame.pc as i32 + sbx()) as usize;
+                        if sbx() < 0 { ck!(); }
                     }
 
                     Op::NewTable => {
                         let ptr = alloc_table_raw();
                         self.gc.register_table(ptr);
-                        self.regs[base + a] = Value::table(ptr);
+                        self.regs[base + a()] = Value::table(ptr);
                         ck!();
                     }
                     Op::GetTable => {
-                        let tv = R!(b);
-                        let kv = RK!(c);
+                        let tv = R!(b());
+                        let kv = RK!(c());
                         if tv.is_table() {
                             let t = unsafe { &*(tv.as_table().unwrap() as *const Table) };
                             let raw = t.raw_get(kv);
                             if !raw.is_nil() || t.metatable.is_none() {
-                                R!(a) = raw;
+                                R!(a()) = raw;
                                 continue;
                             }
                             let result = self.table_index_chain(tv, kv)?;
-                            self.regs[base + a] = result;
+                            self.regs[base + a()] = result;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
@@ -1501,15 +1501,15 @@ impl Vm {
                             } else {
                                 Value::nil()
                             };
-                            R!(a) = result;
+                            R!(a()) = result;
                             continue;
                         }
                         return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
                     }
                     Op::SetTable => {
-                        let tv = R!(a);
-                        let kv = RK!(b);
-                        let vv = RK!(c);
+                        let tv = R!(a());
+                        let kv = RK!(b());
+                        let vv = RK!(c());
                         if tv.is_table() {
                             let t = unsafe { &*(tv.as_table().unwrap() as *const Table) };
                             if t.metatable.is_none() || !t.raw_get(kv).is_nil() {
@@ -1526,42 +1526,42 @@ impl Vm {
                         return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
                     }
                     Op::SetList => {
-                        let tv = R!(a);
+                        let tv = R!(a());
                         let t = unsafe { table_ref(tv) };
-                        let offset = (c as usize - 1) * 50;
-                        let n = if b == 0 { frame.top.saturating_sub(base + a + 1) } else { b };
+                        let offset = (c() as usize - 1) * 50;
+                        let n = if b() == 0 { frame.top.saturating_sub(base + a() + 1) } else { b() };
                         for i in 1..=n {
-                            let v = R!(a + i);
+                            let v = R!(a() + i);
                             t.raw_set(Value::int((offset + i) as i64), v);
                         }
                     }
 
                     Op::GetGlobal => {
-                        let k = self.resolve_const(proto, bx);
+                        let k = self.resolve_const(proto, bx());
                         if !k.is_string() {
                             return Err(VmError::RuntimeError("invalid global name".into()));
                         }
                         let v = self.globals.raw_get(k);
-                        self.regs[base + a] = v;
+                        self.regs[base + a()] = v;
                     }
                     Op::SetGlobal => {
-                        let k = self.resolve_const(proto, bx);
+                        let k = self.resolve_const(proto, bx());
                         if !k.is_string() {
                             return Err(VmError::RuntimeError("invalid global name".into()));
                         }
-                        let v = self.regs[base + a];
+                        let v = self.regs[base + a()];
                         self.globals.raw_set(k, v);
                     }
 
                     Op::Call => {
-                        let fn_val = R!(a);
-                        let nargs = if b == 0 { frame.top.saturating_sub(base + a + 1) as u8 } else { (b - 1) as u8 };
-                        let nresults = if c == 0 { 255 } else { (c - 1) as u8 };
+                        let fn_val = R!(a());
+                        let nargs = if b() == 0 { frame.top.saturating_sub(base + a() + 1) as u8 } else { (b() - 1) as u8 };
+                        let nresults = if c() == 0 { 255 } else { (c() - 1) as u8 };
 
                         // Proto-callables (script functions/closures) are the
                         // common case; cfn and __call checks come after.
                         if let Some(cp) = get_proto_callable(fn_val) {
-                            self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, base + a + 1, nargs, nresults)?;
+                            self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, base + a() + 1, nargs, nresults)?;
                             // Refresh in place instead of re-entering 'outer;
                             // the checkpoint below covers the GC/budget check.
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
@@ -1570,7 +1570,7 @@ impl Vm {
                             ck!();
                             continue;
                         } else if let Some(cfn) = get_cfn(fn_val) {
-                            let args_base = base + a + 1;
+                            let args_base = base + a() + 1;
                             let args: Vec<Value> = (0..nargs as usize)
                                 .map(|i| self.regs[args_base + i])
                                 .collect();
@@ -1578,19 +1578,19 @@ impl Vm {
                             // `continue 'outer` re-fetches `frame`/`proto` from self.frames;
                             // a CFunction may have swapped frames (e.g. coroutine.resume),
                             // so the old references must not be touched past this point.
-                            self.place_results(base + a, results, nresults);
+                            self.place_results(base + a(), results, nresults);
                             continue 'outer;
                         } else if fn_val.is_table() {
                             let mm = self.get_mm(fn_val, "__call");
                             if mm.is_nil() {
                                 return Err(VmError::RuntimeError("attempt to call a table value".into()));
                             }
-                            let args_base = base + a + 1;
+                            let args_base = base + a() + 1;
                             let mut mm_args = Vec::with_capacity(nargs as usize + 1);
                             mm_args.push(fn_val);
                             for i in 0..nargs as usize { mm_args.push(self.regs[args_base + i]); }
                             let results = self.call_value_isolated(mm, &mm_args)?;
-                            self.place_results(base + a, results, nresults);
+                            self.place_results(base + a(), results, nresults);
                             continue 'outer;
                         } else {
                             return Err(VmError::RuntimeError(format!("attempt to call a {}", fn_val.type_name())));
@@ -1598,19 +1598,19 @@ impl Vm {
                     }
 
                     Op::Return => {
-                        let nv = if b == 0 { frame.top.saturating_sub(base + a) } else { b - 1 };
+                        let nv = if b() == 0 { frame.top.saturating_sub(base + a()) } else { b() - 1 };
                         let expected = frame.expected_results;
                         let base_save = base;
                         self.frames.pop();
                         if self.frames.is_empty() {
                             self.top_level_results =
-                                self.regs[base_save + a..base_save + a + nv].to_vec();
+                                self.regs[base_save + a()..base_save + a() + nv].to_vec();
                             return Ok(());
                         }
                         // The frame was pushed at (call site A) + 1, so results land
                         // back on the calling instruction's A register. Source and
                         // destination overlap (dst < src), so move in place.
-                        self.place_results_from(base_save - 1, base_save + a, nv, expected);
+                        self.place_results_from(base_save - 1, base_save + a(), nv, expected);
                         frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                         proto = unsafe { &*frame.proto };
                         base = frame.base;
@@ -1623,30 +1623,30 @@ impl Vm {
                         // the next candidate index. No init-step subtraction:
                         // an i64 wrap there (e.g. init=mininteger, step=1)
                         // would corrupt the first iteration.
-                        to_number(R!(a), "initial value")?;
-                        to_number(R!(a + 1), "limit")?;
-                        let step = to_number(R!(a + 2), "step")?;
+                        to_number(R!(a()), "initial value")?;
+                        to_number(R!(a() + 1), "limit")?;
+                        let step = to_number(R!(a() + 2), "step")?;
                         if matches!(step, Num::Int(0)) || matches!(step, Num::Float(f) if f == 0.0) {
                             return Err(VmError::RuntimeError("'for' step is zero".into()));
                         }
-                        frame.pc = (frame.pc as i32 + sbx) as usize;
+                        frame.pc = (frame.pc as i32 + sbx()) as usize;
                     }
                     Op::ForLoop => {
-                        let idx  = to_number(R!(a), "initial value")?;
-                        let lim  = to_number(R!(a + 1), "limit")?;
-                        let step = to_number(R!(a + 2), "step")?;
+                        let idx  = to_number(R!(a()), "initial value")?;
+                        let lim  = to_number(R!(a() + 1), "limit")?;
+                        let step = to_number(R!(a() + 2), "step")?;
                         let in_range = if num_is_positive(step) {
                             num_le(idx, lim)
                         } else {
                             num_le(lim, idx)
                         };
                         if in_range {
-                            R!(a + 3) = R!(a);
+                            R!(a() + 3) = R!(a());
                             // Advance the candidate for the next check. Integer
                             // overflow must terminate the loop (Lua semantics),
                             // not wrap the counter back to the other end.
-                            R!(a) = num_add(idx, step);
-                            frame.pc = (frame.pc as i32 + sbx) as usize;
+                            R!(a()) = num_add(idx, step);
+                            frame.pc = (frame.pc as i32 + sbx()) as usize;
                             ck!();
                         }
                     }
@@ -1655,18 +1655,18 @@ impl Vm {
                     // +4.. loop vars; a script iterator's frame is pushed at a+5
                     // so its Return lands the results on a+4 like the cfn path.
                     Op::TForCall => {
-                        let fn_val = R!(a);
-                        let state  = R!(a + 1);
-                        let ctrl   = R!(a + 2);
-                        let nresults = c as u8;
+                        let fn_val = R!(a());
+                        let state  = R!(a() + 1);
+                        let ctrl   = R!(a() + 2);
+                        let nresults = c() as u8;
                         if let Some(cfn) = get_cfn(fn_val) {
                             let results = cfn(&[state, ctrl])?;
-                            self.place_results(base + a + 4, results, nresults);
+                            self.place_results(base + a() + 4, results, nresults);
                             continue 'outer;
                         } else {
                             let cp = get_proto_callable(fn_val)
                                 .ok_or_else(|| VmError::RuntimeError("attempt to call non-function in for-in".into()))?;
-                            let new_base = base + a + 5;
+                            let new_base = base + a() + 5;
                             let needed = new_base + unsafe { &*cp.proto }.max_regs as usize + 8;
                             if needed > self.regs.len() { self.regs.resize(needed, Value::nil()); }
                             self.regs[new_base] = state;
@@ -1680,15 +1680,15 @@ impl Vm {
                         }
                     }
                     Op::TForLoop => {
-                        if !R!(a + 4).is_nil() {
-                            R!(a + 2) = R!(a + 4);
-                            frame.pc = (frame.pc as i32 + sbx) as usize;
+                        if !R!(a() + 4).is_nil() {
+                            R!(a() + 2) = R!(a() + 4);
+                            frame.pc = (frame.pc as i32 + sbx()) as usize;
                             ck!();
                         }
                     }
 
                     Op::Closure => {
-                        let inner_proto = unsafe { proto.protos.get_unchecked(bx) };
+                        let inner_proto = unsafe { proto.protos.get_unchecked(bx()) };
                         let closure_val = if inner_proto.upvals.is_empty() {
                             Value::userdata(inner_proto as *const Proto as *mut u8)
                         } else {
@@ -1709,33 +1709,33 @@ impl Vm {
                             self.gc.register_closure(ptr);
                             Value::closure(ptr)
                         };
-                        self.regs[base + a] = closure_val;
+                        self.regs[base + a()] = closure_val;
                         ck!();
                     }
                     Op::GetUpval => {
-                        let v = if b < frame.upvals_len {
-                            unsafe { *frame.upvals_ptr.add(b) }
+                        let v = if b() < frame.upvals_len {
+                            unsafe { *frame.upvals_ptr.add(b()) }
                         } else {
                             Value::nil()
                         };
-                        R!(a) = v;
+                        R!(a()) = v;
                     }
                     Op::SetUpval => {
-                        if b < frame.upvals_len {
-                            unsafe { *frame.upvals_ptr.add(b) = R!(a); }
+                        if b() < frame.upvals_len {
+                            unsafe { *frame.upvals_ptr.add(b()) = R!(a()); }
                         }
                     }
 
                     Op::Vararg => {
-                        let n = if b == 0 { frame.varargs.len() } else { b - 1 };
-                        if base + a + n > self.regs.len() { self.regs.resize(base + a + n + 64, Value::nil()); }
+                        let n = if b() == 0 { frame.varargs.len() } else { b() - 1 };
+                        if base + a() + n > self.regs.len() { self.regs.resize(base + a() + n + 64, Value::nil()); }
                         for i in 0..n {
-                            R!(a + i) = frame.varargs.get(i).copied().unwrap_or(Value::nil());
+                            R!(a() + i) = frame.varargs.get(i).copied().unwrap_or(Value::nil());
                         }
-                        if b == 0 { frame.top = base + a + n; }
+                        if b() == 0 { frame.top = base + a() + n; }
                     }
 
-                    Op::Tbc    => self.tbc.push((base + a, b != 0)),
+                    Op::Tbc    => self.tbc.push((base + a(), b() != 0)),
                     Op::TbcPop => { self.tbc.pop(); }
                 }
             }
