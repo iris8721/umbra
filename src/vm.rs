@@ -1211,6 +1211,16 @@ impl Vm {
                     else { unsafe { *self.regs.get_unchecked(base + $x) } }
                 }
             }
+            // GC/budget checkpoint. Only needed where a loop can spin
+            // (backward jumps, calls, returns) or a GC object was just
+            // created — checking every instruction was pure dispatch cost.
+            macro_rules! ck {
+                () => {
+                    if self.gc.should_collect() || (self.step_limit != 0 && self.step_count > self.step_limit) {
+                        continue 'outer;
+                    }
+                }
+            }
             macro_rules! arith_op {
                 ($dst:expr, $b:expr, $c:expr, $int_op:expr, $float_op:expr, $mm_name:expr) => {{
                     let bv = RK!($b);
@@ -1243,9 +1253,7 @@ impl Vm {
                 // budget-error handling happens back at 'outer's top, where it's
                 // safe to mutate self.frames (frame/proto aren't held past this point).
                 self.step_count += 1;
-                if self.gc.should_collect() || (self.step_limit != 0 && self.step_count > self.step_limit) {
-                    continue 'outer;
-                }
+
 
                 let instr = unsafe { *proto.code.get_unchecked(frame.pc) };
                 frame.pc += 1;
@@ -1405,6 +1413,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            ck!();
                             if eq != (a != 0) { frame.pc += 1; }
                         }
                     }
@@ -1423,6 +1432,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            ck!();
                             if lt != (a != 0) { frame.pc += 1; }
                         }
                     }
@@ -1437,6 +1447,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            ck!();
                             if le != (a != 0) { frame.pc += 1; }
                         }
                     }
@@ -1454,12 +1465,14 @@ impl Vm {
                     }
                     Op::Jmp => {
                         frame.pc = (frame.pc as i32 + sbx) as usize;
+                        if sbx < 0 { ck!(); }
                     }
 
                     Op::NewTable => {
                         let ptr = alloc_table_raw();
                         self.gc.register_table(ptr);
                         self.regs[base + a] = Value::table(ptr);
+                        ck!();
                     }
                     Op::GetTable => {
                         let tv = R!(b);
@@ -1476,6 +1489,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            ck!();
                             continue;
                         }
                         if tv.is_string() {
@@ -1503,6 +1517,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            ck!();
                             continue;
                         }
                         return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
@@ -1544,12 +1559,12 @@ impl Vm {
                         // common case; cfn and __call checks come after.
                         if let Some(cp) = get_proto_callable(fn_val) {
                             self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, base + a + 1, nargs, nresults)?;
-                            // Refresh in place instead of re-entering 'outer:
-                            // the GC/budget checks there also run at the top of
-                            // the inner loop, so nothing is skipped.
+                            // Refresh in place instead of re-entering 'outer;
+                            // the checkpoint below covers the GC/budget check.
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            ck!();
                             continue;
                         } else if let Some(cfn) = get_cfn(fn_val) {
                             let args_base = base + a + 1;
@@ -1596,6 +1611,7 @@ impl Vm {
                         frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                         proto = unsafe { &*frame.proto };
                         base = frame.base;
+                        ck!();
                         continue;
                     }
 
@@ -1628,6 +1644,7 @@ impl Vm {
                             // not wrap the counter back to the other end.
                             R!(a) = num_add(idx, step);
                             frame.pc = (frame.pc as i32 + sbx) as usize;
+                            ck!();
                         }
                     }
 
@@ -1655,6 +1672,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            ck!();
                             continue;
                         }
                     }
@@ -1662,6 +1680,7 @@ impl Vm {
                         if !R!(a + 4).is_nil() {
                             R!(a + 2) = R!(a + 4);
                             frame.pc = (frame.pc as i32 + sbx) as usize;
+                            ck!();
                         }
                     }
 
@@ -1688,6 +1707,7 @@ impl Vm {
                             Value::closure(ptr)
                         };
                         self.regs[base + a] = closure_val;
+                        ck!();
                     }
                     Op::GetUpval => {
                         let v = if b < frame.upvals_len {
