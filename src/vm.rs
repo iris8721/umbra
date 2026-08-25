@@ -1263,7 +1263,10 @@ impl Vm {
                 let bx = ibx(instr);
                 let sbx= isbx(instr);
 
-                match Op::from_u8(iop(instr)).ok_or_else(|| VmError::RuntimeError("illegal opcode".into()))? {
+                // Op is #[repr(u8)] with contiguous variants 0..=TbcPop and the
+                // compiler only emits valid opcodes, so decode unchecked.
+                debug_assert!(iop(instr) <= Op::TbcPop as u8);
+                match unsafe { std::mem::transmute::<u8, Op>(iop(instr)) } {
                     Op::LoadNil  => R!(a) = Value::nil(),
                     Op::LoadBool => {
                         R!(a) = Value::bool(b != 0);
