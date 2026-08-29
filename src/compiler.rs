@@ -487,6 +487,45 @@ impl FnComp {
         Ok(())
     }
 
+    // Emits the branch for a condition, returning the jump to patch to the
+    // "condition false" target. Comparisons emit Cmp;Jmp directly — the VM
+    // fuses the pair — instead of materializing a boolean and testing it.
+    fn emit_cond_test(&mut self, cond: &Expr) -> CResult<usize> {
+        if let Expr::Binop { op, lhs, rhs, line } = cond {
+            let cmp = match op {
+                Binop::Eq => Some((Op::Eq, false, false)),
+                Binop::Ne => Some((Op::Eq, true,  false)),
+                Binop::Lt => Some((Op::Lt, false, false)),
+                Binop::Le => Some((Op::Le, false, false)),
+                Binop::Gt => Some((Op::Lt, false, true)),
+                Binop::Ge => Some((Op::Le, false, true)),
+                _ => None,
+            };
+            if let Some((vm_op, invert, swap)) = cmp {
+                self.line = *line;
+                let temp_base = self.free_reg;
+                let (l, r) = if swap { (rhs, lhs) } else { (lhs, rhs) };
+                let le = self.compile_expr(l)?;
+                let lrk = self.to_rk(le)?;
+                let re = self.compile_expr(r)?;
+                let rrk = self.to_rk(re)?;
+                self.free_reg = temp_base;
+                // The VM jumps when the raw comparison equals A; jumping on
+                // false means A = invert.
+                self.emit(enc_abc(vm_op, invert as u8, lrk as u8, rrk as u8));
+                return Ok(self.proto.emit_jump(*line));
+            }
+        }
+        let base = self.free_reg;
+        let e = self.compile_expr(cond)?;
+        let r = self.to_reg(e, Some(base))?;
+        if self.free_reg <= r { self.free_reg = r + 1; }
+        self.emit(enc_abc(Op::Test, r as u8, 0, 0));
+        let j = self.proto.emit_jump(self.line);
+        self.free_reg_to(base);
+        Ok(j)
+    }
+
     fn check_vararg(&self, line: u32) -> CResult<()> {
         if self.is_vararg {
             Ok(())
@@ -813,13 +852,8 @@ impl FnComp {
             Stmt::While { cond, body, line } => {
                 self.line = *line;
                 let loop_top = self.pc();
-                let cond_reg = self.free_reg;
-                let e = self.compile_expr(cond)?;
-                let r = self.to_reg(e, Some(cond_reg))?;
-                if self.free_reg <= r { self.free_reg = r + 1; }
-                self.emit(enc_abc(Op::Test, r as u8, 0, 0));
-                let exit_jump = self.proto.emit_jump(*line);
-                self.free_reg_to(cond_reg);
+                let exit_jump = self.emit_cond_test(cond)?;
+
 
                 self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
                 self.compile_block(body)?;
@@ -855,12 +889,8 @@ impl FnComp {
                 // cond is compiled before popping the body's locals — Lua's repeat-until
                 // scoping rule lets `until` see locals the body just declared.
                 let cond_pos = self.pc();
-                let cond_reg = self.free_reg;
-                let e = self.compile_expr(cond)?;
-                let r = self.to_reg(e, Some(cond_reg))?;
-                if self.free_reg <= r { self.free_reg = r + 1; }
-                self.emit(enc_abc(Op::Test, r as u8, 0, 0));
-                self.emit_back(Op::Jmp, 0, loop_top)?;
+                let back = self.emit_cond_test(cond)?;
+                self.patch(back, loop_top)?;
 
                 self.emit_closes(locals_top)?;
                 self.pop_locals_to(locals_top);
@@ -878,14 +908,7 @@ impl FnComp {
                 let mut exit_jumps = Vec::new();
 
                 let test = |fc: &mut Self, cond: &Expr| -> CResult<usize> {
-                    let base = fc.free_reg;
-                    let e = fc.compile_expr(cond)?;
-                    let r = fc.to_reg(e, Some(base))?;
-                    if fc.free_reg <= r { fc.free_reg = r + 1; }
-                    fc.emit(enc_abc(Op::Test, r as u8, 0, 0));
-                    let j = fc.proto.emit_jump(fc.line);
-                    fc.free_reg_to(base);
-                    Ok(j)
+                    fc.emit_cond_test(cond)
                 };
 
                 let fail = test(self, cond)?;
@@ -1364,12 +1387,7 @@ impl FnComp {
             Expr::Ternary { cond, then, else_, line } => {
                 self.line = *line;
                 let base = self.free_reg;
-                let ce = self.compile_expr(cond)?;
-                let cr = self.to_reg(ce, Some(base))?;
-                if self.free_reg <= cr { self.free_reg = cr + 1; }
-                self.emit(enc_abc(Op::Test, cr, 0, 0));
-                let else_jump = self.proto.emit_jump(*line);
-                self.free_reg_to(base);
+                let else_jump = self.emit_cond_test(cond)?;
 
                 let dst = base;
                 let te = self.compile_expr(then)?;
