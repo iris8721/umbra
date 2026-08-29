@@ -1245,6 +1245,22 @@ impl Vm {
                     }
                 }}
             }
+            // The compiler always emits a Jmp right after a conditional op;
+            // consume it inline so a compare+branch costs one dispatch.
+            // The consumed Jmp still counts as a step, and a backward target
+            // is a loop edge, so it checkpoints like a real Jmp.
+            macro_rules! fused_jmp {
+                ($taken:expr) => {{
+                    let j = unsafe { *proto.code.get_unchecked(frame.pc) };
+                    debug_assert!(iop(j) == Op::Jmp as u8);
+                    frame.pc += 1;
+                    self.step_count += 1;
+                    if $taken {
+                        frame.pc = (frame.pc as i32 + isbx(j)) as usize;
+                        if isbx(j) < 0 { ck!(); }
+                    }
+                }}
+            }
 
             loop {
                 if frame.pc >= proto.code.len() { break; }
@@ -1409,16 +1425,17 @@ impl Vm {
 
                     Op::Eq => {
                         let bv = RK!(b()); let cv = RK!(c());
-                        if bv.raw_bits() == cv.raw_bits() {
-                            if a() == 0 { frame.pc += 1; }
+                        let eq = if bv.raw_bits() == cv.raw_bits() {
+                            true
                         } else {
                             let eq = self.values_eq_mm(bv, cv)?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
                             ck!();
-                            if eq != (a() != 0) { frame.pc += 1; }
-                        }
+                            eq
+                        };
+                        fused_jmp!(eq == (a() != 0));
                     }
 
                     Op::Lt => {
@@ -1426,45 +1443,45 @@ impl Vm {
                         // Numbers compare inline (floats can never be NaN here —
                         // Value::float maps NaN to nil); only non-numbers take
                         // the metamethod path, which may swap frames.
-                        if bv.is_int() && cv.is_int() {
-                            if (bv.as_int().unwrap() < cv.as_int().unwrap()) != (a() != 0) { frame.pc += 1; }
+                        let lt = if bv.is_int() && cv.is_int() {
+                            bv.as_int().unwrap() < cv.as_int().unwrap()
                         } else if bv.is_number() && cv.is_number() {
-                            if value_lt(bv, cv)? != (a() != 0) { frame.pc += 1; }
+                            value_lt(bv, cv)?
                         } else {
                             let lt = self.value_lt_mm(bv, cv)?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
                             ck!();
-                            if lt != (a() != 0) { frame.pc += 1; }
-                        }
+                            lt
+                        };
+                        fused_jmp!(lt == (a() != 0));
                     }
                     Op::Le => {
                         let bv = RK!(b()); let cv = RK!(c());
-                        if bv.is_int() && cv.is_int() {
-                            if (bv.as_int().unwrap() <= cv.as_int().unwrap()) != (a() != 0) { frame.pc += 1; }
+                        let le = if bv.is_int() && cv.is_int() {
+                            bv.as_int().unwrap() <= cv.as_int().unwrap()
                         } else if bv.is_number() && cv.is_number() {
-                            if value_le(bv, cv)? != (a() != 0) { frame.pc += 1; }
+                            value_le(bv, cv)?
                         } else {
                             let le = self.value_le_mm(bv, cv)?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
                             ck!();
-                            if le != (a() != 0) { frame.pc += 1; }
-                        }
+                            le
+                        };
+                        fused_jmp!(le == (a() != 0));
                     }
 
                     Op::Test => {
-                        if R!(a()).is_truthy() != (c() != 0) { frame.pc += 1; }
+                        fused_jmp!(R!(a()).is_truthy() == (c() != 0));
                     }
                     Op::TestSet => {
                         let bv = R!(b());
-                        if bv.is_truthy() == (c() != 0) {
-                            R!(a()) = bv;
-                        } else {
-                            frame.pc += 1;
-                        }
+                        let taken = bv.is_truthy() == (c() != 0);
+                        if taken { R!(a()) = bv; }
+                        fused_jmp!(taken);
                     }
                     Op::Jmp => {
                         frame.pc = (frame.pc as i32 + sbx()) as usize;
