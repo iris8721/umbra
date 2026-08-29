@@ -1197,18 +1197,21 @@ impl Vm {
             let mut frame = unsafe { &mut *frame };
             let mut proto = unsafe { &*frame.proto };
             let mut base = frame.base;
+            // Cached regs base pointer: self.regs only moves on resize, and
+            // every path that can resize refreshes this before continuing.
+            let mut regs = self.regs.as_mut_ptr();
 
             // Register and constant indices come from the compiler's own
             // bytecode (register allocation is bounded by max_regs, which
             // push_frame sizes the window for), so indexing is unchecked —
             // the bounds checks were a measurable slice of dispatch cost.
             macro_rules! R {
-                ($r:expr) => { *unsafe { self.regs.get_unchecked_mut(base + $r) } }
+                ($r:expr) => { *unsafe { &mut *regs.add(base + $r) } }
             }
             macro_rules! RK {
                 ($x:expr) => {
                     if is_rk($x) { self.resolve_const(proto, rk_idx($x)) }
-                    else { unsafe { *self.regs.get_unchecked(base + $x) } }
+                    else { unsafe { *regs.add(base + $x) } }
                 }
             }
             // GC/budget checkpoint. Only needed where a loop can spin
@@ -1291,7 +1294,7 @@ impl Vm {
                     Op::LoadInt  => R!(a()) = Value::int(sbx() as i64),
                     Op::LoadK    => {
                         let v = self.resolve_const(proto, bx());
-                        self.regs[base + a()] = v;
+                        unsafe { *regs.add(base + a()) = v; }
                     }
                     Op::Move     => R!(a()) = R!(b()),
 
@@ -1408,13 +1411,13 @@ impl Vm {
                                     continue 'outer;
                                 }
                             }
-                            self.regs[base + a()] = Value::int(len);
+                            unsafe { *regs.add(base + a()) = Value::int(len); }
                         } else {
                             return Err(VmError::RuntimeError(format!("attempt to get length of a {} value", v.type_name())));
                         }
                     }
                     Op::Concat => {
-                        let mut vals: Vec<Value> = (b()..=c()).map(|i| unsafe { *self.regs.get_unchecked(base + i) }).collect();
+                        let mut vals: Vec<Value> = (b()..=c()).map(|i| unsafe { *regs.add(base + i) }).collect();
                         let mut acc = vals.pop().unwrap_or(Value::nil());
                         for &left in vals.iter().rev() {
                             acc = self.concat_two(left, acc)?;
@@ -1432,6 +1435,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            regs = self.regs.as_mut_ptr();
                             ck!();
                             eq
                         };
@@ -1452,6 +1456,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            regs = self.regs.as_mut_ptr();
                             ck!();
                             lt
                         };
@@ -1468,6 +1473,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            regs = self.regs.as_mut_ptr();
                             ck!();
                             le
                         };
@@ -1491,7 +1497,7 @@ impl Vm {
                     Op::NewTable => {
                         let ptr = alloc_table_raw();
                         self.gc.register_table(ptr);
-                        self.regs[base + a()] = Value::table(ptr);
+                        unsafe { *regs.add(base + a()) = Value::table(ptr); }
                         ck!();
                     }
                     Op::GetTable => {
@@ -1509,6 +1515,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            regs = self.regs.as_mut_ptr();
                             ck!();
                             continue;
                         }
@@ -1537,6 +1544,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            regs = self.regs.as_mut_ptr();
                             ck!();
                             continue;
                         }
@@ -1559,14 +1567,14 @@ impl Vm {
                             return Err(VmError::RuntimeError("invalid global name".into()));
                         }
                         let v = self.globals.raw_get(k);
-                        self.regs[base + a()] = v;
+                        unsafe { *regs.add(base + a()) = v; }
                     }
                     Op::SetGlobal => {
                         let k = self.resolve_const(proto, bx());
                         if !k.is_string() {
                             return Err(VmError::RuntimeError("invalid global name".into()));
                         }
-                        let v = self.regs[base + a()];
+                        let v = unsafe { *regs.add(base + a()) };
                         self.globals.raw_set(k, v);
                     }
 
@@ -1584,12 +1592,13 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            regs = self.regs.as_mut_ptr();
                             ck!();
                             continue;
                         } else if let Some(cfn) = get_cfn(fn_val) {
                             let args_base = base + a() + 1;
                             let args: Vec<Value> = (0..nargs as usize)
-                                .map(|i| self.regs[args_base + i])
+                                .map(|i| unsafe { *regs.add(args_base + i) })
                                 .collect();
                             let results = cfn(&args)?;
                             // `continue 'outer` re-fetches `frame`/`proto` from self.frames;
@@ -1605,7 +1614,7 @@ impl Vm {
                             let args_base = base + a() + 1;
                             let mut mm_args = Vec::with_capacity(nargs as usize + 1);
                             mm_args.push(fn_val);
-                            for i in 0..nargs as usize { mm_args.push(self.regs[args_base + i]); }
+                            for i in 0..nargs as usize { mm_args.push(unsafe { *regs.add(args_base + i) }); }
                             let results = self.call_value_isolated(mm, &mm_args)?;
                             self.place_results(base + a(), results, nresults);
                             continue 'outer;
@@ -1631,6 +1640,7 @@ impl Vm {
                         frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                         proto = unsafe { &*frame.proto };
                         base = frame.base;
+                        regs = self.regs.as_mut_ptr();
                         ck!();
                         continue;
                     }
@@ -1692,6 +1702,7 @@ impl Vm {
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
+                            regs = self.regs.as_mut_ptr();
                             ck!();
                             continue;
                         }
@@ -1711,7 +1722,7 @@ impl Vm {
                         } else {
                             let upvals: Vec<Value> = inner_proto.upvals.iter().map(|desc| {
                                 if desc.in_stack {
-                                    unsafe { *self.regs.get_unchecked(base + desc.idx as usize) }
+                                    unsafe { *regs.add(base + desc.idx as usize) }
                                 } else if (desc.idx as usize) < frame.upvals_len {
                                     unsafe { *frame.upvals_ptr.add(desc.idx as usize) }
                                 } else {
@@ -1726,7 +1737,7 @@ impl Vm {
                             self.gc.register_closure(ptr);
                             Value::closure(ptr)
                         };
-                        self.regs[base + a()] = closure_val;
+                        unsafe { *regs.add(base + a()) = closure_val; }
                         ck!();
                     }
                     Op::GetUpval => {
@@ -1745,7 +1756,7 @@ impl Vm {
 
                     Op::Vararg => {
                         let n = if b() == 0 { frame.varargs.len() } else { b() - 1 };
-                        if base + a() + n > self.regs.len() { self.regs.resize(base + a() + n + 64, Value::nil()); }
+                        if base + a() + n > self.regs.len() { self.regs.resize(base + a() + n + 64, Value::nil()); regs = self.regs.as_mut_ptr(); }
                         for i in 0..n {
                             R!(a() + i) = frame.varargs.get(i).copied().unwrap_or(Value::nil());
                         }
