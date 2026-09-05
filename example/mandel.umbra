@@ -1,0 +1,26 @@
+@ Mandelbrot set rendered as 200x200 ASCII art.
+@ Float arithmetic in a tight nested loop; '#' marks points that
+@ never escape within 50 iterations.
+let W = 200
+let H = 200
+let max_iter = 50
+let lines = {}
+for y = 0, H - 1 {
+    let row = {}
+    let ci = (y - H / 2) * 2.0 / H
+    for x = 0, W - 1 {
+        let cr = (x - W / 2) * 3.0 / W - 0.5
+        var zr = 0.0
+        var zi = 0.0
+        var i = 0
+        while i < max_iter and zr * zr + zi * zi <= 4.0 {
+            let t = zr * zr - zi * zi + cr
+            zi = 2.0 * zr * zi + ci
+            zr = t
+            i++
+        }
+        row[x + 1] = (i == max_iter) ? "#" : " "
+    }
+    lines[y + 1] = table.concat(row)
+}
+print(table.concat(lines, "\n"))

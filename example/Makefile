@@ -1,6 +1,4 @@
-LIB_DIR = ../target/release
-
-.PHONY: all run run-word-count run-scheduler run-bank-account clean
+.PHONY: all run run-word-count run-scheduler run-bank-account run-nqueens run-dijkstra run-json run-mandel clean
 
 all: host
 
@@ -17,6 +15,18 @@ run-scheduler: host
 
 run-bank-account: host
 	./host bank_account.umbra
+
+run-nqueens: host
+	./host nqueens.umbra
+
+run-dijkstra: host
+	./host dijkstra.umbra
+
+run-json: host
+	./host json.umbra
+
+run-mandel: host
+	./host mandel.umbra
 
 clean:
 	rm -f host host.exe

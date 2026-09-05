@@ -1,0 +1,158 @@
+@ JSON-ish serializer + recursive-descent parser roundtrip.
+@ Exercises string building, pattern matching, recursion, and a
+@ __tostring metamethod that renders a wrapped table as JSON.
+@ (umbra's type() splits Lua's "number" into "integer"/"float")
+fn is_number(v) {
+    let t = type(v)
+    return t == "integer" or t == "float"
+}
+
+fn is_array(t) {
+    let n = #t
+    var c = 0
+    for k, _ in pairs(t) {
+        if not is_number(k) { return false }
+        c++
+    }
+    return c == n
+}
+
+let escapes = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\t'] = '\\t' }
+fn encode_str(s) {
+    return '"' .. string.gsub(s, '["\\\n\t]', escapes) .. '"'
+}
+
+var encode = none
+fn encode_table(t) {
+    let parts = {}
+    if is_array(t) {
+        for i = 1, #t { parts[i] = encode(t[i]) }
+        return "[" .. table.concat(parts, ",") .. "]"
+    }
+    let keys = {}
+    for k, _ in pairs(t) { keys[#keys + 1] = k }
+    table.sort(keys)
+    for i = 1, #keys {
+        let k = keys[i]
+        parts[i] = encode_str(k) .. ":" .. encode(t[k])
+    }
+    return "{" .. table.concat(parts, ",") .. "}"
+}
+
+encode = fn(v) {
+    let ty = type(v)
+    if ty == "string" { return encode_str(v) }
+    if is_number(v) {
+        if v == math.floor(v) and math.abs(v) < 9007199254740992 {
+            return string.format("%d", v)
+        }
+        return string.format("%.14g", v)
+    }
+    if ty == "boolean" { return tostring(v) }
+    if ty == "table" { return encode_table(v) }
+    return "null"
+}
+
+fn decode(s) {
+    var pos = 1
+    fn skip() {
+        while pos <= #s {
+            let c = string.sub(s, pos, pos)
+            if c == " " or c == "\t" or c == "\n" { pos++ } else { break }
+        }
+    }
+    var parse_value = none
+    fn parse_string() {
+        pos++ @ skip quote
+        let out = {}
+        while true {
+            let c = string.sub(s, pos, pos)
+            if c == '"' { pos++; break }
+            if c == "\\" {
+                let e = string.sub(s, pos + 1, pos + 1)
+                let mapped = ({ n = "\n", t = "\t", ['"'] = '"', ["\\"] = "\\" })[e]
+                out[#out + 1] = mapped or e
+                pos += 2
+            } else {
+                out[#out + 1] = c
+                pos++
+            }
+        }
+        return table.concat(out)
+    }
+    fn parse_number() {
+        let start = pos
+        while pos <= #s and string.match(string.sub(s, pos, pos), "[%d%.%+%-eE]") {
+            pos++
+        }
+        return tonumber(string.sub(s, start, pos - 1))
+    }
+    fn parse_array() {
+        pos++
+        let arr = {}
+        skip()
+        if string.sub(s, pos, pos) == "]" { pos++; return arr }
+        while true {
+            arr[#arr + 1] = parse_value()
+            skip()
+            let c = string.sub(s, pos, pos)
+            pos++
+            if c == "]" { break }
+        }
+        return arr
+    }
+    fn parse_object() {
+        pos++
+        let obj = {}
+        skip()
+        if string.sub(s, pos, pos) == "}" { pos++; return obj }
+        while true {
+            skip()
+            let k = parse_string()
+            skip()
+            pos++ @ ':'
+            obj[k] = parse_value()
+            skip()
+            let c = string.sub(s, pos, pos)
+            pos++
+            if c == "}" { break }
+        }
+        return obj
+    }
+    parse_value = fn() {
+        skip()
+        let c = string.sub(s, pos, pos)
+        if c == '"' { return parse_string() }
+        if c == "[" { return parse_array() }
+        if c == "{" { return parse_object() }
+        if c == "t" { pos += 4; return true }
+        if c == "f" { pos += 5; return false }
+        if c == "n" { pos += 4; return none }
+        return parse_number()
+    }
+    return parse_value()
+}
+
+@ a metatable __tostring wrapper so tables print via encode()
+let Json = {}
+Json.__index = Json
+Json.__tostring = fn(self) { return encode(self.data) }
+fn wrap(data) { return setmetatable({ data = data }, Json) }
+
+let doc = wrap({
+    name = "umbra\tprobe",
+    tags = { "vm", "gc", "jit-less" },
+    nested = { a = { 1, 2, 3 }, b = { x = true, y = false } },
+    pi = 3.14159265358979,
+    count = 42,
+    empty = {},
+})
+
+let text = tostring(doc)
+print("encoded: ${text}")
+let back = decode(text)
+print("reencoded: ${encode(back)}")
+print("name: ${back.name}")
+print("pi: ${string.format("%.14g", back.pi)}")
+print("tags[2]: ${back.tags[2]}")
+print("nested.b.x: ${tostring(back.nested.b.x)}")

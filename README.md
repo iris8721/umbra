@@ -120,6 +120,12 @@ Runnable `.umbra` programs in `example/`:
 - `scheduler.umbra` — a cooperative round-robin task scheduler on coroutines
 - `word_count.umbra` — `io.open` with `<close>`, `string.gmatch` patterns,
   `table.sort`
+- `nqueens.umbra` — recursive backtracking over a shared table
+- `dijkstra.umbra` — shortest paths on a seeded graph with a hand-rolled
+  binary-heap priority queue
+- `json.umbra` — serializer + recursive-descent parser roundtrip; patterns,
+  `__tostring`
+- `mandel.umbra` — 200x200 ASCII Mandelbrot; float arithmetic in nested loops
 
 ## Tests
 

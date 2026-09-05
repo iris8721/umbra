@@ -1,0 +1,38 @@
+@ N-queens, n=8: count solutions and print the first one found.
+@ Recursive backtracking over a shared placement table.
+let n = 8
+var count = 0
+var first = none
+let place = {} @ place[row] = column of the queen in that row
+
+fn solve(k) {
+    if k > n {
+        count++
+        if first == none {
+            first = {}
+            for r = 1, n { first[r] = place[r] }
+        }
+        return
+    }
+    for c = 1, n {
+        var ok = true
+        for r = 1, k - 1 {
+            let pc = place[r]
+            if pc == c or pc - c == r - k or c - pc == r - k {
+                ok = false
+                break
+            }
+        }
+        if ok {
+            place[k] = c
+            solve(k + 1)
+            place[k] = none
+        }
+    }
+}
+
+solve(1)
+print("solutions: ${count}")
+let parts = {}
+for r = 1, n { parts[r] = tostring(first[r]) }
+print("first: ${table.concat(parts, " ")}")
