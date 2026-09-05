@@ -173,9 +173,9 @@ impl std::hash::BuildHasher for FxBuild {
 
 pub type FxMap<K, V> = HashMap<K, V, FxBuild>;
 
-fn fx_str_hash(s: &str) -> u64 {
+fn fx_str_hash_bytes(b: &[u8]) -> u64 {
     let mut h = FxHasher::default();
-    std::hash::Hasher::write(&mut h, s.as_bytes());
+    std::hash::Hasher::write(&mut h, b);
     std::hash::Hasher::finish(&h)
 }
 
@@ -198,10 +198,27 @@ impl RtString {
 }
 
 fn alloc_string_raw(s: &str) -> *mut u8 {
-    let mut bytes = Vec::with_capacity(s.len() + 1);
-    bytes.extend_from_slice(s.as_bytes());
-    bytes.push(0);
-    let rt = RtString { len: s.len(), hash: fx_str_hash(s), bytes: bytes.into_boxed_slice() };
+    alloc_string_bytes(s.as_bytes())
+}
+
+// Builds an RtString from bytes the caller already owns (or can write
+// directly), avoiding the extra copy alloc_string_raw would make. The
+// caller guarantees the bytes are valid UTF-8; a trailing NUL is appended.
+fn alloc_string_bytes(bytes: &[u8]) -> *mut u8 {
+    let mut buf = Vec::with_capacity(bytes.len() + 1);
+    buf.extend_from_slice(bytes);
+    buf.push(0);
+    let rt = RtString { len: bytes.len(), hash: fx_str_hash_bytes(bytes), bytes: buf.into_boxed_slice() };
+    Box::into_raw(Box::new(rt)) as *mut u8
+}
+
+// Same as alloc_string_bytes but takes ownership of a buffer that already
+// has spare capacity for the NUL — the concat fast path writes into one
+// of these directly so a `t .. x` chain is a single memcpy per operand.
+fn alloc_string_owned(mut buf: Vec<u8>, len: usize) -> *mut u8 {
+    buf.truncate(len);
+    buf.push(0);
+    let rt = RtString { len, hash: fx_str_hash_bytes(&buf[..len]), bytes: buf.into_boxed_slice() };
     Box::into_raw(Box::new(rt)) as *mut u8
 }
 
@@ -318,13 +335,26 @@ pub struct KeyMap {
 impl KeyMap {
     fn new() -> Self { KeyMap { slots: Vec::new(), len: 0, used: 0 } }
 
+    // Heap bytes held by the slot array, for the GC's byte-paced trigger.
+    pub fn capacity_bytes(&self) -> usize {
+        self.slots.capacity() * std::mem::size_of::<(u64, TableKey, Value)>()
+    }
+
     #[inline(always)]
     fn key_hash(k: &TableKey) -> u64 {
+        // Probes index on the LOW bits of this hash, but multiplication only
+        // spreads entropy upward: float/pointer keys (mantissa low bits are
+        // zero) would otherwise all land in the same few slots. Fold the
+        // product's high bits back down so every key type scatters.
+        let mix = |h: u64| {
+            let h = h.wrapping_mul(0x9E3779B97F4A7C15);
+            (h ^ (h >> 32)) | 2
+        };
         match k {
-            TableKey::Int(n)  => (*n as u64).wrapping_mul(0x9E3779B97F4A7C15) | 2,
-            TableKey::Str(p)  => (unsafe { (*(*p as *const RtString)).hash }) | 2,
-            TableKey::Bool(b) => (*b as u64) | 2,
-            TableKey::Ptr(p)  => p.wrapping_mul(0x9E3779B97F4A7C15) | 2,
+            TableKey::Int(n)  => mix(*n as u64),
+            TableKey::Str(p)  => mix(unsafe { (*(*p as *const RtString)).hash }),
+            TableKey::Bool(b) => mix(*b as u64),
+            TableKey::Ptr(p)  => mix(*p),
         }
     }
 
@@ -338,6 +368,21 @@ impl KeyMap {
             let (tag, sk, v) = unsafe { self.slots.get_unchecked(i) };
             if *tag == 0 { return None; }
             if *tag == h && sk == k { return Some(v); }
+            i = (i + 1) & mask;
+        }
+    }
+
+    // Slot index where the probe for `k` stops: the key's own slot on a hit,
+    // or the first empty slot on a miss. next() uses it to resume iteration
+    // without rescanning the whole map.
+    fn probe_slot(&self, k: &TableKey) -> Option<usize> {
+        if self.slots.is_empty() { return None; }
+        let mask = self.slots.len() - 1;
+        let h = Self::key_hash(k);
+        let mut i = (h as usize >> 2) & mask;
+        loop {
+            let (tag, sk, _) = unsafe { self.slots.get_unchecked(i) };
+            if *tag == 0 || (*tag == h && sk == k) { return Some(i); }
             i = (i + 1) & mask;
         }
     }
@@ -450,6 +495,10 @@ impl Table {
         if key.is_int() {
             let i = key.as_int().unwrap();
             if i >= 1 && i <= (self.array.len() + 1) as i64 {
+                // The key may already live in the hash part (inserted before
+                // the array grew this far); drop it so the key exists in
+                // exactly one place and next() can't yield it twice.
+                if self.hash.len > 0 { self.hash.remove(&TableKey::Int(i)); }
                 let idx = (i - 1) as usize;
                 if idx == self.array.len() {
                     self.array.push(val);
@@ -1101,9 +1150,19 @@ impl Vm {
 
     fn concat_two(&mut self, left: Value, right: Value) -> VmResult<Value> {
         if (left.is_string() || left.is_number()) && (right.is_string() || right.is_number()) {
-            let ls = coerce_to_concat_str(left);
-            let rs = coerce_to_concat_str(right);
-            return Ok(self.intern(&(ls + &rs)));
+            // Build the RtString in place: one allocation, one memcpy per
+            // operand, no interning — concat results are throwaway and
+            // string identity is content-based everywhere else.
+            let ltmp;
+            let rtmp;
+            let ls: &str = if left.is_string() { unsafe { string_ref(left) } } else { ltmp = coerce_num_str(left); &ltmp };
+            let rs: &str = if right.is_string() { unsafe { string_ref(right) } } else { rtmp = coerce_num_str(right); &rtmp };
+            let mut buf = Vec::with_capacity(ls.len() + rs.len() + 1);
+            buf.extend_from_slice(ls.as_bytes());
+            buf.extend_from_slice(rs.as_bytes());
+            let raw = alloc_string_owned(buf, ls.len() + rs.len());
+            self.gc.register_string(raw);
+            return Ok(Value::string(raw));
         }
         let mm = self.get_mm2(left, right, "__concat");
         if mm.is_nil() {
@@ -2199,22 +2258,41 @@ impl Vm {
                     return Err(VmError::RuntimeError("next: expected table".into()));
                 }
                 let t = unsafe { &*(tbl.as_table().unwrap() as *const Table) };
-                let mut found = key.is_nil();
-                for (i, &v) in t.array.iter().enumerate() {
-                    if v.is_nil() { continue; }
-                    let k = Value::int((i + 1) as i64);
-                    if found { return Ok(vec![k, v]); }
-                    if values_equal(k, key) { found = true; }
+                // Resume by position instead of rescanning: an int key inside
+                // the array part continues at that index; anything else probes
+                // the hash for its slot and continues after it. A deleted or
+                // never-present key resumes where it would have sat, which is
+                // strictly more useful than Lua's "invalid key" error.
+                let mut ai = 0usize;
+                let mut hi = 0usize;
+                if !key.is_nil() {
+                    if key.is_int_like() {
+                        let i = key.as_int().unwrap();
+                        if i >= 1 && (i as usize) <= t.array.len()
+                            && !t.array[(i - 1) as usize].is_nil() {
+                            ai = i as usize;
+                        } else {
+                            hi = t.hash.probe_slot(&TableKey::Int(i))
+                                .map(|s| s + 1).unwrap_or(0);
+                        }
+                    } else if let Some(tk) = TableKey::from_value(key) {
+                        hi = t.hash.probe_slot(&tk).map(|s| s + 1).unwrap_or(0);
+                    }
                 }
-                for (tk, &v) in t.hash.iter() {
+                for i in ai..t.array.len() {
+                    let v = t.array[i];
+                    if !v.is_nil() { return Ok(vec![Value::int((i + 1) as i64), v]); }
+                }
+                for s in hi..t.hash.slots.len() {
+                    let (tag, tk, v) = &t.hash.slots[s];
+                    if *tag <= 1 { continue; }
                     let k = match tk {
                         TableKey::Int(n)  => make_int_via_current_vm(*n),
                         TableKey::Bool(b) => Value::bool(*b),
                         TableKey::Str(p)  => Value::string(*p),
                         TableKey::Ptr(p)  => Value::from_raw(*p),
                     };
-                    if found { return Ok(vec![k, v]); }
-                    if values_equal(k, key) { found = true; }
+                    return Ok(vec![k, *v]);
                 }
                 Ok(vec![Value::nil()])
             });
@@ -2426,8 +2504,20 @@ impl Vm {
             if total > MAX_ALLOC_LEN {
                 return Err(VmError::RuntimeError("string.rep: result too large".into()));
             }
-            let parts: Vec<&str> = std::iter::repeat(s).take(n).collect();
-            Ok(vec![alloc_string_val(&parts.join(&sep))])
+            // Write the result in place: a Vec of n &str parts would cost
+            // 16 bytes per repeat on top of the join's own buffer.
+            let mut buf = Vec::with_capacity(total + 1);
+            for i in 0..n {
+                if i > 0 { buf.extend_from_slice(sep.as_bytes()); }
+                buf.extend_from_slice(s.as_bytes());
+            }
+            let len = buf.len();
+            let raw = alloc_string_owned(buf, len);
+            CURRENT_VM.with(|c| {
+                let ptr = c.get();
+                if !ptr.is_null() { unsafe { &mut *ptr }.gc.register_string(raw); }
+            });
+            Ok(vec![Value::string(raw)])
         });
         let v_str_upper = self.make_cfn_val(|args| {
             Ok(vec![alloc_string_val(&str_arg(args, 0, "string.upper")?.to_uppercase())])
@@ -3599,7 +3689,13 @@ fn gsub_result_value(v: Value) -> VmResult<Option<Vec<u8>>> {
 
 fn coerce_to_concat_str(v: Value) -> String {
     if v.is_string() { unsafe { string_ref(v) }.to_owned() }
-    else if v.is_int_like() { v.as_int().unwrap().to_string() }
+    else { coerce_num_str(v) }
+}
+
+// Number half of coerce_to_concat_str; concat_two borrows string operands
+// instead of copying them, so only numbers need a scratch String.
+fn coerce_num_str(v: Value) -> String {
+    if v.is_int_like() { v.as_int().unwrap().to_string() }
     else { crate::value::lua_float_str(v.as_float().unwrap()) }
 }
 

@@ -1,3 +1,5 @@
+LIB_DIR = ../target/release
+
 .PHONY: all run run-word-count run-scheduler run-bank-account run-nqueens run-dijkstra run-json run-mandel clean
 
 all: host
