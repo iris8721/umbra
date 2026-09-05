@@ -137,13 +137,15 @@ Release build, same machine, against PUC Lua 5.4:
 
 | | umbra | lua 5.4 | |
 |---|---|---|---|
-| `fib(30)` — call overhead | 0.083s | 0.030s | 2.8× |
-| 2M array writes + reads | 0.057s | 0.031s | 1.8× |
-| 200k string concat + `gmatch` | 0.091s | 0.059s | 1.5× |
+| `fib(30)` — call overhead | 0.056s | 0.032s | 1.7× |
+| 2M array writes + reads | 0.051s | 0.031s | 1.6× |
+| 200k string concat + `gmatch` | 0.091s | 0.061s | 1.5× |
 
-The remaining gap is dispatch: the VM is a `match` loop over a `Vec` of
-instructions, not computed goto, and there is no JIT. No attempt has been
-made to compete with LuaJIT.
+`fib(30)` retires 1.53G instructions to Lua's 0.66G at the same IPC — the
+gap is work per op, not stalls. What's left: NaN-boxing means every integer
+result is range-checked against the 48-bit inline payload (Lua's 16-byte
+`TValue` holds a full `i64`), and `match`-based dispatch can't do the
+computed-goto threading a C interpreter gets. No JIT.
 
 ## Differences from Lua
 
