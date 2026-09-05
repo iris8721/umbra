@@ -157,8 +157,8 @@ impl Value {
             return Some((raw << 16) >> 16);
         }
         if self.is_bigint() {
-            let ptr = (self.0 & PAYLOAD_MASK) as *const i64;
-            return Some(unsafe { *ptr });
+            let ptr = (self.0 & PAYLOAD_MASK) as *const crate::vm::GcBigInt;
+            return Some(unsafe { (*ptr).n });
         }
         None
     }

@@ -3078,6 +3078,25 @@ f = none"#,
         assert!(after <= baseline + 4, "cycle leaked: after={after} baseline={baseline}");
     }
 
+
+    #[test]
+    fn gc_byte_pacing_collects_large_dead_strings() {
+        // A large live set pushes the object-count trigger past the number of
+        // allocations a later phase makes, so only byte pacing can fire here:
+        // 2000 discarded 4KB strings (~8MB) must be collected even though
+        // 2000 < live_after_collect.
+        use vm::Vm;
+        let mut vm = Vm::new();
+        run_with_vm(
+            r#"keep = {}
+for i = 1, 20000 { keep[i] = "k" .. i }
+for i = 1, 2000 { let junk = string.rep("x", 4096) }"#,
+            &mut vm,
+        ).unwrap();
+        let live = vm.gc.live_count();
+        assert!(live < 21500, "dead large strings should have been collected, live={live}");
+    }
+
     #[test]
     fn gc_stress_leaves_no_live_garbage() {
         use vm::Vm;

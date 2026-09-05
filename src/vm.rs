@@ -184,7 +184,9 @@ fn fx_str_hash_bytes(b: &[u8]) -> u64 {
 // as_c_ptr() safe to hand to a C host expecting a NUL-terminated string
 // (a plain Rust String's buffer has no such guarantee). `hash` is the
 // FxHash of the bytes, precomputed so table-key hashing is O(1).
+#[repr(C)] // gc must stay first: the GC reads the header through the object pointer.
 pub struct RtString {
+    pub gc: crate::gc::GcHeader,
     pub len: usize,
     pub hash: u64,
     bytes: Box<[u8]>,
@@ -208,7 +210,7 @@ fn alloc_string_bytes(bytes: &[u8]) -> *mut u8 {
     let mut buf = Vec::with_capacity(bytes.len() + 1);
     buf.extend_from_slice(bytes);
     buf.push(0);
-    let rt = RtString { len: bytes.len(), hash: fx_str_hash_bytes(bytes), bytes: buf.into_boxed_slice() };
+    let rt = RtString { gc: crate::gc::GcHeader::new(crate::gc::GcKind::Str), len: bytes.len(), hash: fx_str_hash_bytes(bytes), bytes: buf.into_boxed_slice() };
     Box::into_raw(Box::new(rt)) as *mut u8
 }
 
@@ -218,7 +220,7 @@ fn alloc_string_bytes(bytes: &[u8]) -> *mut u8 {
 fn alloc_string_owned(mut buf: Vec<u8>, len: usize) -> *mut u8 {
     buf.truncate(len);
     buf.push(0);
-    let rt = RtString { len, hash: fx_str_hash_bytes(&buf[..len]), bytes: buf.into_boxed_slice() };
+    let rt = RtString { gc: crate::gc::GcHeader::new(crate::gc::GcKind::Str), len, hash: fx_str_hash_bytes(&buf[..len]), bytes: buf.into_boxed_slice() };
     Box::into_raw(Box::new(rt)) as *mut u8
 }
 
@@ -230,13 +232,21 @@ fn alloc_string_val(s: &str) -> Value {
         if ptr.is_null() { return Value::string(alloc_string_raw(s)); }
         let vm = unsafe { &mut *ptr };
         let raw = alloc_string_raw(s);
-        vm.gc.register_string(raw);
+        vm.gc.register(raw);
         Value::string(raw)
     })
 }
 
+// Boxed i64 for values that don't fit the inline int range; the gc header
+// keeps it on the same heap list as every other object.
+#[repr(C)]
+pub struct GcBigInt {
+    pub gc: crate::gc::GcHeader,
+    pub n: i64,
+}
+
 fn alloc_bigint_raw(n: i64) -> *mut u8 {
-    Box::into_raw(Box::new(n)) as *mut u8
+    Box::into_raw(Box::new(GcBigInt { gc: crate::gc::GcHeader::new(crate::gc::GcKind::BigInt), n })) as *mut u8
 }
 
 // For plain cfn closures with no direct &mut Vm; falls back to the truncating
@@ -257,7 +267,9 @@ pub(crate) unsafe fn string_ref<'a>(v: Value) -> &'a str {
     }
 }
 
+#[repr(C)] // gc must stay first: the GC reads the header through the object pointer.
 pub struct Table {
+    pub gc: crate::gc::GcHeader,
     pub array: Vec<Value>,
     pub hash: KeyMap,
     pub metatable: Option<*mut Table>,
@@ -461,7 +473,7 @@ impl KeyMap {
 
 impl Table {
     pub fn new() -> Self {
-        Table { array: Vec::new(), hash: KeyMap::new(), metatable: None }
+        Table { gc: crate::gc::GcHeader::new(crate::gc::GcKind::Table), array: Vec::new(), hash: KeyMap::new(), metatable: None }
     }
     #[inline(always)]
     pub fn raw_get(&self, key: Value) -> Value {
@@ -549,7 +561,9 @@ pub struct Coroutine {
     pub tbc: Vec<(usize, bool)>,
 }
 
+#[repr(C)] // gc must stay first: the GC reads the header through the object pointer.
 pub struct LuaClosure {
+    pub gc: crate::gc::GcHeader,
     pub proto: *const Proto,
     pub upvals: Vec<Value>,
 }
@@ -699,7 +713,7 @@ impl Vm {
     fn intern(&mut self, s: &str) -> Value {
         if let Some(&v) = self.string_cache.get(s) { return v; }
         let ptr = alloc_string_raw(s);
-        self.gc.register_string(ptr);
+        self.gc.register(ptr);
         let v = Value::string(ptr);
         self.string_cache.insert(s.to_owned(), v);
         v
@@ -712,7 +726,7 @@ impl Vm {
             return Value::int(n);
         }
         let ptr = alloc_bigint_raw(n);
-        self.gc.register_bigint(ptr);
+        self.gc.register(ptr);
         Value::bigint(ptr)
     }
 
@@ -1161,7 +1175,7 @@ impl Vm {
             buf.extend_from_slice(ls.as_bytes());
             buf.extend_from_slice(rs.as_bytes());
             let raw = alloc_string_owned(buf, ls.len() + rs.len());
-            self.gc.register_string(raw);
+            self.gc.register(raw);
             return Ok(Value::string(raw));
         }
         let mm = self.get_mm2(left, right, "__concat");
@@ -1668,7 +1682,7 @@ impl Vm {
 
                     Op::NewTable => {
                         let ptr = alloc_table_raw();
-                        self.gc.register_table(ptr);
+                        self.gc.register(ptr);
                         unsafe { *regs.add(base + a()) = Value::table(ptr); }
                         ck!();
                     }
@@ -1902,11 +1916,12 @@ impl Vm {
                                 }
                             }).collect();
                             let lc = Box::new(LuaClosure {
+                                gc: crate::gc::GcHeader::new(crate::gc::GcKind::Closure),
                                 proto: inner_proto as *const Proto,
                                 upvals,
                             });
                             let ptr = Box::into_raw(lc) as *mut u8;
-                            self.gc.register_closure(ptr);
+                            self.gc.register(ptr);
                             Value::closure(ptr)
                         };
                         unsafe { *regs.add(base + a()) = closure_val; }
@@ -2396,7 +2411,7 @@ impl Vm {
         });
 
         let co_table_ptr = alloc_table_raw();
-        self.gc.register_table(co_table_ptr);
+        self.gc.register(co_table_ptr);
 
         let create_val = self.make_cfn_val(|args| {
             let fn_val = args.first().copied().unwrap_or(Value::nil());
@@ -2474,7 +2489,7 @@ impl Vm {
         self.globals.raw_set(k_coroutine, co_table_val);
 
         let str_table_ptr = alloc_table_raw();
-        self.gc.register_table(str_table_ptr);
+        self.gc.register(str_table_ptr);
 
         let v_str_len = self.make_cfn_val(|args| {
             Ok(vec![Value::int(str_arg(args, 0, "string.len")?.len() as i64)])
@@ -2515,7 +2530,7 @@ impl Vm {
             let raw = alloc_string_owned(buf, len);
             CURRENT_VM.with(|c| {
                 let ptr = c.get();
-                if !ptr.is_null() { unsafe { &mut *ptr }.gc.register_string(raw); }
+                if !ptr.is_null() { unsafe { &mut *ptr }.gc.register(raw); }
             });
             Ok(vec![Value::string(raw)])
         });
@@ -2737,7 +2752,7 @@ impl Vm {
         self.globals.raw_set(k_string, str_table_val);
 
         let math_table_ptr = alloc_table_raw();
-        self.gc.register_table(math_table_ptr);
+        self.gc.register(math_table_ptr);
 
         let v_math_floor = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
@@ -2917,7 +2932,7 @@ impl Vm {
         self.globals.raw_set(k_math, Value::table(math_table_ptr));
 
         let tbl_table_ptr = alloc_table_raw();
-        self.gc.register_table(tbl_table_ptr);
+        self.gc.register(tbl_table_ptr);
 
         let v_tbl_insert = self.make_cfn_val(|args| {
             let t = args.first().copied().unwrap_or(Value::nil());
@@ -3041,7 +3056,7 @@ impl Vm {
             let ptr = alloc_table_raw();
             CURRENT_VM.with(|c| {
                 let vm_ptr = c.get();
-                if !vm_ptr.is_null() { unsafe { &mut *vm_ptr }.gc.register_table(ptr); }
+                if !vm_ptr.is_null() { unsafe { &mut *vm_ptr }.gc.register(ptr); }
             });
             let tbl = unsafe { &mut *(ptr as *mut Table) };
             for (i, &v) in args.iter().enumerate() {
@@ -3104,7 +3119,7 @@ impl Vm {
         self.globals.raw_set(k_table, Value::table(tbl_table_ptr));
 
         let io_table_ptr = alloc_table_raw();
-        self.gc.register_table(io_table_ptr);
+        self.gc.register(io_table_ptr);
 
         let v_io_write = self.make_cfn_val(|args| {
             let mut out = String::new();
@@ -3173,7 +3188,7 @@ impl Vm {
                 // The handle table exists before the method closures so
                 // file:write can return it (Lua returns the file for chaining).
                 let ft_ptr = alloc_table_raw();
-                vm.gc.register_table(ft_ptr);
+                vm.gc.register(ft_ptr);
                 let handle = Value::table(ft_ptr);
 
                 let f = file.clone();
@@ -3279,7 +3294,7 @@ impl Vm {
         self.globals.raw_set(k_io, Value::table(io_table_ptr));
 
         let os_table_ptr = alloc_table_raw();
-        self.gc.register_table(os_table_ptr);
+        self.gc.register(os_table_ptr);
 
         let v_os_time = self.make_cfn_val(|args| {
             if let Some(&t) = args.first() {
@@ -3339,7 +3354,7 @@ impl Vm {
                     if vm_ptr.is_null() { return Value::nil(); }
                     let vm = unsafe { &mut *vm_ptr };
                     let ptr = alloc_table_raw();
-                    vm.gc.register_table(ptr);
+                    vm.gc.register(ptr);
                     let t = unsafe { &mut *(ptr as *mut Table) };
                     let (year, month, day, yday, wday) = civil_fields(secs);
                     let sod = secs.rem_euclid(86400);
@@ -3371,7 +3386,7 @@ impl Vm {
         self.globals.raw_set(k_os, Value::table(os_table_ptr));
 
         let utf8_table_ptr = alloc_table_raw();
-        self.gc.register_table(utf8_table_ptr);
+        self.gc.register(utf8_table_ptr);
 
         let v_utf8_char = self.make_cfn_val(|args| {
             let mut s = String::new();
@@ -3451,7 +3466,7 @@ impl Vm {
         self.globals.raw_set(k_utf8, Value::table(utf8_table_ptr));
 
         let debug_table_ptr = alloc_table_raw();
-        self.gc.register_table(debug_table_ptr);
+        self.gc.register(debug_table_ptr);
         let v_debug_traceback = self.make_cfn_val(|args| {
             let msg = args.first().filter(|v| v.is_string())
                 .map(|&v| unsafe { string_ref(v) }.to_owned());
