@@ -242,7 +242,7 @@ pub(crate) unsafe fn string_ref<'a>(v: Value) -> &'a str {
 
 pub struct Table {
     pub array: Vec<Value>,
-    pub hash: FxMap<TableKey, Value>,
+    pub hash: KeyMap,
     pub metatable: Option<*mut Table>,
 }
 
@@ -305,9 +305,118 @@ impl TableKey {
     }
 }
 
+// Open-addressed map for the non-array part of a Table. std HashMap::get
+// never inlines, and every GetGlobal/GetTable pays that call plus a probe —
+// this keeps the whole lookup in the dispatch loop. Slot tags: 0 = empty,
+// 1 = tombstone, otherwise (hash | 2) so a hit compares one u64 before the key.
+pub struct KeyMap {
+    slots: Vec<(u64, TableKey, Value)>,
+    len: usize,
+    used: usize,
+}
+
+impl KeyMap {
+    fn new() -> Self { KeyMap { slots: Vec::new(), len: 0, used: 0 } }
+
+    #[inline(always)]
+    fn key_hash(k: &TableKey) -> u64 {
+        match k {
+            TableKey::Int(n)  => (*n as u64).wrapping_mul(0x9E3779B97F4A7C15) | 2,
+            TableKey::Str(p)  => (unsafe { (*(*p as *const RtString)).hash }) | 2,
+            TableKey::Bool(b) => (*b as u64) | 2,
+            TableKey::Ptr(p)  => p.wrapping_mul(0x9E3779B97F4A7C15) | 2,
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self, k: &TableKey) -> Option<&Value> {
+        if self.slots.is_empty() { return None; }
+        let mask = self.slots.len() - 1;
+        let h = Self::key_hash(k);
+        let mut i = (h as usize >> 2) & mask;
+        loop {
+            let (tag, sk, v) = unsafe { self.slots.get_unchecked(i) };
+            if *tag == 0 { return None; }
+            if *tag == h && sk == k { return Some(v); }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let cap = (self.slots.len() * 2).max(8);
+        let mut slots = Vec::new();
+        slots.resize(cap, (0u64, TableKey::Bool(false), Value::nil()));
+        let old = std::mem::replace(&mut self.slots, slots);
+        self.used = 0;
+        for (tag, k, v) in old {
+            if tag > 1 {
+                let mask = self.slots.len() - 1;
+                let mut i = (tag as usize >> 2) & mask;
+                while self.slots[i].0 != 0 { i = (i + 1) & mask; }
+                self.slots[i] = (tag, k, v);
+                self.used += 1;
+            }
+        }
+    }
+
+    pub fn insert(&mut self, k: TableKey, v: Value) {
+        if (self.used + 1) * 4 >= self.slots.len().max(1) * 3 { self.grow(); }
+        let mask = self.slots.len() - 1;
+        let h = Self::key_hash(&k);
+        let mut i = (h as usize >> 2) & mask;
+        let mut tomb = usize::MAX;
+        loop {
+            let slot = unsafe { self.slots.get_unchecked_mut(i) };
+            if slot.0 == 0 {
+                let at = if tomb != usize::MAX { tomb } else { i };
+                self.slots[at] = (h, k, v);
+                self.len += 1;
+                if tomb == usize::MAX { self.used += 1; }
+                return;
+            }
+            if slot.0 == h && slot.1 == k {
+                slot.2 = v;
+                return;
+            }
+            if slot.0 == 1 && tomb == usize::MAX { tomb = i; }
+            i = (i + 1) & mask;
+        }
+    }
+
+    pub fn remove(&mut self, k: &TableKey) {
+        if self.slots.is_empty() { return; }
+        let mask = self.slots.len() - 1;
+        let h = Self::key_hash(k);
+        let mut i = (h as usize >> 2) & mask;
+        loop {
+            let slot = unsafe { self.slots.get_unchecked_mut(i) };
+            if slot.0 == 0 { return; }
+            if slot.0 == h && slot.1 == *k {
+                slot.0 = 1;
+                self.len -= 1;
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&TableKey, &Value)> {
+        self.slots.iter().filter(|s| s.0 > 1).map(|s| (&s.1, &s.2))
+    }
+
+    pub fn retain(&mut self, mut f: impl FnMut(&TableKey, &mut Value) -> bool) {
+        for s in self.slots.iter_mut() {
+            if s.0 > 1 && !f(&s.1, &mut s.2) {
+                s.0 = 1;
+                self.len -= 1;
+            }
+        }
+    }
+}
+
 impl Table {
     pub fn new() -> Self {
-        Table { array: Vec::new(), hash: FxMap::default(), metatable: None }
+        Table { array: Vec::new(), hash: KeyMap::new(), metatable: None }
     }
     #[inline(always)]
     pub fn raw_get(&self, key: Value) -> Value {
@@ -579,7 +688,7 @@ impl Vm {
         roots.extend(self.globals.array.iter().copied());
         // globals isn't a GC object, so propagate_table never sees it: root
         // its hash keys (strings keep the key's pointer alive) and values.
-        for (k, v) in &self.globals.hash {
+        for (k, v) in self.globals.hash.iter() {
             match k {
                 TableKey::Str(p) => roots.push(Value::string(*p)),
                 TableKey::Ptr(bits) => roots.push(Value::from_raw(*bits)),
@@ -1051,19 +1160,22 @@ impl Vm {
 
     #[inline(always)]
     fn resolve_const(&mut self, proto: &Proto, idx: usize) -> Value {
-        match unsafe { proto.consts.get_unchecked(idx) } {
+        // String constants dominate (every GetGlobal/LoadK name); test for
+        // Str first so the hot case is a compare, not a jump-table hop.
+        let c = unsafe { proto.consts.get_unchecked(idx) };
+        if let Const::Str(sc) = c {
+            let (owner, bits) = sc.cached();
+            if bits != 0 && owner == self as *const Vm as usize {
+                return Value::from_raw(bits);
+            }
+            return self.intern_const_str(sc);
+        }
+        match c {
             Const::Nil       => Value::nil(),
             Const::Bool(b)   => Value::bool(*b),
             Const::Int(n)    => self.make_int(*n),
             Const::Float(f)  => Value::float(*f),
-            Const::Str(sc)   => {
-                let (owner, bits) = sc.cached();
-                if bits != 0 && owner == self as *const Vm as usize {
-                    Value::from_raw(bits)
-                } else {
-                    self.intern_const_str(sc)
-                }
-            }
+            Const::Str(_)    => unreachable!(),
         }
     }
 
@@ -2094,7 +2206,7 @@ impl Vm {
                     if found { return Ok(vec![k, v]); }
                     if values_equal(k, key) { found = true; }
                 }
-                for (tk, &v) in &t.hash {
+                for (tk, &v) in t.hash.iter() {
                     let k = match tk {
                         TableKey::Int(n)  => make_int_via_current_vm(*n),
                         TableKey::Bool(b) => Value::bool(*b),
