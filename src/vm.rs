@@ -1265,8 +1265,9 @@ impl Vm {
                 }}
             }
 
+            // Every compiled Proto ends in Return, so the loop exits through
+            // the Return arm — no per-instruction pc bounds check needed.
             loop {
-                if frame.pc >= proto.code.len() { break; }
 
                 // Cheap per-instruction counting only; the actual gc_collect()/
                 // budget-error handling happens back at 'outer's top, where it's
@@ -1767,12 +1768,6 @@ impl Vm {
                     Op::TbcPop => { self.tbc.pop(); }
                 }
             }
-
-            let base_save = base;
-            let expected = frame.expected_results;
-            self.frames.pop();
-            if self.frames.is_empty() { self.top_level_results = vec![]; return Ok(()); }
-            self.place_results(base_save - 1, Vec::new(), expected);
         }
     }
     // Writes a call's results at `at`, nil-padding to `expected` (255 = keep

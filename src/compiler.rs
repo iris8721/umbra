@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::chunk::{Const, Op, Proto, RK_BIT, enc_abc, enc_abx, enc_asbx, iop};
+use crate::chunk::{Const, Op, Proto, RK_BIT, enc_abc, enc_abx, enc_asbx, iop, isbx};
 const BIAS: i32 = crate::chunk::BIAS;
 // Register operands share an 8-bit field with RK constants (bit 7 set), so
 // both registers and RK-encodable constants are limited to 0..128.
@@ -1745,6 +1745,18 @@ fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp
             }
             None => return Err(err(format!("no visible label '{}' for goto", g.name), g.line)),
         }
+    }
+
+    // A conditional at the tail can jump one past the last instruction
+    // (e.g. `if x { return }` at function end). The VM no longer bounds-checks
+    // pc per instruction, so such a proto needs a real Return to land on.
+    let needs_tail = fc.proto.code.iter().enumerate().any(|(i, &instr)| {
+        matches!(Op::from_u8(iop(instr)),
+            Some(Op::Jmp) | Some(Op::ForPrep) | Some(Op::ForLoop) | Some(Op::TForLoop))
+            && i as i32 + 1 + isbx(instr) == fc.proto.code.len() as i32
+    });
+    if needs_tail {
+        fc.emit(enc_abc(Op::Return, 0, 1, 0));
     }
 
     // Bx and upvalue operands are 16 and 8 bits wide; anything past that
