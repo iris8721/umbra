@@ -12,6 +12,7 @@ pub const BIAS: i32 = 32767;
 #[inline(always)] pub fn ic(i: u32)    -> usize { ((i >> 24) & 0xFF) as usize }
 #[inline(always)] pub fn ibx(i: u32)   -> usize { ((i >> 16) & 0xFFFF) as usize }
 #[inline(always)] pub fn isbx(i: u32)  -> i32   { ((i >> 16) as u16 as i32) - BIAS }
+#[inline(always)] pub fn ici(i: u32)   -> i64   { (i >> 24) as u8 as i8 as i64 }
 
 #[inline(always)]
 pub fn enc_abc(op: Op, a: u8, b: u8, c: u8) -> u32 {
@@ -78,12 +79,42 @@ pub enum Op {
     // unwinding through a frame run close() on the locals it tears down.
     Tbc,
     TbcPop,
+
+    // Immediate forms: C is a signed 8-bit integer literal, not an RK
+    // operand. The metamethod fallback still sees the literal as a regular
+    // int value, so behavior matches the generic op exactly.
+    AddI,
+    SubI,
+
+    // Compare-and-jump with an 8-bit immediate: A is the jump sense, B the
+    // register, C the literal. GtI/GeI compare imm against R[B] (the
+    // operands of the source-level `x > k` / `k < x` are already swapped by
+    // the compiler, matching how Gt/Ge reuse Lt/Le).
+    LtI,
+    LeI,
+    GtI,
+    GeI,
+    EqI,
+
+    // Field access with a constant-string key: C is a raw const index (not
+    // RK), skipping the RK tag check on the lookup path.
+    GetField,
+    SetField,
+
+    // Method-call setup: R[A+1] = R[B]; R[A] = R[B][K[C]] — fuses the
+    // receiver move and the method lookup that a `obj:name(...)` call needs.
+    SelfOp,
+
+    // `return f(...)`: reuses the current frame instead of pushing one.
+    // Operands match Call; the compiler only emits it when no <close> local
+    // is pending and the call is the sole return value.
+    TailCall,
 }
 
 impl Op {
     #[inline(always)]
     pub fn from_u8(b: u8) -> Option<Self> {
-        if b <= Op::TbcPop as u8 {
+        if b <= Op::TailCall as u8 {
             Some(unsafe { std::mem::transmute(b) })
         } else {
             None
@@ -149,6 +180,11 @@ pub struct Proto {
     pub is_vararg: bool,
     pub source: Option<String>,
     pub lines: Vec<u32>,
+    // Per-const GetGlobal cache, parallel to `consts`: (owner VM, globals
+    // generation, cached value bits). Filled lazily by the VM; a globals
+    // write bumps the generation and invalidates every entry. Sized to
+    // consts.len() at compile time; empty for hand-built protos.
+    pub global_cache: Vec<Cell<(usize, u64, u64)>>,
 }
 
 impl Proto {
@@ -163,6 +199,7 @@ impl Proto {
             is_vararg: false,
             source: None,
             lines: Vec::new(),
+            global_cache: Vec::new(),
         }
     }
 

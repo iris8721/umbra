@@ -1311,6 +1311,69 @@ print(pcall(f))"#,
     }
 
     #[test]
+    fn vm_tail_call_reuses_frame() {
+        // 100k-deep tail recursion would overflow the 200-frame call stack
+        // without tail calls.
+        assert_output(
+            "fn loop_(n, acc) { if n == 0 { return acc } return loop_(n - 1, acc + n) }
+            print(loop_(100000, 0))",
+            &["5000050000"],
+        );
+    }
+
+    #[test]
+    fn vm_tail_call_preserves_multi_results() {
+        assert_output(
+            "fn two() { return 7, 8 }
+            fn f() { return two() }
+            print(f())",
+            &["7\t8"],
+        );
+    }
+
+    #[test]
+    fn vm_tail_call_through_cfn_and_method() {
+        // Host-function tail calls still return through the reused frame.
+        assert_output(
+            "fn f() { return tostring(42) }
+            print(f())",
+            &["42"],
+        );
+        assert_output(
+            "let o = { v = 3 }
+            fn o:m(k) { return self.v + k }
+            fn g() { return o:m(4) }
+            print(g())",
+            &["7"],
+        );
+    }
+
+    #[test]
+    fn vm_tail_call_runs_pending_close() {
+        // A <close> local in scope makes `return f()` a normal call: f runs
+        // first, then close() as g's frame unwinds.
+        assert_output(
+            "var log = {}
+            fn f() { log[#log + 1] = \"f\" return 1 }
+            fn g() { let c <close> = { close = fn() { log[#log + 1] = \"c\" } } return f() }
+            g()
+            print(table.concat(log, \",\"))",
+            &["f,c"],
+        );
+    }
+
+    #[test]
+    fn vm_superinstructions_emitted() {
+        let (block, errs) = parse("fn f(n) { if n < 2 { return n } return f(n - 1) }");
+        assert!(errs.is_empty());
+        let proto = compile(block, None).unwrap();
+        let dump = disasm(&proto);
+        assert!(dump.contains("LtI"), "{dump}");
+        assert!(dump.contains("SubI"), "{dump}");
+        assert!(dump.contains("TailCall"), "{dump}");
+    }
+
+    #[test]
     fn vm_concat() {
         assert_output(r#"print("hello" .. " " .. "world")"#, &["hello world"]);
     }
@@ -3960,6 +4023,24 @@ print("after")"#,
     }
 }
 
+#[cfg(test)]
+pub fn disasm(p: &chunk::Proto) -> String {
+    let mut out = String::new();
+    fn dump(p: &chunk::Proto, depth: usize, out: &mut String) {
+        use chunk::*;
+        let pad = "  ".repeat(depth);
+        out.push_str(&format!("{pad}proto params={} vararg={} regs={} consts={}\n",
+            p.params, p.is_vararg, p.max_regs, p.consts.len()));
+        for (i, &ins) in p.code.iter().enumerate() {
+            let op = Op::from_u8(iop(ins)).map(|o| format!("{o:?}")).unwrap_or_else(|| "?".into());
+            out.push_str(&format!("{pad}{i:4} {op:10} a={} b={} c={} bx={} sbx={}\n",
+                ia(ins), ib(ins), ic(ins), ibx(ins), isbx(ins)));
+        }
+        for c in p.protos.iter() { dump(c, depth + 1, out); }
+    }
+    dump(p, 0, &mut out);
+    out
+}
 
 #[cfg(test)]
 mod stdlib_second_pass_tests {

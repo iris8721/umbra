@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use crate::chunk::{Const, Op, Proto, StrConst, ia, ib, ic, ibx, isbx, iop, is_rk, rk_idx};
+use crate::chunk::{Const, Op, Proto, StrConst, ia, ib, ic, ibx, isbx, iop, ici, is_rk, rk_idx};
 use crate::gc::Gc;
 use crate::pack;
 use crate::pattern;
@@ -503,6 +503,7 @@ impl Table {
         })
     }
 
+    #[inline(always)]
     pub fn raw_set(&mut self, key: Value, val: Value) {
         if key.is_int() {
             let i = key.as_int().unwrap();
@@ -577,12 +578,19 @@ pub struct Frame {
     pub upvals_len: usize,
     pub varargs: Box<[Value]>,
     pub top: usize,
+    // The callee value, rooted for the GC. Normal calls leave it nil — the
+    // caller's register window already roots the function — but a tail call
+    // overwrites that window with the new arguments, so the reused frame
+    // must hold the closure itself or its upvalues could be collected.
+    pub callable: Value,
 }
 
 pub struct Vm {
     regs: Vec<Value>,
     frames: Vec<Frame>,
     pub globals: Table,
+    // Bumped on every globals write; GetGlobal callsite caches key on it.
+    globals_gen: u64,
     string_cache: FxMap<String, Value>,
     // Interned string constants resolved from live Protos; rooted for the
     // VM's lifetime so the per-constant cache in StrConst can never dangle.
@@ -686,6 +694,7 @@ impl Vm {
             regs: vec![Value::nil(); 256],
             frames: Vec::with_capacity(200),
             globals: Table::new(),
+            globals_gen: 0,
             string_cache: FxMap::default(),
             const_strings: Vec::new(),
             top_level_results: Vec::new(),
@@ -744,9 +753,12 @@ impl Vm {
         }).max().unwrap_or(0).min(self.regs.len());
         let mut roots: Vec<Value> = self.regs[..reg_top].to_vec();
         // Varargs are copied out of the register window into the frame, so
-        // they need their own scan — nothing else references them.
+        // they need their own scan — nothing else references them. The
+        // callable is rooted for tail calls, which overwrite the caller's
+        // register window (and with it the only other reference).
         for f in self.frames.iter().chain(self.saved_frames.iter().flatten()) {
             roots.extend(f.varargs.iter().copied());
+            roots.push(f.callable);
         }
         roots.extend(self.globals.array.iter().copied());
         // globals isn't a GC object, so propagate_table never sees it: root
@@ -773,6 +785,7 @@ impl Vm {
             roots.push(co.fn_val);
             for f in &co.frames {
                 roots.extend(f.varargs.iter().copied());
+                roots.push(f.callable);
             }
         }
         for &(ptr, gc_fn) in self.gc.pending_finalizers.iter().chain(&self.gc.running_finalizers) {
@@ -1297,8 +1310,7 @@ impl Vm {
             Box::new([])
         };
         // Manual push: Vec::push_mut's grow path never inlines and dominated
-        // the call profile; capacity is preallocated to the 200-frame limit.
-        let f = Frame { proto, pc: 0, base, expected_results: expected, upvals_ptr, upvals_len, varargs, top: base };
+        let f = Frame { proto, pc: 0, base, expected_results: expected, upvals_ptr, upvals_len, varargs, top: base, callable: Value::nil() };
         if self.frames.len() == self.frames.capacity() {
             self.frames.reserve(8);
         }
@@ -1449,6 +1461,60 @@ impl Vm {
                     }
                 }}
             }
+            // Shared table-index body for GetTable/GetField/SelfOp: yields
+            // the looked-up value. The metamethod path can swap frames, so
+            // it refreshes the cached frame/proto/base/regs before yielding.
+            macro_rules! get_table {
+                ($tv:expr, $kv:expr) => {{
+                    let tv = $tv;
+                    let kv = $kv;
+                    if tv.is_table() {
+                        let t = unsafe { &*(tv.as_table().unwrap() as *const Table) };
+                        let raw = t.raw_get(kv);
+                        if !raw.is_nil() || t.metatable.is_none() {
+                            raw
+                        } else {
+                            let result = self.table_index_chain(tv, kv)?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            regs = self.regs.as_mut_ptr();
+                            ck!();
+                            result
+                        }
+                    } else if tv.is_string() {
+                        if self.string_lib.is_table() {
+                            unsafe { &*(self.string_lib.as_table().unwrap() as *const Table) }.raw_get(kv)
+                        } else {
+                            Value::nil()
+                        }
+                    } else {
+                        return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
+                    }
+                }}
+            }
+            macro_rules! set_table {
+                ($tv:expr, $kv:expr, $vv:expr) => {{
+                    let tv = $tv;
+                    let kv = $kv;
+                    let vv = $vv;
+                    if tv.is_table() {
+                        let t = unsafe { &*(tv.as_table().unwrap() as *const Table) };
+                        if t.metatable.is_none() || !t.raw_get(kv).is_nil() {
+                            unsafe { table_ref(tv) }.raw_set(kv, vv);
+                        } else {
+                            self.table_newindex_chain(tv, kv, vv)?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            regs = self.regs.as_mut_ptr();
+                            ck!();
+                        }
+                    } else {
+                        return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
+                    }
+                }}
+            }
 
             // Every compiled Proto ends in Return, so the loop exits through
             // the Return arm — no per-instruction pc bounds check needed.
@@ -1468,9 +1534,9 @@ impl Vm {
                 let bx  = || ibx(instr);
                 let sbx = || isbx(instr);
 
-                // Op is #[repr(u8)] with contiguous variants 0..=TbcPop and the
+                // Op is #[repr(u8)] with contiguous variants 0..=TailCall and the
                 // compiler only emits valid opcodes, so decode unchecked.
-                debug_assert!(iop(instr) <= Op::TbcPop as u8);
+                debug_assert!(iop(instr) <= Op::TailCall as u8);
                 match unsafe { std::mem::transmute::<u8, Op>(iop(instr)) } {
                     Op::LoadNil  => R!(a()) = Value::nil(),
                     Op::LoadBool => {
@@ -1486,6 +1552,52 @@ impl Vm {
 
                     Op::Add  => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_add(y)) }, |x: f64, y: f64| x + y, "__add"),
                     Op::Sub  => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_sub(y)) }, |x: f64, y: f64| x - y, "__sub"),
+                    // Immediate arith: C is a signed literal, not an RK
+                    // operand — the int fast path skips the const resolve.
+                    // The metamethod/error path behaves exactly like the
+                    // generic op with the literal as the second operand.
+                    Op::AddI => {
+                        let bv = R!(b());
+                        let k = ici(instr);
+                        if bv.is_int_like() {
+                            let res = self.make_int(bv.as_int().unwrap().wrapping_add(k));
+                            R!(a()) = res;
+                        } else if bv.is_float() {
+                            R!(a()) = Value::float(bv.as_float().unwrap() + k as f64);
+                        } else {
+                            let cv = Value::int(k);
+                            let mm = self.get_mm2(bv, cv, "__add");
+                            if mm.is_nil() {
+                                let bad = if !bv.is_number() { bv } else { cv };
+                                return Err(VmError::RuntimeError(format!(
+                                    "attempt to perform arithmetic on a {} value", bad.type_name())));
+                            }
+                            let res = self.call_value_isolated(mm, &[bv, cv])?;
+                            self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
+                            continue 'outer;
+                        }
+                    }
+                    Op::SubI => {
+                        let bv = R!(b());
+                        let k = ici(instr);
+                        if bv.is_int_like() {
+                            let res = self.make_int(bv.as_int().unwrap().wrapping_sub(k));
+                            R!(a()) = res;
+                        } else if bv.is_float() {
+                            R!(a()) = Value::float(bv.as_float().unwrap() - k as f64);
+                        } else {
+                            let cv = Value::int(k);
+                            let mm = self.get_mm2(bv, cv, "__sub");
+                            if mm.is_nil() {
+                                let bad = if !bv.is_number() { bv } else { cv };
+                                return Err(VmError::RuntimeError(format!(
+                                    "attempt to perform arithmetic on a {} value", bad.type_name())));
+                            }
+                            let res = self.call_value_isolated(mm, &[bv, cv])?;
+                            self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
+                            continue 'outer;
+                        }
+                    }
                     Op::Mul  => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_mul(y)) }, |x: f64, y: f64| x * y, "__mul"),
                     Op::Div  => {
                         let bv = RK!(b()); let cv = RK!(c());
@@ -1666,6 +1778,100 @@ impl Vm {
                         fused_jmp!(le == (a() != 0));
                     }
 
+                    // Immediate compares: R[B] against a signed literal (C).
+                    // GtI/GeI evaluate `imm < R[B]` / `imm <= R[B]` — the
+                    // compiler already swapped the source operands, so the
+                    // metamethod path sees the same argument order the
+                    // generic Lt/Le would.
+                    Op::LtI => {
+                        let bv = R!(b());
+                        let k = ici(instr);
+                        let lt = if bv.is_int() {
+                            bv.as_int().unwrap() < k
+                        } else if bv.is_number() {
+                            value_lt(bv, Value::int(k))?
+                        } else {
+                            let lt = self.value_lt_mm(bv, Value::int(k))?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            regs = self.regs.as_mut_ptr();
+                            ck!();
+                            lt
+                        };
+                        fused_jmp!(lt == (a() != 0));
+                    }
+                    Op::LeI => {
+                        let bv = R!(b());
+                        let k = ici(instr);
+                        let le = if bv.is_int() {
+                            bv.as_int().unwrap() <= k
+                        } else if bv.is_number() {
+                            value_le(bv, Value::int(k))?
+                        } else {
+                            let le = self.value_le_mm(bv, Value::int(k))?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            regs = self.regs.as_mut_ptr();
+                            ck!();
+                            le
+                        };
+                        fused_jmp!(le == (a() != 0));
+                    }
+                    Op::GtI => {
+                        let bv = R!(b());
+                        let k = ici(instr);
+                        let gt = if bv.is_int() {
+                            k < bv.as_int().unwrap()
+                        } else if bv.is_number() {
+                            value_lt(Value::int(k), bv)?
+                        } else {
+                            let gt = self.value_lt_mm(Value::int(k), bv)?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            regs = self.regs.as_mut_ptr();
+                            ck!();
+                            gt
+                        };
+                        fused_jmp!(gt == (a() != 0));
+                    }
+                    Op::GeI => {
+                        let bv = R!(b());
+                        let k = ici(instr);
+                        let ge = if bv.is_int() {
+                            k <= bv.as_int().unwrap()
+                        } else if bv.is_number() {
+                            value_le(Value::int(k), bv)?
+                        } else {
+                            let ge = self.value_le_mm(Value::int(k), bv)?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            regs = self.regs.as_mut_ptr();
+                            ck!();
+                            ge
+                        };
+                        fused_jmp!(ge == (a() != 0));
+                    }
+                    Op::EqI => {
+                        let bv = R!(b());
+                        let cv = Value::int(ici(instr));
+                        let eq = if bv.raw_bits() == cv.raw_bits() {
+                            true
+                        } else {
+                            let eq = self.values_eq_mm(bv, cv)?;
+                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
+                            proto = unsafe { &*frame.proto };
+                            base = frame.base;
+                            regs = self.regs.as_mut_ptr();
+                            ck!();
+                            eq
+                        };
+                        fused_jmp!(eq == (a() != 0));
+                    }
+
                     Op::Test => {
                         fused_jmp!(R!(a()).is_truthy() == (c() != 0));
                     }
@@ -1687,54 +1893,27 @@ impl Vm {
                         ck!();
                     }
                     Op::GetTable => {
-                        let tv = R!(b());
-                        let kv = RK!(c());
-                        if tv.is_table() {
-                            let t = unsafe { &*(tv.as_table().unwrap() as *const Table) };
-                            let raw = t.raw_get(kv);
-                            if !raw.is_nil() || t.metatable.is_none() {
-                                R!(a()) = raw;
-                                continue;
-                            }
-                            let result = self.table_index_chain(tv, kv)?;
-                            self.regs[base + a()] = result;
-                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
-                            proto = unsafe { &*frame.proto };
-                            base = frame.base;
-                            regs = self.regs.as_mut_ptr();
-                            ck!();
-                            continue;
-                        }
-                        if tv.is_string() {
-                            let result = if self.string_lib.is_table() {
-                                unsafe { &*(self.string_lib.as_table().unwrap() as *const Table) }.raw_get(kv)
-                            } else {
-                                Value::nil()
-                            };
-                            R!(a()) = result;
-                            continue;
-                        }
-                        return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
+                        let v = get_table!(R!(b()), RK!(c()));
+                        R!(a()) = v;
                     }
                     Op::SetTable => {
-                        let tv = R!(a());
-                        let kv = RK!(b());
-                        let vv = RK!(c());
-                        if tv.is_table() {
-                            let t = unsafe { &*(tv.as_table().unwrap() as *const Table) };
-                            if t.metatable.is_none() || !t.raw_get(kv).is_nil() {
-                                unsafe { table_ref(tv) }.raw_set(kv, vv);
-                                continue;
-                            }
-                            self.table_newindex_chain(tv, kv, vv)?;
-                            frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
-                            proto = unsafe { &*frame.proto };
-                            base = frame.base;
-                            regs = self.regs.as_mut_ptr();
-                            ck!();
-                            continue;
-                        }
-                        return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
+                        set_table!(R!(a()), RK!(b()), RK!(c()));
+                    }
+                    Op::GetField => {
+                        let kv = self.resolve_const(proto, c());
+                        let v = get_table!(R!(b()), kv);
+                        R!(a()) = v;
+                    }
+                    Op::SetField => {
+                        let kv = self.resolve_const(proto, b());
+                        set_table!(R!(a()), kv, RK!(c()));
+                    }
+                    Op::SelfOp => {
+                        let tv = R!(b());
+                        let kv = self.resolve_const(proto, c());
+                        R!(a() + 1) = tv;
+                        let v = get_table!(tv, kv);
+                        R!(a()) = v;
                     }
                     Op::SetList => {
                         let tv = R!(a());
@@ -1748,11 +1927,24 @@ impl Vm {
                     }
 
                     Op::GetGlobal => {
-                        let k = self.resolve_const(proto, bx());
+                        let bi = bx();
+                        let cached = proto.global_cache.get(bi).map(|c| c.get());
+                        if let Some((owner, g, bits)) = cached {
+                            if bits != 0 && owner == self as *const Vm as usize
+                                && g == self.globals_gen
+                            {
+                                unsafe { *regs.add(base + a()) = Value::from_raw(bits); }
+                                continue;
+                            }
+                        }
+                        let k = self.resolve_const(proto, bi);
                         if !k.is_string() {
                             return Err(VmError::RuntimeError("invalid global name".into()));
                         }
                         let v = self.globals.raw_get(k);
+                        if let Some(c) = proto.global_cache.get(bi) {
+                            c.set((self as *const Vm as usize, self.globals_gen, v.raw_bits()));
+                        }
                         unsafe { *regs.add(base + a()) = v; }
                     }
                     Op::SetGlobal => {
@@ -1762,6 +1954,7 @@ impl Vm {
                         }
                         let v = unsafe { *regs.add(base + a()) };
                         self.globals.raw_set(k, v);
+                        self.globals_gen += 1;
                     }
 
                     Op::Call => {
@@ -1803,6 +1996,87 @@ impl Vm {
                             for i in 0..nargs as usize { mm_args.push(unsafe { *regs.add(args_base + i) }); }
                             let results = self.call_value_isolated(mm, &mm_args)?;
                             self.place_results(base + a(), results, nresults);
+                            continue 'outer;
+                        } else {
+                            return Err(VmError::RuntimeError(format!("attempt to call a {}", fn_val.type_name())));
+                        }
+                    }
+
+                    // `return f(...)`: the callee takes over this frame —
+                    // args move down to base, pc/proto/upvals swap, and the
+                    // original caller's expected_results stays in force.
+                    // The compiler only emits it when no <close> mark is
+                    // pending in this frame, so nothing here needs unwinding.
+                    Op::TailCall => {
+                        let fn_val = R!(a());
+                        let nargs = if b() == 0 { frame.top.saturating_sub(base + a() + 1) } else { b() - 1 };
+
+                        if let Some(cp) = get_proto_callable(fn_val) {
+                            let p = unsafe { &*cp.proto };
+                            let needed = base + (p.max_regs as usize).max(nargs) + 8;
+                            if needed > self.regs.len() {
+                                self.regs.resize(needed + 64, Value::nil());
+                                regs = self.regs.as_mut_ptr();
+                            }
+                            unsafe {
+                                std::ptr::copy(
+                                    regs.add(base + a() + 1),
+                                    regs.add(base),
+                                    nargs,
+                                );
+                            }
+                            let varargs: Box<[Value]> = if p.is_vararg && nargs > p.params as usize {
+                                self.regs[base + p.params as usize..base + nargs].to_vec().into_boxed_slice()
+                            } else {
+                                Box::new([])
+                            };
+                            frame.proto = cp.proto;
+                            frame.pc = 0;
+                            frame.upvals_ptr = cp.upvals_ptr;
+                            frame.upvals_len = cp.upvals_len;
+                            frame.varargs = varargs;
+                            frame.top = base;
+                            frame.callable = fn_val;
+                            proto = p;
+                            ck!();
+                            continue;
+                        } else if let Some(cfn) = get_cfn(fn_val) {
+                            let args_base = base + a() + 1;
+                            let args: Vec<Value> = (0..nargs)
+                                .map(|i| unsafe { *regs.add(args_base + i) })
+                                .collect();
+                            let expected = frame.expected_results;
+                            let base_save = base;
+                            let results = cfn(&args)?;
+                            // A yield propagates with the frame still live:
+                            // resume() drops the results at base+a() and the
+                            // compiler-emitted Return after this op sends
+                            // them to the original caller.
+                            self.frames.pop();
+                            if self.frames.is_empty() {
+                                self.top_level_results = results;
+                                return Ok(());
+                            }
+                            self.place_results(base_save - 1, results, expected);
+                            continue 'outer;
+                        } else if fn_val.is_table() {
+                            let mm = self.get_mm(fn_val, "__call");
+                            if mm.is_nil() {
+                                return Err(VmError::RuntimeError("attempt to call a table value".into()));
+                            }
+                            let args_base = base + a() + 1;
+                            let mut mm_args = Vec::with_capacity(nargs + 1);
+                            mm_args.push(fn_val);
+                            for i in 0..nargs { mm_args.push(unsafe { *regs.add(args_base + i) }); }
+                            let expected = frame.expected_results;
+                            let base_save = base;
+                            let results = self.call_value_isolated(mm, &mm_args)?;
+                            self.frames.pop();
+                            if self.frames.is_empty() {
+                                self.top_level_results = results;
+                                return Ok(());
+                            }
+                            self.place_results(base_save - 1, results, expected);
                             continue 'outer;
                         } else {
                             return Err(VmError::RuntimeError(format!("attempt to call a {}", fn_val.type_name())));
@@ -3497,6 +3771,7 @@ impl Vm {
         let k = self.intern(name);
         let v = self.make_cfn_val(f);
         self.globals.raw_set(k, v);
+        self.globals_gen += 1;
     }
 
     // Not GC-tracked (a cfn box lives until the VM is dropped); bit 47 of the
@@ -3531,6 +3806,7 @@ impl Vm {
     pub fn set_global(&mut self, name: &str, v: Value) {
         let k = self.intern(name);
         self.globals.raw_set(k, v);
+        self.globals_gen += 1;
     }
 
     pub fn get_global(&mut self, name: &str) -> Value {

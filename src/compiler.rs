@@ -324,6 +324,13 @@ impl FnComp {
 
     fn const_val(&mut self, c: Const) -> usize { self.proto.add_const(c) }
 
+    // Const index for GetField/SetField/SelfOp's 8-bit key operand; names
+    // past 255 fall back to the RK forms.
+    fn field_key(&mut self, s: &str) -> Option<u8> {
+        let i = self.const_str(s);
+        if i <= u8::MAX as usize { Some(i as u8) } else { None }
+    }
+
     // Constants past the RK range are loaded into a fresh register instead;
     // the register stays reserved until the caller resets free_reg.
     fn rk_const(&mut self, c: Const) -> CResult<usize> {
@@ -417,10 +424,12 @@ impl FnComp {
         } else {
             reg
         };
-        let fki = self.rk_str("close")?;
         let fn_reg = self.alloc_reg()?;
         self.reserve(fn_reg as usize + 2)?;
-        self.emit(enc_abc(Op::GetTable, fn_reg, value_reg, fki));
+        match self.field_key("close") {
+            Some(ki) => { self.emit(enc_abc(Op::GetField, fn_reg, value_reg, ki)); },
+            None => { let fki = self.rk_str("close")?; self.emit(enc_abc(Op::GetTable, fn_reg, value_reg, fki)); }
+        };
         self.emit_move(fn_reg + 1, value_reg);
         self.emit(enc_abc(Op::Call, fn_reg, 2, 1));
         Ok(())
@@ -493,17 +502,26 @@ impl FnComp {
     fn emit_cond_test(&mut self, cond: &Expr) -> CResult<usize> {
         if let Expr::Binop { op, lhs, rhs, line } = cond {
             let cmp = match op {
-                Binop::Eq => Some((Op::Eq, false, false)),
-                Binop::Ne => Some((Op::Eq, true,  false)),
-                Binop::Lt => Some((Op::Lt, false, false)),
-                Binop::Le => Some((Op::Le, false, false)),
-                Binop::Gt => Some((Op::Lt, false, true)),
-                Binop::Ge => Some((Op::Le, false, true)),
-                _ => None,
+                Binop::Eq | Binop::Ne | Binop::Lt | Binop::Le | Binop::Gt | Binop::Ge => true,
+                _ => false,
             };
-            if let Some((vm_op, invert, swap)) = cmp {
+            if cmp {
                 self.line = *line;
                 let temp_base = self.free_reg;
+                let invert = matches!(op, Binop::Ne);
+                if self.emit_cmp_imm(*op, lhs, rhs, invert as u8)?.is_some() {
+                    self.free_reg = temp_base;
+                    return Ok(self.proto.emit_jump(*line));
+                }
+                let (vm_op, invert, swap) = match op {
+                    Binop::Eq => (Op::Eq, false, false),
+                    Binop::Ne => (Op::Eq, true,  false),
+                    Binop::Lt => (Op::Lt, false, false),
+                    Binop::Le => (Op::Le, false, false),
+                    Binop::Gt => (Op::Lt, false, true),
+                    Binop::Ge => (Op::Le, false, true),
+                    _ => unreachable!(),
+                };
                 let (l, r) = if swap { (rhs, lhs) } else { (lhs, rhs) };
                 let le = self.compile_expr(l)?;
                 let lrk = self.to_rk(le)?;
@@ -673,6 +691,12 @@ impl FnComp {
     // return values, which a variable-length tail can't guarantee, so a
     // trailing call is then truncated to one result and `...` is expanded
     // only after the closes have run.
+    //
+    // `return f(...)` alone (no other values, no pending <close>) compiles to
+    // TailCall: the callee reuses this frame, so recursion in tail position
+    // never grows the frame stack. The Return emitted after it is dead code
+    // on the normal path — it exists so a coroutine that yields out of a
+    // host-function tail call has somewhere to resume into.
     fn compile_return(&mut self, vals: &[Expr], line: u32) -> CResult<()> {
         self.line = line;
         let closes = self.has_closes(0);
@@ -685,8 +709,21 @@ impl FnComp {
         let n = vals.len();
         let tail_vararg = matches!(vals[n - 1], Expr::Vararg(_));
         if tail_vararg { self.check_vararg(line)?; }
-        let tail_call = !closes && matches!(vals[n - 1], Expr::Call(_) | Expr::MethodCall(_));
-        let fixed = if tail_vararg || tail_call { n - 1 } else { n };
+        let last_is_call = matches!(vals[n - 1], Expr::Call(_) | Expr::MethodCall(_));
+        // Only a sole trailing call is a real tail call; `return a, f()`
+        // still needs the multi-value Call+Return sequence.
+        let tail_call = !closes && last_is_call && n == 1;
+        let fixed = if tail_vararg || (last_is_call && !closes) { n - 1 } else { n };
+        if n == 1 && !tail_call && !tail_vararg {
+            // Single value: return it from wherever it landed — no Move to a
+            // fixed base. (The closes path is fine too: close scratch
+            // registers sit above free_reg, never below it.)
+            let e = self.compile_expr(&vals[0])?;
+            let r = self.to_reg(e, None)?;
+            if closes { self.emit_closes(0)?; }
+            self.emit(enc_abc(Op::Return, r, 2, 0));
+            return Ok(());
+        }
         for (i, v) in vals[..fixed].iter().enumerate() {
             let dst = base + i as u8;
             let e = self.compile_expr(v)?;
@@ -698,10 +735,11 @@ impl FnComp {
             self.reserve(base as usize + fixed + 1)?;
             self.emit(enc_abc(Op::Vararg, base + fixed as u8, 0, 0));
             self.emit(enc_abc(Op::Return, base, 0, 0));
-        } else if tail_call {
+        } else if last_is_call && !closes {
+            let tbase = base + fixed as u8;
             match &vals[n - 1] {
-                Expr::Call(c) => self.compile_call(c, base + fixed as u8, MULTRET)?,
-                Expr::MethodCall(m) => self.compile_method_call(m, base + fixed as u8, MULTRET)?,
+                Expr::Call(c) => self.compile_call(c, tbase, MULTRET, tail_call)?,
+                Expr::MethodCall(m) => self.compile_method_call(m, tbase, MULTRET, tail_call)?,
                 _ => unreachable!(),
             }
             self.emit(enc_abc(Op::Return, base, 0, 0));
@@ -738,8 +776,8 @@ impl FnComp {
                         // any operand is truncated to u8.
                         self.reserve(dst + want)?;
                         match val {
-                            Expr::Call(c) => { self.compile_call(c, dst as u8, want as u8)?; }
-                            Expr::MethodCall(m) => { self.compile_method_call(m, dst as u8, want as u8)?; }
+                            Expr::Call(c) => { self.compile_call(c, dst as u8, want as u8, false)?; }
+                            Expr::MethodCall(m) => { self.compile_method_call(m, dst as u8, want as u8, false)?; }
                             Expr::Vararg(_) => {
                                 self.check_vararg(*line)?;
                                 self.emit(enc_abc(Op::Vararg, dst as u8, want as u8 + 1, 0));
@@ -788,8 +826,10 @@ impl FnComp {
                 let vr = self.to_reg(ve, None)?;
                 for name in fields {
                     let dst = self.alloc_reg()?;
-                    let fki = self.rk_str(name)?;
-                    self.emit(enc_abc(Op::GetTable, dst, vr, fki));
+                    match self.field_key(name) {
+                        Some(ki) => { self.emit(enc_abc(Op::GetField, dst, vr, ki)); },
+                        None => { let fki = self.rk_str(name)?; self.emit(enc_abc(Op::GetTable, dst, vr, fki)); }
+                    };
                     let boxed = self.captured.contains(name);
                     self.locals.push(Local { name: name.clone(), reg: dst, mutable: *mutable, close: false, boxed });
                     if boxed { self.box_in_place(dst)?; }
@@ -809,8 +849,8 @@ impl FnComp {
                     if want > 1 {
                         self.reserve(dst + want)?;
                         match &values[i] {
-                            Expr::Call(c) => { self.compile_call(c, dst as u8, want as u8)?; }
-                            Expr::MethodCall(m) => { self.compile_method_call(m, dst as u8, want as u8)?; }
+                            Expr::Call(c) => { self.compile_call(c, dst as u8, want as u8, false)?; }
+                            Expr::MethodCall(m) => { self.compile_method_call(m, dst as u8, want as u8, false)?; }
                             Expr::Vararg(_) => {
                                 self.check_vararg(*line)?;
                                 self.emit(enc_abc(Op::Vararg, dst as u8, want as u8 + 1, 0));
@@ -1005,8 +1045,8 @@ impl FnComp {
 
                 if iters.len() == 1 {
                     match &iters[0] {
-                        Expr::Call(c) => { self.compile_call(c, base, 3)?; }
-                        Expr::MethodCall(m) => { self.compile_method_call(m, base, 3)?; }
+                        Expr::Call(c) => { self.compile_call(c, base, 3, false)?; }
+                        Expr::MethodCall(m) => { self.compile_method_call(m, base, 3, false)?; }
                         it0 => {
                             let e = self.compile_expr(it0)?;
                             self.to_reg(e, Some(base))?;
@@ -1088,15 +1128,19 @@ impl FnComp {
                     let mut cur = base_r;
                     let field_end = if name.method.is_some() { nparts } else { nparts - 1 };
                     for p in &name.parts[1..field_end] {
-                        let fki = self.rk_str(p)?;
                         let next = self.alloc_reg()?;
-                        self.emit(enc_abc(Op::GetTable, next, cur, fki));
+                        match self.field_key(p) {
+                            Some(ki) => { self.emit(enc_abc(Op::GetField, next, cur, ki)); },
+                            None => { let fki = self.rk_str(p)?; self.emit(enc_abc(Op::GetTable, next, cur, fki)); }
+                        };
                         cur = next;
                     }
                     let last_key = name.method.as_deref()
                         .unwrap_or_else(|| name.parts.last().unwrap());
-                    let lki = self.rk_str(last_key)?;
-                    self.emit(enc_abc(Op::SetTable, cur, lki, dst));
+                    match self.field_key(last_key) {
+                        Some(ki) => { self.emit(enc_abc(Op::SetField, cur, ki, dst)); },
+                        None => { let lki = self.rk_str(last_key)?; self.emit(enc_abc(Op::SetTable, cur, lki, dst)); }
+                    };
                     self.free_reg_to(base_r);
                 }
                 self.free_reg_to(dst);
@@ -1136,7 +1180,7 @@ impl FnComp {
             Stmt::Call(c) => {
                 self.line = c.line;
                 let base = self.free_reg;
-                self.compile_call(c, base, 0)?;
+                self.compile_call(c, base, 0, false)?;
                 self.free_reg_to(base);
             }
             Stmt::ExprStmt(e) => {
@@ -1148,7 +1192,7 @@ impl FnComp {
             Stmt::MethodCall(m) => {
                 self.line = m.line;
                 let base = self.free_reg;
-                self.compile_method_call(m, base, 0)?;
+                self.compile_method_call(m, base, 0, false)?;
                 self.free_reg_to(base);
             }
 
@@ -1225,8 +1269,10 @@ impl FnComp {
                 let reg_top = self.free_reg;
                 let te = self.compile_expr(table)?;
                 let tr = self.to_reg(te, None)?;
-                let fki = self.rk_str(field)?;
-                self.emit(enc_abc(Op::SetTable, tr, fki, src));
+                match self.field_key(field) {
+                    Some(ki) => { self.emit(enc_abc(Op::SetField, tr, ki, src)); },
+                    None => { let fki = self.rk_str(field)?; self.emit(enc_abc(Op::SetTable, tr, fki, src)); }
+                };
                 self.free_reg_to(reg_top);
             }
             Expr::Index { table, key, line } => {
@@ -1234,6 +1280,14 @@ impl FnComp {
                 let reg_top = self.free_reg;
                 let te = self.compile_expr(table)?;
                 let tr = self.to_reg(te, None)?;
+                if let Expr::String(s, _) = &**key {
+                    if let Some(ki) = self.field_key(s) {
+                        self.compile_expr(key)?;
+                        self.emit(enc_abc(Op::SetField, tr, ki, src));
+                        self.free_reg_to(reg_top);
+                        return Ok(());
+                    }
+                }
                 let ke = self.compile_expr(key)?;
                 let kr = self.to_rk(ke)?;
                 self.emit(enc_abc(Op::SetTable, tr, kr as u8, src));
@@ -1350,9 +1404,11 @@ impl FnComp {
                 self.line = *line;
                 let te = self.compile_expr(table)?;
                 let tr = self.to_reg(te, None)?;
-                let fki = self.rk_str(field)?;
                 let dst = self.alloc_reg()?;
-                self.emit(enc_abc(Op::GetTable, dst, tr, fki));
+                match self.field_key(field) {
+                    Some(ki) => { self.emit(enc_abc(Op::GetField, dst, tr, ki)); },
+                    None => { let fki = self.rk_str(field)?; self.emit(enc_abc(Op::GetTable, dst, tr, fki)); }
+                };
                 if !matches!(te.kind, ExprKind::Reg(_)) {
                     self.emit_move(tr, dst);
                     self.free_reg = tr + 1;
@@ -1365,6 +1421,14 @@ impl FnComp {
                 self.line = *line;
                 let te = self.compile_expr(table)?;
                 let tr = self.to_reg(te, None)?;
+                if let Expr::String(s, _) = &**key {
+                    if let Some(ki) = self.field_key(s) {
+                        self.compile_expr(key)?;
+                        let dst = self.alloc_reg()?;
+                        self.emit(enc_abc(Op::GetField, dst, tr, ki));
+                        return Ok(Expr2::reg(dst, *line));
+                    }
+                }
                 let ke = self.compile_expr(key)?;
                 let kr = self.to_rk(ke)?;
                 let dst = self.alloc_reg()?;
@@ -1375,13 +1439,13 @@ impl FnComp {
                 self.line = c.line;
                 let base = self.free_reg;
                 let results = 1;
-                self.compile_call(c, base, results)?;
+                self.compile_call(c, base, results, false)?;
                 Ok(Expr2::reg(base, c.line))
             }
             Expr::MethodCall(m) => {
                 self.line = m.line;
                 let base = self.free_reg;
-                self.compile_method_call(m, base, 1)?;
+                self.compile_method_call(m, base, 1, false)?;
                 Ok(Expr2::reg(base, m.line))
             }
             Expr::Ternary { cond, then, else_, line } => {
@@ -1413,10 +1477,9 @@ impl FnComp {
                 let old_reg = self.to_reg(te, Some(base))?;
                 if self.free_reg <= old_reg { self.free_reg = old_reg + 1; }
 
-                let one = self.to_rk(Expr2 { kind: ExprKind::IntK(1), line: *line })?;
                 let new_reg = self.alloc_reg()?;
-                let vm_op = if *delta >= 0 { Op::Add } else { Op::Sub };
-                self.emit(enc_abc(vm_op, new_reg, old_reg, one as u8));
+                let vm_op = if *delta >= 0 { Op::AddI } else { Op::SubI };
+                self.emit(enc_abc(vm_op, new_reg, old_reg, 1));
 
                 // Re-evaluates target's own subexpressions (e.g. an Index's key)
                 // a second time for the write-back — a double-evaluation that only
@@ -1431,6 +1494,60 @@ impl FnComp {
         }
     }
 
+    // Small integer literal usable as an 8-bit immediate operand.
+    fn lit_i8(e: &Expr) -> Option<i8> {
+        match e {
+            Expr::Int(n, _) if *n >= i8::MIN as i64 && *n <= i8::MAX as i64 => Some(*n as i8),
+            _ => None,
+        }
+    }
+
+    // Literal AST nodes compile to constants; the immediate ops want a
+    // register on the other side, so a literal/literal pair keeps the
+    // generic RK form (no register load is emitted for it).
+    fn is_lit(e: &Expr) -> bool {
+        matches!(e, Expr::Nil(_) | Expr::True(_) | Expr::False(_)
+            | Expr::Int(..) | Expr::Float(..) | Expr::String(..))
+    }
+
+    // `x <op> k` / `k <op> x` with a small literal: emits the immediate
+    // compare (the caller emits the fused Jmp). Operand order is preserved:
+    // the register side is compiled exactly where the generic path would
+    // evaluate it.
+    fn emit_cmp_imm(&mut self, op: Binop, lhs: &Expr, rhs: &Expr,
+                    sense: u8) -> CResult<Option<()>> {
+        // (source op, literal side) -> (immediate op, register side is lhs)
+        let (i_op, reg_on_left) = match (op, Self::lit_i8(rhs), Self::lit_i8(lhs)) {
+            (Binop::Lt, Some(_), _) if !Self::is_lit(lhs) => (Op::LtI, true),
+            (Binop::Lt, _, Some(_)) if !Self::is_lit(rhs) => (Op::GtI, false),
+            (Binop::Le, Some(_), _) if !Self::is_lit(lhs) => (Op::LeI, true),
+            (Binop::Le, _, Some(_)) if !Self::is_lit(rhs) => (Op::GeI, false),
+            (Binop::Gt, Some(_), _) if !Self::is_lit(lhs) => (Op::GtI, true),
+            (Binop::Gt, _, Some(_)) if !Self::is_lit(rhs) => (Op::LtI, false),
+            (Binop::Ge, Some(_), _) if !Self::is_lit(lhs) => (Op::GeI, true),
+            (Binop::Ge, _, Some(_)) if !Self::is_lit(rhs) => (Op::LeI, false),
+            (Binop::Eq | Binop::Ne, Some(_), _) if !Self::is_lit(lhs) => (Op::EqI, true),
+            (Binop::Eq | Binop::Ne, _, Some(_)) if !Self::is_lit(rhs) => (Op::EqI, false),
+            _ => return Ok(None),
+        };
+        let (reg_src, lit_src) = if reg_on_left { (lhs, rhs) } else { (rhs, lhs) };
+        let imm = Self::lit_i8(lit_src).unwrap();
+        // The literal side still goes through compile_expr so its depth
+        // check runs exactly as the generic path's would.
+        if reg_on_left {
+            let e = self.compile_expr(reg_src)?;
+            let r = self.to_reg(e, None)?;
+            self.compile_expr(lit_src)?;
+            self.emit(enc_abc(i_op, sense, r, imm as u8));
+        } else {
+            self.compile_expr(lit_src)?;
+            let e = self.compile_expr(reg_src)?;
+            let r = self.to_reg(e, None)?;
+            self.emit(enc_abc(i_op, sense, r, imm as u8));
+        }
+        Ok(Some(()))
+    }
+
     fn compile_binop(&mut self, op: Binop, lhs: &Expr, rhs: &Expr, line: u32) -> CResult<Expr2> {
         self.line = line;
 
@@ -1439,6 +1556,30 @@ impl FnComp {
         }
 
         let temp_base = self.free_reg;
+
+        // `x + k` / `x - k` with a small literal: one immediate op, no RK
+        // constant. The literal rhs still compiles (depth check parity) but
+        // materializes nothing.
+        if matches!(op, Binop::Add | Binop::Sub)
+            && Self::lit_i8(rhs).is_some() && !Self::is_lit(lhs)
+        {
+            let le = self.compile_expr(lhs)?;
+            let lreg = self.to_reg(le, None)?;
+            self.compile_expr(rhs)?;
+            self.free_reg = temp_base;
+            let dst = self.alloc_reg()?;
+            let vm_op = if op == Binop::Add { Op::AddI } else { Op::SubI };
+            self.emit(enc_abc(vm_op, dst, lreg, Self::lit_i8(rhs).unwrap() as u8));
+            return Ok(Expr2::reg(dst, line));
+        }
+
+        let invert = matches!(op, Binop::Ne);
+        if self.emit_cmp_imm(op, lhs, rhs, !invert as u8)?.is_some() {
+            self.free_reg = temp_base;
+            let dst = self.alloc_reg()?;
+            return self.emit_bool_from_cmp(dst, line);
+        }
+
         let le = self.compile_expr(lhs)?;
         let lrk = self.to_rk(le)?;
         let re = self.compile_expr(rhs)?;
@@ -1540,12 +1681,23 @@ impl FnComp {
             match field {
                 TableField::Named { key, val, line } => {
                     self.line = *line;
-                    let fki = self.rk_str(key)?;
                     let ve = self.compile_expr(val)?;
                     let vr = self.to_rk(ve)?;
-                    self.emit(enc_abc(Op::SetTable, dst, fki, vr as u8));
+                    match self.field_key(key) {
+                        Some(ki) => { self.emit(enc_abc(Op::SetField, dst, ki, vr as u8)); },
+                        None => { let fki = self.rk_str(key)?; self.emit(enc_abc(Op::SetTable, dst, fki, vr as u8)); }
+                    };
                 }
                 TableField::Indexed { key, val } => {
+                    if let Expr::String(s, _) = key {
+                        if let Some(ki) = self.field_key(s) {
+                            self.compile_expr(key)?;
+                            let ve = self.compile_expr(val)?;
+                            let vr = self.to_rk(ve)?;
+                            self.emit(enc_abc(Op::SetField, dst, ki, vr as u8));
+                            continue;
+                        }
+                    }
                     let ke = self.compile_expr(key)?;
                     let kr = self.to_rk(ke)?;
                     let ve = self.compile_expr(val)?;
@@ -1563,8 +1715,8 @@ impl FnComp {
                             self.emit(enc_abc(Op::Vararg, slot, 0, 0));
                             open_tail = true;
                         }
-                        Expr::Call(c) if is_last => { self.compile_call(c, slot, MULTRET)?; open_tail = true; }
-                        Expr::MethodCall(m) if is_last => { self.compile_method_call(m, slot, MULTRET)?; open_tail = true; }
+                        Expr::Call(c) if is_last => { self.compile_call(c, slot, MULTRET, false)?; open_tail = true; }
+                        Expr::MethodCall(m) if is_last => { self.compile_method_call(m, slot, MULTRET, false)?; open_tail = true; }
                         _ => {
                             let ve = self.compile_expr(val)?;
                             self.to_reg(ve, Some(slot))?;
@@ -1593,32 +1745,47 @@ impl FnComp {
         Ok(Expr2::reg(dst, tc.line))
     }
 
-    // Callee at `base`, args above it, results land back at `base`.
-    fn compile_call(&mut self, c: &CallExpr, base: u8, nresults: u8) -> CResult<()> {
+    // Callee at `base`, args above it, results land back at `base`. `tail`
+    // emits TailCall instead: the frame is reused, so the caller's
+    // expected_results (not nresults) governs where results go.
+    fn compile_call(&mut self, c: &CallExpr, base: u8, nresults: u8, tail: bool) -> CResult<()> {
         let ce = self.compile_expr(&c.callee)?;
         self.to_reg(ce, Some(base))?;
         self.free_reg = base + 1;
 
         let (nargs, is_variable) = self.push_args(&c.args, base + 1)?;
         let b = if is_variable { 0 } else { nargs + 1 };
-        self.emit_call(base, b, nresults)
+        self.emit_call(base, b, nresults, tail)
     }
 
     // Method at `base`, receiver at `base+1` (the implicit first arg), so the
-    // results land at `base` exactly like compile_call.
-    fn compile_method_call(&mut self, m: &MethodCallExpr, base: u8, nresults: u8) -> CResult<()> {
-        let re = self.compile_expr(&m.receiver)?;
-        self.to_reg(re, Some(base + 1))?;
+    // results land at `base` exactly like compile_call. SelfOp fuses the
+    // receiver move and the method lookup into one instruction.
+    fn compile_method_call(&mut self, m: &MethodCallExpr, base: u8, nresults: u8, tail: bool) -> CResult<()> {
+        if let Some(ki) = self.field_key(&m.method) {
+            let re = self.compile_expr(&m.receiver)?;
+            let rr = self.to_reg(re, None)?;
+            self.reserve(base as usize + 2)?;
+            self.emit(enc_abc(Op::SelfOp, base, rr, ki));
+        } else {
+            let re = self.compile_expr(&m.receiver)?;
+            self.to_reg(re, Some(base + 1))?;
+            let fki = self.rk_str(&m.method)?;
+            self.emit(enc_abc(Op::GetTable, base, base + 1, fki));
+        }
         self.free_reg = base + 2;
 
-        let fki = self.rk_str(&m.method)?;
-        self.emit(enc_abc(Op::GetTable, base, base + 1, fki));
         let (nargs, is_variable) = self.push_args(&m.args, base + 2)?;
         let b = if is_variable { 0 } else { nargs + 2 };
-        self.emit_call(base, b, nresults)
+        self.emit_call(base, b, nresults, tail)
     }
 
-    fn emit_call(&mut self, base: u8, b: u8, nresults: u8) -> CResult<()> {
+    fn emit_call(&mut self, base: u8, b: u8, nresults: u8, tail: bool) -> CResult<()> {
+        if tail {
+            self.emit(enc_abc(Op::TailCall, base, b, 0));
+            self.free_reg = base + 1;
+            return Ok(());
+        }
         if nresults == MULTRET {
             self.emit(enc_abc(Op::Call, base, b, 0));
             self.free_reg = base + 1;
@@ -1651,8 +1818,8 @@ impl FnComp {
                 let slot = arg_base + fixed as u8;
                 match &exprs[n - 1] {
                     Expr::Vararg(_) => { self.check_vararg(self.line)?; self.emit(enc_abc(Op::Vararg, slot, 0, 0)); }
-                    Expr::Call(c) => self.compile_call(c, slot, MULTRET)?,
-                    Expr::MethodCall(m) => self.compile_method_call(m, slot, MULTRET)?,
+                    Expr::Call(c) => self.compile_call(c, slot, MULTRET, false)?,
+                    Expr::MethodCall(m) => self.compile_method_call(m, slot, MULTRET, false)?,
                     _ => unreachable!(),
                 }
                 Ok((fixed as u8, true))
@@ -1770,6 +1937,8 @@ fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp
     if fc.upvals.len() > u8::MAX as usize + 1 {
         return Err(err("too many upvalues", body.line));
     }
+
+    fc.proto.global_cache.resize(fc.proto.consts.len(), std::cell::Cell::new((0, 0, 0)));
 
     fc.proto.upvals = fc.upvals.iter().map(|u| {
         crate::chunk::UpvalDesc { name: u.name.clone(), in_stack: u.in_stack, idx: u.outer_idx }
