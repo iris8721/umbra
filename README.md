@@ -30,7 +30,8 @@ Familiar to anyone who knows Lua, with a C-flavored syntax:
   outside the NaN-box's 48-bit payload are heap-boxed transparently) and
   wrap on overflow like Lua's
 - Multiple returns; a trailing call or `...` in a return, argument list or
-  table constructor passes all of its values
+  table constructor passes all of its values. `return f(x)` is a proper tail
+  call — the frame is reused, so tail-recursive loops don't grow the stack
 - `require` module system (`require "foo.bar"` → `foo/bar.umbra`, cached)
 - `goto`/labels, `pcall`/`xpcall` error handling with line-attributed tracebacks
 
@@ -139,19 +140,22 @@ API, and stdlib edge cases.
 
 ## Performance
 
-Release build, same machine, against PUC Lua 5.4:
+Release build, cycles on one pinned core (`perf stat -e cycles`, mean of
+5), against PUC Lua 5.4:
 
 | | umbra | lua 5.4 | |
 |---|---|---|---|
-| `fib(30)` — call overhead | 0.056s | 0.032s | 1.7× |
-| 2M array writes + reads | 0.051s | 0.031s | 1.6× |
-| 200k string concat + `gmatch` | 0.091s | 0.061s | 1.5× |
+| `fib(30)` — call overhead | 325M | 202M | 1.6× |
+| 2M array writes + reads | 422M | 174M | 2.4× |
+| 200k string concat + `gmatch` | 368M | 408M | 0.9× |
+| 5M short-lived tables, 100k live | 3.24G | 1.69G | 1.9× |
 
-`fib(30)` retires 1.53G instructions to Lua's 0.66G at the same IPC — the
-gap is work per op, not stalls. What's left: NaN-boxing means every integer
-result is range-checked against the 48-bit inline payload (Lua's 16-byte
-`TValue` holds a full `i64`), and `match`-based dispatch can't do the
-computed-goto threading a C interpreter gets. No JIT.
+The bytecode has the same superinstructions Lua 5.4 added (immediate-operand
+arithmetic and compares, `GetField`/`SelfOp`, tail calls) plus a per-callsite
+global cache. What's left is representation: NaN-boxing range-checks every
+integer result against the 48-bit inline payload where Lua's 16-byte
+`TValue` holds a full `i64`, and `match` dispatch can't do the computed-goto
+threading a C interpreter gets. No JIT.
 
 ## Differences from Lua
 
