@@ -20,61 +20,79 @@ typedef enum {
     UMBRA_ERR_SYNTAX   = 2,
 } umbra_Status;
 
+/** Create a new state with the standard library loaded. */
 umbra_State *umbra_newstate(void);
+/** Destroy a state and free everything it owns. */
 void         umbra_close(umbra_State *U);
 
+/** Number of values on the stack in the current C-call frame. */
 int  umbra_gettop(const umbra_State *U);
+/** Set the stack top: idx >= 0 grows with nils (clamped), idx < 0 pops. */
 void umbra_settop(umbra_State *U, int idx);
+/** Pop n values from the stack. */
 void umbra_pop(umbra_State *U, int n);
 
+/** Push nil (the `none` value). Stack: +1. */
 void umbra_pushnil(umbra_State *U);
+/** Push a float. Stack: +1. */
 void umbra_pushnumber(umbra_State *U, double n);
+/** Push an integer (heap-boxed if outside the 48-bit inline range). Stack: +1. */
 void umbra_pushinteger(umbra_State *U, int64_t n);
+/** Push a boolean (b != 0). Stack: +1. */
 void umbra_pushboolean(umbra_State *U, int b);
+/** Push a NUL-terminated string (interned); NULL pushes nil. Stack: +1. */
 void umbra_pushstring(umbra_State *U, const char *s);
 
-/** Returns: 0=nil 1=boolean 2=integer 3=float 4=string 5=table 6=function 7=coroutine */
+/** Type tag of the value at idx:
+    0=nil 1=boolean 2=integer 3=float 4=string 5=table 6=function 7=coroutine. */
 int umbra_type(const umbra_State *U, int idx);
+/** 1 if the value at idx is an integer or float, else 0. */
 int umbra_isnumber(const umbra_State *U, int idx);
+/** 1 if the value at idx is a string, else 0. */
 int umbra_isstring(const umbra_State *U, int idx);
+/** 1 if the value at idx is nil, else 0. */
 int umbra_isnil(const umbra_State *U, int idx);
+/** 1 if the value at idx is callable (script function or C function), else 0. */
 int umbra_isfunction(const umbra_State *U, int idx);
 
+/** Value at idx as a double (integers widen); 0 for non-numbers. */
 double      umbra_tonumber(const umbra_State *U, int idx);
+/** Value at idx as an i64 (floats truncate); 0 for non-numbers. */
 int64_t     umbra_tointeger(const umbra_State *U, int idx);
+/** Value at idx as a boolean under umbra truthiness (nil and false are false). */
 int         umbra_toboolean(const umbra_State *U, int idx);
-/** Pointer valid as long as the string value is reachable. */
+/** Value at idx as a C string, or NULL if it isn't a string. */
 const char *umbra_tostring(const umbra_State *U, int idx);
 
+/** Push the global named `name` (nil if unset or name is NULL). Stack: +1. */
 void umbra_getglobal(umbra_State *U, const char *name);
+/** Pop the top value and store it as the global named `name`. Stack: -1. */
 void umbra_setglobal(umbra_State *U, const char *name);
 
-/** Compile and run source string. On error pushes the error value
-    (message string, or the object passed to error()) and returns non-zero:
-    UMBRA_ERR_SYNTAX for parse/compile failures, UMBRA_ERR_RUNTIME otherwise. */
+/** Compile and run a source string; on error pushes the error value and
+    returns UMBRA_ERR_SYNTAX (parse/compile) or UMBRA_ERR_RUNTIME. */
 int umbra_dostring(umbra_State *U, const char *src);
-
-/** Protected call: calls function at -(nargs+1) with nargs args.
-    On success pushes nres results (-1 = all). On error pushes the error
-    value (a string message, or whatever object error() was given).
-    Returns 0 on success, non-zero on error. */
+/** Call the function at -(nargs+1), popping it and its args; pushes nres
+    results (-1 = all) on success, or the error value on failure. */
 int umbra_pcall(umbra_State *U, int nargs, int nres);
 
-/** Register f as a global callable from scripts.
-    f receives U with args at stack[1..nargs] and pushes results. */
+/** Register f as a global callable; f gets a fresh frame with args at 1..n
+    and returns the number of results pushed (negative = error). */
 void umbra_register(umbra_State *U, const char *name, umbra_CFunction f);
 
-/** Run a full GC collection cycle. Call between script executions. */
+/** Run a full GC collection cycle. */
 void   umbra_gc_collect(umbra_State *U);
-/** Set the object-count threshold that triggers automatic collection (default 1024). */
+/** Set the object-count threshold that triggers automatic collection. */
 void   umbra_gc_setstep(umbra_State *U, size_t threshold);
 /** Bounds how many bytecode instructions a script may run before erroring
-    out (0 = unlimited); host-only, resets the count. */
+    out (0 = unlimited); host-only, resets the count. Call before dostring/
+    pcall-ing a script you don't fully trust to terminate. */
 void   umbra_set_step_limit(umbra_State *U, uint64_t limit);
 /** Host-only hard ceiling on live GC-tracked objects (0 = unlimited); exceeding
-    it after a collection attempt is a real error. */
+    it after a collection attempt is a real error, unlike umbra_gc_setstep
+    which only tunes when collection is attempted. */
 void   umbra_set_max_objects(umbra_State *U, size_t limit);
-/** Returns the number of live GC-tracked objects. */
+/** Number of live GC-tracked objects. */
 size_t umbra_gc_livecount(const umbra_State *U);
 
 #ifdef __cplusplus

@@ -78,22 +78,26 @@ unsafe fn cstr<'a>(s: *const c_char) -> Option<std::borrow::Cow<'a, str>> {
     if s.is_null() { None } else { Some(unsafe { CStr::from_ptr(s) }.to_string_lossy()) }
 }
 
+/// Create a new state with the standard library loaded.
 #[unsafe(no_mangle)]
 pub extern "C" fn umbra_newstate() -> *mut UmbraState {
     Box::into_raw(Box::new(UmbraState::new_inner()))
 }
 
+/// Destroy a state and free everything it owns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_close(U: *mut UmbraState) {
     if !U.is_null() { unsafe { drop(Box::from_raw(U)); } }
 }
 
+/// Number of values on the stack in the current C-call frame.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_gettop(U: *const UmbraState) -> c_int {
     let s = unsafe { &*U };
     s.stack().len().saturating_sub(s.api_base) as c_int
 }
 
+/// Set the stack top: idx >= 0 grows with nils (clamped), idx < 0 pops.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_settop(U: *mut UmbraState, idx: c_int) {
     let s = unsafe { &mut *U };
@@ -108,22 +112,26 @@ pub unsafe extern "C" fn umbra_settop(U: *mut UmbraState, idx: c_int) {
     }
 }
 
+/// Pop n values from the stack.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pop(U: *mut UmbraState, n: c_int) {
     if n <= 0 { return; }
     unsafe { umbra_settop(U, -n); }
 }
 
+/// Push nil (the `none` value). Stack: +1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pushnil(U: *mut UmbraState) {
     unsafe { (*U).stack_mut().push(Value::nil()); }
 }
 
+/// Push a float. Stack: +1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pushnumber(U: *mut UmbraState, n: c_double) {
     unsafe { (*U).stack_mut().push(Value::float(n)); }
 }
 
+/// Push an integer (heap-boxed if outside the 48-bit inline range). Stack: +1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pushinteger(U: *mut UmbraState, n: i64) {
     let state = unsafe { &mut *U };
@@ -131,11 +139,13 @@ pub unsafe extern "C" fn umbra_pushinteger(U: *mut UmbraState, n: i64) {
     state.stack_mut().push(v);
 }
 
+/// Push a boolean (b != 0). Stack: +1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pushboolean(U: *mut UmbraState, b: c_int) {
     unsafe { (*U).stack_mut().push(Value::bool(b != 0)); }
 }
 
+/// Push a NUL-terminated string (interned); NULL pushes nil. Stack: +1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pushstring(U: *mut UmbraState, s: *const c_char) {
     let state = unsafe { &mut *U };
@@ -146,7 +156,8 @@ pub unsafe extern "C" fn umbra_pushstring(U: *mut UmbraState, s: *const c_char) 
     state.stack_mut().push(v);
 }
 
-// Stable FFI contract: 0=nil 1=boolean 2=integer 3=float 4=string 5=table 6=function 7=coroutine
+/// Type tag of the value at idx:
+/// 0=nil 1=boolean 2=integer 3=float 4=string 5=table 6=function 7=coroutine.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_type(U: *const UmbraState, idx: c_int) -> c_int {
     let v = unsafe { (*U).get(idx) };
@@ -160,28 +171,33 @@ pub unsafe extern "C" fn umbra_type(U: *const UmbraState, idx: c_int) -> c_int {
     6
 }
 
+/// 1 if the value at idx is an integer or float, else 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_isnumber(U: *const UmbraState, idx: c_int) -> c_int {
     let v = unsafe { (*U).get(idx) };
     (v.is_int_like() || v.is_float()) as c_int
 }
 
+/// 1 if the value at idx is a string, else 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_isstring(U: *const UmbraState, idx: c_int) -> c_int {
     unsafe { (*U).get(idx) }.is_string() as c_int
 }
 
+/// 1 if the value at idx is nil, else 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_isnil(U: *const UmbraState, idx: c_int) -> c_int {
     unsafe { (*U).get(idx) }.is_nil() as c_int
 }
 
+/// 1 if the value at idx is callable (script function or C function), else 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_isfunction(U: *const UmbraState, idx: c_int) -> c_int {
     let v = unsafe { (*U).get(idx) };
     (v.is_userdata() || v.is_closure()) as c_int
 }
 
+/// Value at idx as a double (integers widen); 0 for non-numbers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_tonumber(U: *const UmbraState, idx: c_int) -> c_double {
     let v = unsafe { (*U).get(idx) };
@@ -190,6 +206,7 @@ pub unsafe extern "C" fn umbra_tonumber(U: *const UmbraState, idx: c_int) -> c_d
     else { 0.0 }
 }
 
+/// Value at idx as an i64 (floats truncate); 0 for non-numbers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_tointeger(U: *const UmbraState, idx: c_int) -> i64 {
     let v = unsafe { (*U).get(idx) };
@@ -198,6 +215,7 @@ pub unsafe extern "C" fn umbra_tointeger(U: *const UmbraState, idx: c_int) -> i6
     else { 0 }
 }
 
+/// Value at idx as a boolean under umbra truthiness (nil and false are false).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_toboolean(U: *const UmbraState, idx: c_int) -> c_int {
     unsafe { (*U).get(idx) }.is_truthy() as c_int
@@ -207,6 +225,7 @@ pub unsafe extern "C" fn umbra_toboolean(U: *const UmbraState, idx: c_int) -> c_
 // and stays valid while the value is on the API stack (or otherwise reachable).
 // RtString's trailing NUL makes this safe as a C string, modulo the usual
 // caveat that an embedded NUL in the Umbra string itself would truncate it.
+/// Value at idx as a C string, or NULL if it isn't a string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_tostring(U: *const UmbraState, idx: c_int) -> *const c_char {
     let v = unsafe { (*U).get(idx) };
@@ -218,6 +237,7 @@ pub unsafe extern "C" fn umbra_tostring(U: *const UmbraState, idx: c_int) -> *co
     }
 }
 
+/// Push the global named `name` (nil if unset or name is NULL). Stack: +1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_getglobal(U: *mut UmbraState, name: *const c_char) {
     let state = unsafe { &mut *U };
@@ -228,6 +248,7 @@ pub unsafe extern "C" fn umbra_getglobal(U: *mut UmbraState, name: *const c_char
     state.stack_mut().push(v);
 }
 
+/// Pop the top value and store it as the global named `name`. Stack: -1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_setglobal(U: *mut UmbraState, name: *const c_char) {
     let state = unsafe { &mut *U };
@@ -243,6 +264,8 @@ pub unsafe extern "C" fn umbra_setglobal(U: *mut UmbraState, name: *const c_char
     }
 }
 
+/// Compile and run a source string; on error pushes the error value and
+/// returns UMBRA_ERR_SYNTAX (parse/compile) or UMBRA_ERR_RUNTIME.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_dostring(U: *mut UmbraState, src: *const c_char) -> c_int {
     let state = unsafe { &mut *U };
@@ -286,8 +309,8 @@ pub unsafe extern "C" fn umbra_dostring(U: *mut UmbraState, src: *const c_char) 
     }
 }
 
-// Convention: call the function at `-(nargs+1)`, popping it and its args.
-// On success pushes `nres` results (-1 = all); on error pushes the error message.
+/// Call the function at -(nargs+1), popping it and its args; pushes nres
+/// results (-1 = all) on success, or the error value on failure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pcall(U: *mut UmbraState, nargs: c_int, nres: c_int) -> c_int {
     let state = unsafe { &mut *U };
@@ -328,11 +351,13 @@ pub unsafe extern "C" fn umbra_pcall(U: *mut UmbraState, nargs: c_int, nres: c_i
     }
 }
 
+/// Run a full GC collection cycle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_gc_collect(U: *mut UmbraState) {
     unsafe { (*U).vm.gc_collect(); }
 }
 
+/// Set the object-count threshold that triggers automatic collection.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_gc_setstep(U: *mut UmbraState, threshold: usize) {
     unsafe { (*U).vm.gc.threshold = threshold; }
@@ -354,11 +379,14 @@ pub unsafe extern "C" fn umbra_set_max_objects(U: *mut UmbraState, limit: usize)
     unsafe { (*U).vm.set_max_objects(limit); }
 }
 
+/// Number of live GC-tracked objects.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_gc_livecount(U: *const UmbraState) -> usize {
     unsafe { (*U).vm.gc.live_count() }
 }
 
+/// Register f as a global callable; f gets a fresh frame with args at 1..n
+/// and returns the number of results pushed (negative = error).
 // The wrapper gives f its own frame: args are pushed above api_base, and
 // whatever f leaves on the stack beyond its declared results is discarded.
 // A returned count larger than what f actually pushed is clamped to the frame.
