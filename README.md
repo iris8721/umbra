@@ -76,6 +76,9 @@ Host-facing safety knobs: an instruction-step budget
 (`umbra_set_max_objects`), and panic containment — a Rust panic inside the VM
 is caught and surfaced as a script error rather than unwinding into the host.
 
+The reasoning and measured costs behind the major decisions are in
+[DESIGN.md](DESIGN.md).
+
 ## Building
 
 ```sh
@@ -83,8 +86,24 @@ cargo build --release
 ```
 
 Produces `libumbra` as both a `cdylib` (for C hosts) and an `rlib` (for Rust
-hosts). `umbra.h` is emitted by `build.rs` — cbindgen doesn't yet handle Rust
-2024's `#[unsafe(no_mangle)]`, so the header is generated programmatically.
+hosts), plus the `umbra` command-line binary. `umbra.h` is emitted by
+`build.rs` — cbindgen doesn't yet handle Rust 2024's `#[unsafe(no_mangle)]`,
+so the header is generated programmatically.
+
+## Running scripts
+
+```sh
+umbra file.umbra [args...]   # run a script; args land in the global `arg` table
+umbra -e 'print(1 + 1)'      # evaluate a string
+umbra                        # REPL: expressions print their value, Ctrl-D exits
+```
+
+`arg` follows Lua's convention: `arg[0]` is the script path, `arg[1..]` its
+arguments, `arg[-1]` the interpreter. Errors print to stderr with exit code 1.
+
+```sh
+cargo run --release -- example/nqueens.umbra
+```
 
 ## Embedding from C
 
@@ -114,7 +133,7 @@ cd example && make run-word-count
 
 ## Example scripts
 
-Runnable `.umbra` programs in `example/`:
+Runnable `.umbra` programs in `example/` — e.g. `umbra example/nqueens.umbra`:
 
 - `bank_account.umbra` — prototype-based OOP: classes, inheritance, method
   calls, string interpolation
