@@ -1,0 +1,155 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Umbra",
+  "scopeName": "source.umbra",
+  "fileTypes": ["umbra"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#labels" },
+    { "include": "#attributes" },
+    { "include": "#operators" },
+    { "include": "#functions" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.umbra",
+          "begin": "/\\*",
+          "end": "\\*/"
+        },
+        {
+          "name": "comment.line.at.umbra",
+          "match": "@.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.umbra",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "include": "#escapes" },
+            { "include": "#interpolation" }
+          ]
+        },
+        {
+          "name": "string.quoted.single.umbra",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            { "include": "#escapes" },
+            { "include": "#interpolation" }
+          ]
+        }
+      ]
+    },
+    "escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.umbra",
+          "match": "\\\\(u\\{[0-9a-fA-F]+\\}|x[0-9a-fA-F]{2}|.)"
+        }
+      ]
+    },
+    "interpolation": {
+      "patterns": [
+        {
+          "name": "meta.interpolation.umbra",
+          "begin": "\\$\\{",
+          "end": "\\}",
+          "beginCaptures": {
+            "0": { "name": "punctuation.section.interpolation.begin.umbra" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.section.interpolation.end.umbra" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#strings" },
+            { "include": "#numbers" },
+            { "include": "#keywords" },
+            { "include": "#operators" }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.umbra",
+          "match": "\\b0[xX][0-9a-fA-F_]+(\\.[0-9a-fA-F_]*)?([pP][+-]?[0-9]+)?\\b"
+        },
+        {
+          "name": "constant.numeric.float.umbra",
+          "match": "\\b[0-9][0-9_]*(\\.[0-9_]+)?([eE][+-]?[0-9]+)?\\b|\\.[0-9][0-9_]*([eE][+-]?[0-9]+)?\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.umbra",
+          "match": "\\b(if|else|while|for|in|return|break|continue|switch|case|goto|repeat|until|yield)\\b"
+        },
+        {
+          "name": "storage.type.umbra",
+          "match": "\\b(let|var|fn)\\b"
+        },
+        {
+          "name": "keyword.operator.logical.umbra",
+          "match": "\\b(and|or|not)\\b"
+        },
+        {
+          "name": "constant.language.umbra",
+          "match": "\\b(none|true|false)\\b"
+        },
+        {
+          "name": "variable.language.umbra",
+          "match": "\\b(self|\\.\\.\\.)\\b"
+        }
+      ]
+    },
+    "labels": {
+      "patterns": [
+        {
+          "name": "entity.name.label.umbra",
+          "match": "::[A-Za-z_][A-Za-z0-9_]*::"
+        }
+      ]
+    },
+    "attributes": {
+      "patterns": [
+        {
+          "name": "storage.modifier.umbra",
+          "match": "<(close|const)>"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.umbra",
+          "match": "(\\+\\+|--|//=|<<=|>>=|\\.\\.=|&=|\\|=|~=|\\^=|\\+=|-=|\\*=|/=|%=|==|!=|<=|>=|//|<<|>>|\\.\\.|&&|\\|\\||[+*/%^#&~|<>=?:.\\-])"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "entity.name.function.umbra",
+          "match": "(?<=\\bfn\\s)[A-Za-z_][A-Za-z0-9_.:]*"
+        },
+        {
+          "name": "support.function.umbra",
+          "match": "\\b(print|tostring|tonumber|type|assert|error|pcall|xpcall|ipairs|pairs|unpack|select|setmetatable|getmetatable|rawget|rawset|rawequal|require|load|next)\\b"
+        }
+      ]
+    }
+  }
+}
