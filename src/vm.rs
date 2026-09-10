@@ -237,6 +237,16 @@ fn alloc_string_val(s: &str) -> Value {
     })
 }
 
+// Mutable byte buffer: the binary-data counterpart of RtString. Not interned
+// (contents change under b[i] = v), no trailing NUL, no cached hash — it is
+// never a table key. Indexed 1-based like strings.
+#[repr(C)] // gc must stay first: the GC reads the header through the object pointer.
+pub struct RtBytes {
+    pub gc: crate::gc::GcHeader,
+    pub len: usize,
+    pub data: Box<[u8]>,
+}
+
 // Boxed i64 for values that don't fit the inline int range; the gc header
 // keeps it on the same heap list as every other object.
 #[repr(C)]
