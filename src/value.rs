@@ -1,34 +1,42 @@
 /// NaN-boxed 64-bit value.
 ///
-/// Layout when in NaN space (top 13 bits all set):
+/// Layout when in NaN space (bits 62..51 all set — the sign bit is NOT part
+/// of the signature, so both NaN halves are tag space):
 ///
-///   [63..51 = 1111_1111_1111_1]  NaN signature  (13 bits)
-///   [50..48]                     type tag        (3 bits)
-///   [47..0]                      payload         (48 bits)
+///   [63]      ┐
+///   [50..48]  ┘ type tag        (4 bits: sign bit + low 3)
+///   [62..51]  1111_1111_1111    NaN signature  (12 bits)
+///   [47..0]                     payload         (48 bits)
 ///
-/// Floats that are not NaN pass through bit-for-bit unchanged.
-/// Heap pointers are assumed to fit in 48 bits (a 4-level paging user-space
-/// address; bit 47 is used to tag C functions, see Vm::make_cfn_val).
-/// Integers outside INLINE_INT_MIN..=INLINE_INT_MAX don't fit the 48-bit
-/// payload; those are heap-boxed as a plain i64 under TAG_BIGINT instead
-/// (see Vm::make_int), so the full i64 range round-trips correctly.
+/// Floats that are not NaN pass through bit-for-bit unchanged (infinities
+/// have bit 51 clear, so they never enter tag space). Heap pointers are
+/// assumed to fit in 48 bits (a 4-level paging user-space address; bit 47
+/// is used to tag C functions, see Vm::make_cfn_val). Integers outside
+/// INLINE_INT_MIN..=INLINE_INT_MAX don't fit the 48-bit payload; those are
+/// heap-boxed as a plain i64 under TAG_BIGINT instead (see Vm::make_int),
+/// so the full i64 range round-trips correctly.
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct Value(u64);
 
+const NAN_MASK:     u64 = 0x7FF8_0000_0000_0000;
 const NAN_BITS:     u64 = 0xFFF8_0000_0000_0000;
 const TAG_SHIFT:    u32 = 48;
 const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-const TAG_INT:       u64 = 0;
-const TAG_MISC:      u64 = 1;
-const TAG_TABLE:     u64 = 2;
-const TAG_STRING:    u64 = 3;
-const TAG_USERDATA:  u64 = 4;
-const TAG_COROUTINE: u64 = 5;
-const TAG_CLOSURE:   u64 = 6;
-const TAG_BIGINT:    u64 = 7;
+// The tag is 4 bits: the sign bit (63) sits above the low 3 bits at 50..48.
+// Sign-set tags (8..15) are the original kinds; sign-clear tags (0..7) are
+// positive-NaN-space kinds, of which only Bytes exists so far.
+const TAG_BYTES:     u64 = 0;
+const TAG_INT:       u64 = 8;
+const TAG_MISC:      u64 = 9;
+const TAG_TABLE:     u64 = 10;
+const TAG_STRING:    u64 = 11;
+const TAG_USERDATA:  u64 = 12;
+const TAG_COROUTINE: u64 = 13;
+const TAG_CLOSURE:   u64 = 14;
+const TAG_BIGINT:    u64 = 15;
 
 // The 48-bit payload can't hold every i64: values outside this range are
 // heap-boxed as a plain `Box<i64>` (see Value::bigint) instead of truncated.
@@ -42,7 +50,7 @@ const MISC_TRUE:  u64 = 2;
 impl Value {
     #[inline(always)]
     fn tagged(tag: u64, payload: u64) -> Self {
-        Self(NAN_BITS | (tag << TAG_SHIFT) | (payload & PAYLOAD_MASK))
+        Self(NAN_BITS | ((tag & 0x7) << TAG_SHIFT) | (payload & PAYLOAD_MASK))
     }
 
     #[inline(always)]
@@ -99,13 +107,18 @@ impl Value {
     }
 
     #[inline(always)]
+    pub fn bytes(ptr: *mut u8) -> Self {
+        Self(NAN_MASK | ((ptr as u64) & PAYLOAD_MASK))
+    }
+
+    #[inline(always)]
     fn is_nan_boxed(self) -> bool {
-        (self.0 & NAN_BITS) == NAN_BITS
+        (self.0 & NAN_MASK) == NAN_MASK
     }
 
     #[inline(always)]
     fn tag(self) -> u64 {
-        (self.0 >> TAG_SHIFT) & 0x7
+        ((self.0 >> TAG_SHIFT) & 0x7) | ((self.0 >> 60) & 0x8)
     }
 
     #[inline(always)]
@@ -135,6 +148,8 @@ impl Value {
     pub fn is_coroutine(self) -> bool { self.is_nan_boxed() && self.tag() == TAG_COROUTINE }
     #[inline(always)]
     pub fn is_closure(self)   -> bool { self.is_nan_boxed() && self.tag() == TAG_CLOSURE }
+    #[inline(always)]
+    pub fn is_bytes(self)     -> bool { self.is_nan_boxed() && self.tag() == TAG_BYTES }
 
     #[inline(always)]
     pub fn as_bool(self) -> Option<bool> {
@@ -212,6 +227,12 @@ impl Value {
     }
 
     #[inline(always)]
+    pub fn as_bytes_ptr(self) -> Option<*mut u8> {
+        if !self.is_bytes() { return None; }
+        Some((self.0 & PAYLOAD_MASK) as *mut u8)
+    }
+
+    #[inline(always)]
     pub fn raw_bits(self) -> u64 { self.0 }
 
     #[inline(always)]
@@ -226,6 +247,7 @@ impl Value {
         else if self.is_table()  { "table" }
         else if self.is_coroutine() { "coroutine" }
         else if self.is_userdata() || self.is_closure() { "function" }
+        else if self.is_bytes()  { "bytes" }
         else { "unknown" }
     }
 }
@@ -302,6 +324,7 @@ impl std::fmt::Debug for Value {
         else if self.is_userdata()  { write!(f, "function({:x})", self.0 & PAYLOAD_MASK) }
         else if self.is_coroutine() { write!(f, "coroutine({:x})", self.0 & PAYLOAD_MASK) }
         else if self.is_closure()   { write!(f, "function({:x})", self.0 & PAYLOAD_MASK) }
+        else if self.is_bytes()     { write!(f, "bytes({:x})", self.0 & PAYLOAD_MASK) }
         else { write!(f, "Value({:#018x})", self.0) }
     }
 }

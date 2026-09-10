@@ -247,6 +247,34 @@ pub struct RtBytes {
     pub data: Box<[u8]>,
 }
 
+fn alloc_bytes_raw(len: usize) -> *mut u8 {
+    let rt = RtBytes { gc: crate::gc::GcHeader::new(crate::gc::GcKind::Bytes), len, data: vec![0u8; len].into_boxed_slice() };
+    Box::into_raw(Box::new(rt)) as *mut u8
+}
+
+fn alloc_bytes_val(bytes: &[u8]) -> Value {
+    CURRENT_VM.with(|c| {
+        let ptr = c.get();
+        let raw = alloc_bytes_raw(bytes.len());
+        unsafe { (*(raw as *mut RtBytes)).data.copy_from_slice(bytes); }
+        if !ptr.is_null() { unsafe { &mut *ptr }.gc.register(raw); }
+        Value::bytes(raw)
+    })
+}
+
+fn alloc_bytes_new(len: usize) -> Value {
+    CURRENT_VM.with(|c| {
+        let ptr = c.get();
+        let raw = alloc_bytes_raw(len);
+        if !ptr.is_null() { unsafe { &mut *ptr }.gc.register(raw); }
+        Value::bytes(raw)
+    })
+}
+
+pub(crate) unsafe fn bytes_ref<'a>(v: Value) -> &'a mut RtBytes {
+    unsafe { &mut *(v.as_bytes_ptr().unwrap() as *mut RtBytes) }
+}
+
 // Boxed i64 for values that don't fit the inline int range; the gc header
 // keeps it on the same heap list as every other object.
 #[repr(C)]
@@ -609,8 +637,9 @@ pub struct Vm {
     pub gc: Gc,
     pub coroutines: Vec<*mut Coroutine>,
     pub owned_protos: Vec<Box<crate::chunk::Proto>>,
-    cfns: Vec<*mut CFunction>,
     pub string_lib: Value,
+    pub bytes_lib: Value,
+    cfns: Vec<*mut CFunction>,
     // Values the embedding host holds on its API stack; rooted like registers.
     pub host_stack: Vec<Value>,
     print_hook: Option<Box<dyn Fn(String)>>,
@@ -713,6 +742,7 @@ impl Vm {
             owned_protos: Vec::new(),
             cfns: Vec::new(),
             string_lib: Value::nil(),
+            bytes_lib: Value::nil(),
             host_stack: Vec::with_capacity(32),
             print_hook,
             poisoned: false,
@@ -788,6 +818,7 @@ impl Vm {
         roots.extend(self.const_strings.iter().copied());
         roots.extend(self.loaded_modules.values().copied());
         roots.push(self.string_lib);
+        roots.push(self.bytes_lib);
         for &ptr in &self.coroutines {
             let co = unsafe { &*ptr };
             if co.status == CoStatus::Dead { continue; }
@@ -1498,6 +1529,20 @@ impl Vm {
                         } else {
                             Value::nil()
                         }
+                    } else if tv.is_bytes() {
+                        if kv.is_int_like() {
+                            let b = unsafe { &*(tv.as_bytes_ptr().unwrap() as *const RtBytes) };
+                            let i = kv.as_int().unwrap();
+                            if i >= 1 && i <= b.len as i64 {
+                                Value::int(b.data[(i - 1) as usize] as i64)
+                            } else {
+                                Value::nil()
+                            }
+                        } else if self.bytes_lib.is_table() {
+                            unsafe { &*(self.bytes_lib.as_table().unwrap() as *const Table) }.raw_get(kv)
+                        } else {
+                            Value::nil()
+                        }
                     } else {
                         return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
                     }
@@ -1520,6 +1565,17 @@ impl Vm {
                             regs = self.regs.as_mut_ptr();
                             ck!();
                         }
+                    } else if tv.is_bytes() {
+                        let b = unsafe { &mut *(tv.as_bytes_ptr().unwrap() as *mut RtBytes) };
+                        let i = match kv.as_int() {
+                            Some(i) if i >= 1 && i <= b.len as i64 => i,
+                            _ => return Err(VmError::RuntimeError("bytes index out of bounds".into())),
+                        };
+                        let n = match vv.as_int() {
+                            Some(n) if (0..=255).contains(&n) => n as u8,
+                            _ => return Err(VmError::RuntimeError("bytes value must be an integer 0-255".into())),
+                        };
+                        b.data[(i - 1) as usize] = n;
                     } else {
                         return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
                     }
@@ -1705,6 +1761,9 @@ impl Vm {
                         if v.is_string() {
                             let s = unsafe { string_ref(v) };
                             R!(a()) = Value::int(s.len() as i64);
+                        } else if v.is_bytes() {
+                            let n = unsafe { (*(v.as_bytes_ptr().unwrap() as *const RtBytes)).len };
+                            R!(a()) = Value::int(n as i64);
                         } else if v.is_table() {
                             let (len, mt_ptr) = {
                                 let t = unsafe { &*(v.as_table().unwrap() as *const Table) };
@@ -2967,14 +3026,17 @@ impl Vm {
             let fmt = str_arg(args, 0, "string.format")?;
             string_format(fmt, if args.len() > 1 { &args[1..] } else { &[] })
         });
-        // Strings must be valid UTF-8 (string_ref uses from_utf8_unchecked), so
-        // the packed blob is hex-encoded rather than raw bytes, unlike Lua.
+        // Packed output is arbitrary binary, so it comes back as a bytes
+        // value — strings stay UTF-8 text. unpack accepts bytes or a string
+        // and returns bytes for its string fields.
         let v_str_pack = self.make_cfn_val(|args| {
             let fmt = str_arg(args, 0, "string.pack")?;
             let mut pvals = Vec::new();
             for &v in args.get(1..).unwrap_or(&[]) {
                 let pv = if v.is_string() {
                     pack::PackValue::Str(unsafe { string_ref(v) }.as_bytes().to_vec())
+                } else if v.is_bytes() {
+                    pack::PackValue::Str(unsafe { bytes_ref(v) }.data.to_vec())
                 } else if v.is_int_like() {
                     pack::PackValue::Int(v.as_int().unwrap())
                 } else if v.is_float() {
@@ -2985,31 +3047,29 @@ impl Vm {
                 pvals.push(pv);
             }
             let bytes = pack::pack(fmt, &pvals).map_err(VmError::RuntimeError)?;
-            Ok(vec![alloc_string_val(&bytes_to_hex(&bytes))])
+            Ok(vec![alloc_bytes_val(&bytes)])
         });
         let v_str_unpack = self.make_cfn_val(|args| {
             let fmt = str_arg(args, 0, "string.unpack")?;
-            let hex = str_arg(args, 1, "string.unpack")?;
-            let bytes = hex_to_bytes(hex)
-                .ok_or_else(|| VmError::RuntimeError("string.unpack: invalid packed data".into()))?;
-            // Lua's posrelatI: negative counts back from the end; 0 or a
-            // position past len+1 is an error, not a silent clamp.
+            let data: &[u8] = match args.get(1) {
+                Some(&v) if v.is_string() => unsafe { string_ref(v) }.as_bytes(),
+                Some(&v) if v.is_bytes() => &unsafe { bytes_ref(v) }.data,
+                _ => return Err(VmError::RuntimeError("string.unpack: bytes or string expected".into())),
+            };
             let init = match args.get(2) { None => 1, Some(&v) => int_arg(v, "string.unpack")? };
-            let start = if init > 0 { init }
-                        else if init != 0 && -init <= bytes.len() as i64 { bytes.len() as i64 + init + 1 }
-                        else { 0 };
-            if start < 1 || start > bytes.len() as i64 + 1 {
-                return Err(VmError::RuntimeError("string.unpack: initial position out of bounds".into()));
-            }
-            let start = (start - 1) as usize;
-            let (vals, end_pos) = pack::unpack(fmt, &bytes, start).map_err(VmError::RuntimeError)?;
+            let (vals, end_pos) = pack::unpack(fmt, data, init).map_err(VmError::RuntimeError)?;
             let mut out: Vec<Value> = vals.into_iter().map(|pv| match pv {
                 pack::PackValue::Int(n) => make_int_via_current_vm(n),
                 pack::PackValue::Float(f) => Value::float(f),
-                pack::PackValue::Str(s) => alloc_string_val(&String::from_utf8_lossy(&s)),
+                pack::PackValue::Str(s) => alloc_bytes_val(&s),
             }).collect();
             out.push(make_int_via_current_vm((end_pos + 1) as i64));
             Ok(out)
+        });
+        let v_str_packsize = self.make_cfn_val(|args| {
+            let fmt = str_arg(args, 0, "string.packsize")?;
+            let n = pack::packsize(fmt).map_err(VmError::RuntimeError)?;
+            Ok(vec![make_int_via_current_vm(n as i64)])
         });
 
         {
@@ -3029,11 +3089,72 @@ impl Vm {
             let k = self.intern("format");  st.raw_set(k, v_str_format);
             let k = self.intern("pack");    st.raw_set(k, v_str_pack);
             let k = self.intern("unpack");  st.raw_set(k, v_str_unpack);
+            let k = self.intern("packsize"); st.raw_set(k, v_str_packsize);
         }
         let str_table_val = Value::table(str_table_ptr);
         self.string_lib = str_table_val;
         let k_string = self.intern("string");
         self.globals.raw_set(k_string, str_table_val);
+
+        let bytes_table_ptr = alloc_table_raw();
+        self.gc.register(bytes_table_ptr);
+
+        let v_bytes_new = self.make_cfn_val(|args| {
+            let n = match args.first() { None => 0, Some(&v) => int_arg(v, "bytes.new")? };
+            if !(0..=MAX_ALLOC_LEN as i64).contains(&n) {
+                return Err(VmError::RuntimeError("bytes.new: invalid size".into()));
+            }
+            Ok(vec![alloc_bytes_new(n as usize)])
+        });
+        let v_bytes_from = self.make_cfn_val(|args| {
+            match args.first() {
+                Some(&v) if v.is_string() => Ok(vec![alloc_bytes_val(unsafe { string_ref(v) }.as_bytes())]),
+                Some(&v) if v.is_bytes() => Ok(vec![alloc_bytes_val(&unsafe { bytes_ref(v) }.data)]),
+                _ => Err(VmError::RuntimeError("bytes.from: string expected".into())),
+            }
+        });
+        let v_bytes_tostring = self.make_cfn_val(|args| {
+            match args.first() {
+                Some(&v) if v.is_bytes() => {
+                    let b = unsafe { &*(v.as_bytes_ptr().unwrap() as *const RtBytes) };
+                    match std::str::from_utf8(&b.data[..b.len]) {
+                        Ok(s) => Ok(vec![alloc_string_val(s)]),
+                        Err(_) => Err(VmError::RuntimeError("bytes.tostring: not valid UTF-8".into())),
+                    }
+                }
+                _ => Err(VmError::RuntimeError("bytes.tostring: bytes expected".into())),
+            }
+        });
+        let v_bytes_concat = self.make_cfn_val(|args| {
+            let mut out = Vec::new();
+            for &v in args {
+                if v.is_bytes() { out.extend_from_slice(&unsafe { bytes_ref(v) }.data); }
+                else if v.is_string() { out.extend_from_slice(unsafe { string_ref(v) }.as_bytes()); }
+                else { return Err(VmError::RuntimeError("bytes.concat: bytes or string expected".into())); }
+            }
+            Ok(vec![alloc_bytes_val(&out)])
+        });
+        let v_bytes_len = self.make_cfn_val(|args| {
+            match args.first() {
+                Some(&v) if v.is_bytes() => {
+                    let n = unsafe { (*(v.as_bytes_ptr().unwrap() as *const RtBytes)).len };
+                    Ok(vec![Value::int(n as i64)])
+                }
+                _ => Err(VmError::RuntimeError("bytes.len: bytes expected".into())),
+            }
+        });
+
+        {
+            let bt = unsafe { &mut *(bytes_table_ptr as *mut Table) };
+            let k = self.intern("new");      bt.raw_set(k, v_bytes_new);
+            let k = self.intern("from");     bt.raw_set(k, v_bytes_from);
+            let k = self.intern("tostring"); bt.raw_set(k, v_bytes_tostring);
+            let k = self.intern("concat");   bt.raw_set(k, v_bytes_concat);
+            let k = self.intern("len");      bt.raw_set(k, v_bytes_len);
+        }
+        self.bytes_lib = Value::table(bytes_table_ptr);
+        let k_bytes = self.intern("bytes");
+        self.globals.raw_set(k_bytes, self.bytes_lib);
 
         let math_table_ptr = alloc_table_raw();
         self.gc.register(math_table_ptr);
@@ -3432,6 +3553,7 @@ impl Vm {
                 Some(&v) if v.is_string() => unsafe { string_ref(v) }.to_owned(),
                 Some(_) => return Err(VmError::RuntimeError("io.open: string expected".into())),
             };
+            let binary = mode.ends_with('b');
             let mode = mode.trim_end_matches('b');
             let mut opts = std::fs::OpenOptions::new();
             match mode {
@@ -3462,7 +3584,7 @@ impl Vm {
                     let fmts: Vec<Value> = if args.len() <= 1 { vec![Value::nil()] } else { args[1..].to_vec() };
                     let mut out = Vec::new();
                     for fv in fmts {
-                        let v = read_file_format(file, &fv)?;
+                        let v = read_file_format(file, &fv, binary)?;
                         if v.is_nil() { return Ok(vec![Value::nil()]); }
                         out.push(v);
                     }
@@ -3481,13 +3603,14 @@ impl Vm {
                     let file = guard.as_mut()
                         .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
                     use std::io::Write;
-                    let mut out = String::new();
+                    let mut out: Vec<u8> = Vec::new();
                     for &v in args.get(1..).unwrap_or(&[]) {
-                        if v.is_string() { out.push_str(unsafe { string_ref(v) }); }
-                        else if v.is_number() { out.push_str(&format!("{v}")); }
-                        else { return Err(VmError::RuntimeError("file:write: string or number expected".into())); }
+                        if v.is_string() { out.extend_from_slice(unsafe { string_ref(v) }.as_bytes()); }
+                        else if v.is_bytes() { out.extend_from_slice(&unsafe { bytes_ref(v) }.data); }
+                        else if v.is_number() { out.extend_from_slice(format!("{v}").as_bytes()); }
+                        else { return Err(VmError::RuntimeError("file:write: string, bytes or number expected".into())); }
                     }
-                    file.write_all(out.as_bytes())
+                    file.write_all(&out)
                         .map_err(|e| VmError::RuntimeError(format!("file:write: {e}")))?;
                     Ok(vec![handle])
                 });
@@ -3513,8 +3636,8 @@ impl Vm {
                                 // reaches EOF.
                                 None => { guard.take(); Ok(vec![Value::nil()]) }
                                 Some(mut l) => {
-                                    while l.ends_with('\n') || l.ends_with('\r') { l.pop(); }
-                                    Ok(vec![alloc_string_val(&l)])
+                                    while l.last().is_some_and(|&c| c == b'\n' || c == b'\r') { l.pop(); }
+                                    Ok(vec![alloc_string_val(&String::from_utf8_lossy(&l))])
                                 }
                             }
                         })
@@ -3548,8 +3671,8 @@ impl Vm {
                     match read_line_from_file(f)? {
                         None => { guard.take(); Ok(vec![Value::nil()]) }
                         Some(mut l) => {
-                            while l.ends_with('\n') || l.ends_with('\r') { l.pop(); }
-                            Ok(vec![alloc_string_val(&l)])
+                            while l.last().is_some_and(|&c| c == b'\n' || c == b'\r') { l.pop(); }
+                            Ok(vec![alloc_string_val(&String::from_utf8_lossy(&l))])
                         }
                     }
                 })
@@ -4003,6 +4126,10 @@ fn coerce_num_str(v: Value) -> String {
 // __tostring-aware stringification shared by print/tostring/string.format.
 fn tostring_value(v: Value) -> VmResult<String> {
     if v.is_string() { return Ok(unsafe { string_ref(v) }.to_owned()); }
+    if v.is_bytes() {
+        let b = unsafe { &*(v.as_bytes_ptr().unwrap() as *const RtBytes) };
+        return Ok(format!("bytes({})", b.len));
+    }
     if v.is_table() {
         let via_mm = with_current_vm(|vm| -> VmResult<Option<String>> {
             let mm = vm.get_mm(v, "__tostring");
@@ -4138,7 +4265,7 @@ fn capture_yield_site(co: &mut Coroutine) {
 // No BufReader: the same File is shared (via Rc<RefCell<>>) between a file
 // handle's read/write closures, and buffering reads would desync an
 // interleaved read/write sequence on "r+"/"w+"/"a+" handles.
-fn read_line_from_file(file: &mut std::fs::File) -> VmResult<Option<String>> {
+fn read_line_from_file(file: &mut std::fs::File) -> VmResult<Option<Vec<u8>>> {
     use std::io::Read;
     let mut bytes: Vec<u8> = Vec::new();
     let mut byte = [0u8; 1];
@@ -4153,7 +4280,7 @@ fn read_line_from_file(file: &mut std::fs::File) -> VmResult<Option<String>> {
         }
     }
     if bytes.is_empty() { return Ok(None); }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    Ok(Some(bytes))
 }
 
 // Lua's str_to_number on a maximal prefix: returns (value, bytes consumed
@@ -4222,7 +4349,7 @@ fn read_number_from_file(file: &mut std::fs::File) -> VmResult<Value> {
     Ok(v)
 }
 
-fn read_file_format(file: &mut std::fs::File, fv: &Value) -> VmResult<Value> {
+fn read_file_format(file: &mut std::fs::File, fv: &Value, binary: bool) -> VmResult<Value> {
     use std::io::{Read, Seek};
     if fv.is_number() {
         let n = int_arg(*fv, "file:read")?;
@@ -4234,7 +4361,7 @@ fn read_file_format(file: &mut std::fs::File, fv: &Value) -> VmResult<Value> {
                 Ok(0) => Ok(Value::nil()),
                 Ok(_) => {
                     let _ = file.seek(std::io::SeekFrom::Current(-1));
-                    Ok(alloc_string_val(""))
+                    Ok(if binary { alloc_bytes_new(0) } else { alloc_string_val("") })
                 }
                 Err(e) => Err(VmError::RuntimeError(format!("file:read: {e}"))),
             };
@@ -4243,7 +4370,7 @@ fn read_file_format(file: &mut std::fs::File, fv: &Value) -> VmResult<Value> {
         let got = file.read(&mut buf).map_err(|e| VmError::RuntimeError(format!("file:read: {e}")))?;
         if got == 0 { return Ok(Value::nil()); }
         buf.truncate(got);
-        return Ok(alloc_string_val(&String::from_utf8_lossy(&buf)));
+        return Ok(if binary { alloc_bytes_val(&buf) } else { alloc_string_val(&String::from_utf8_lossy(&buf)) });
     }
     let fmt = if fv.is_string() {
         unsafe { string_ref(*fv) }.trim_start_matches('*').to_owned()
@@ -4254,22 +4381,23 @@ fn read_file_format(file: &mut std::fs::File, fv: &Value) -> VmResult<Value> {
     };
     match fmt.as_str() {
         "a" => {
-            let mut buf = String::new();
-            file.read_to_string(&mut buf)
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)
                 .map_err(|e| VmError::RuntimeError(format!("file:read: {e}")))?;
-            Ok(alloc_string_val(&buf))
+            Ok(if binary { alloc_bytes_val(&buf) }
+               else { alloc_string_val(&String::from_utf8_lossy(&buf)) })
         }
         "n" => read_number_from_file(file),
         "l" => match read_line_from_file(file)? {
             None => Ok(Value::nil()),
             Some(mut l) => {
-                while l.ends_with('\n') || l.ends_with('\r') { l.pop(); }
-                Ok(alloc_string_val(&l))
+                while l.last().is_some_and(|&c| c == b'\n' || c == b'\r') { l.pop(); }
+                Ok(if binary { alloc_bytes_val(&l) } else { alloc_string_val(&String::from_utf8_lossy(&l)) })
             }
         },
         "L" => match read_line_from_file(file)? {
             None => Ok(Value::nil()),
-            Some(l) => Ok(alloc_string_val(&l)),
+            Some(l) => Ok(if binary { alloc_bytes_val(&l) } else { alloc_string_val(&String::from_utf8_lossy(&l)) }),
         },
         _ => Err(VmError::RuntimeError(format!("file:read: invalid format '{fmt}'"))),
     }
@@ -4324,23 +4452,6 @@ fn read_stdin_format(fv: &Value) -> VmResult<Value> {
     }
 }
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes { s.push_str(&format!("{b:02x}")); }
-    s
-}
-
-fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) { return None; }
-    let sb = s.as_bytes();
-    let mut out = Vec::with_capacity(sb.len() / 2);
-    for chunk in sb.chunks(2) {
-        let hi = (chunk[0] as char).to_digit(16)?;
-        let lo = (chunk[1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-    }
-    Some(out)
-}
 
 fn str_arg<'a>(args: &'a [Value], idx: usize, fn_name: &'static str) -> VmResult<&'a str> {
     match args.get(idx) {

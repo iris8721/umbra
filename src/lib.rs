@@ -1513,9 +1513,9 @@ print(pcall(f))"#,
         assert_output(
             "let le = string.pack(\"<I2\", 1)
             let be = string.pack(\">I2\", 1)
-            print(le)
-            print(be)",
-            &["0100", "0001"],
+            print(le[1], le[2])
+            print(be[1], be[2])",
+            &["1\t0", "0\t1"],
         );
     }
 
@@ -1534,7 +1534,7 @@ print(pcall(f))"#,
         assert_output(
             r#"let packed = string.pack("s1", "hi")
             let s, pos = string.unpack("s1", packed)
-            print(s)
+            print(bytes.tostring(s))
             print(pos)"#,
             &["hi", "4"],
         );
@@ -1545,7 +1545,7 @@ print(pcall(f))"#,
         assert_output(
             r#"let packed = string.pack("c5", "ab")
             print(#packed)"#,
-            &["10"],
+            &["5"],
         );
     }
 
@@ -4131,17 +4131,18 @@ mod stdlib_second_pass_tests {
     fn string_pack_extra_formats_and_strict_ints() {
         assert_output(r#"print(string.unpack("j", string.pack("j", -5)))"#, &["-5\t9"]);
         assert_output(r#"print(string.unpack("n", string.pack("n", 1.5)))"#, &["1.5\t9"]);
-        assert_output(r#"print(string.unpack("z", string.pack("z", "abc")))"#, &["abc\t5"]);
+        assert_output(r#"print(bytes.tostring(string.unpack("z", string.pack("z", "abc"))))"#, &["abc"]);
         assert!(run(r#"string.pack("z", "a\0b")"#).is_err());
         assert!(run(r#"string.pack("b", 1.9)"#).is_err());
-        assert_output(r#"print(string.pack("b", 1.0))"#, &["01"]);
+        assert_output(r#"print(string.pack("b", 1.0)[1])"#, &["1"]);
         assert_output(r#"print(string.unpack("Xi4", string.pack("i4", 7)))"#, &["1"]);
     }
 
     #[test]
     fn string_unpack_position_argument_bounds() {
         assert_output(r#"print(string.unpack("b", string.pack("b", 1), -1))"#, &["1\t2"]);
-        assert!(run(r#"string.unpack("b", string.pack("b", 1), 0)"#).is_err());
+        assert_output(r#"print(string.unpack("b", string.pack("b", 1), 0))"#, &["1\t2"]);
+        assert_output(r#"print(string.unpack("b", string.pack("b", 1), -5))"#, &["1\t2"]);
         assert!(run(r#"string.unpack("b", string.pack("b", 1), 3)"#).is_err());
         assert_output(r#"print(string.unpack("", string.pack("b", 1), 2))"#, &["2"]);
     }
@@ -4262,5 +4263,168 @@ mod stdlib_second_pass_tests {
         assert!(run(r#"string.char(65.5)"#).is_err());
         assert!(run(r#"table.remove({1, 2}, 1.5)"#).is_err());
         assert_output(r#"print(string.sub("abc", 2.0))"#, &["bc"]);
+    }
+}
+
+// bytes type + Lua-5.4-exact string.pack/unpack (byte-level compatibility
+// with real Lua was verified against lua 5.4.7 during development).
+#[cfg(test)]
+mod bytes_and_pack_tests {
+    use super::*;
+
+    fn assert_output(src: &str, expected: &[&str]) {
+        assert_eq!(run_capture(src).unwrap(), expected, "script: {src}");
+    }
+
+
+    #[test]
+    fn bytes_new_from_index_and_len() {
+        assert_output(
+            "let b = bytes.new(4)
+            print(#b, type(b))
+            b[1] = 65
+            b[4] = 255
+            print(b[1], b[2], b[4])
+            print(b[5], b[0])",
+            &["4\tbytes", "65\t0\t255", "nil\tnil"],
+        );
+    }
+
+
+    #[test]
+    fn bytes_index_bounds_and_value_range() {
+        assert!(run("let b = bytes.new(2) b[3] = 1").is_err());
+        assert!(run("let b = bytes.new(2) b[0] = 1").is_err());
+        assert!(run("let b = bytes.new(2) b[1] = 256").is_err());
+        assert!(run("let b = bytes.new(2) b[1] = -1").is_err());
+        assert!(run("let b = bytes.new(2) b[1] = \"x\"").is_err());
+        assert!(run("let b = bytes.new(2) b.x = 1").is_err());
+    }
+
+    #[test]
+    fn bytes_from_tostring_concat() {
+        assert_output(
+            r#"let b = bytes.from("hi")
+            print(#b, b[1], b[2])
+            print(bytes.tostring(b))
+            print(bytes.tostring(bytes.concat(b, "!", b)))
+            print(bytes.len(b))"#,
+            &["2\t104\t105", "hi", "hi!hi", "2"],
+        );
+        assert!(run(r#"bytes.tostring(string.pack("B", 200))"#).is_err());
+        assert!(run("bytes.tostring(\"str\")").is_err());
+        assert!(run("bytes.from(5)").is_err());
+    }
+
+    #[test]
+    fn bytes_method_call_via_index() {
+        assert_output(
+            r#"let b = bytes.from("ab")
+            print(b:tostring())
+            print(b:len())"#,
+            &["ab", "2"],
+        );
+    }
+
+    #[test]
+    fn pack_returns_bytes_matching_lua() {
+        // Expected bytes produced by lua 5.4.7 string.pack on x86-64.
+        assert_output(
+            r#"let b = string.pack("<i4", 0x01020304)
+            print(b[1], b[2], b[3], b[4], #b)
+            let be = string.pack(">i4", 0x01020304)
+            print(be[1], be[2], be[3], be[4])
+            let n = string.pack("=i4", 0x01020304)
+            print(n[1], n[4])"#,
+            &["4\t3\t2\t1\t4", "1\t2\t3\t4", "4\t1"],
+        );
+    }
+
+    #[test]
+    fn pack_alignment_bang_and_x() {
+        // lua: pack("!4bi4",1,2) = 01 000000 02000000; pack("!4bXdd",1,2.5)
+        // pads the double to 4 (maxalign), not 8.
+        assert_output(
+            r#"let b = string.pack("!4bi4", 1, 2)
+            print(#b, b[1], b[5])
+            let d = string.pack("!4bXdd", 1, 2.5)
+            print(#d, d[5], d[12])
+            print(string.packsize("!4bi4"), string.packsize("bXhh"))"#,
+            &["8\t1\t2", "12\t0\t64", "8\t3"],
+        );
+        assert!(run(r#"string.pack("Xc4", "ab")"#).is_err());
+        assert!(run(r#"string.pack("Xz", "ab")"#).is_err());
+        assert!(run(r#"string.pack("!3i4", 5)"#).is_err());
+        assert!(run(r#"string.packsize("i4s1")"#).is_err());
+    }
+
+    #[test]
+    fn pack_wide_ints_and_sign_extension() {
+        // lua: pack("i16",-1) = ff*16; pack("I16",-1) = ff*8 then 00*8.
+        assert_output(
+            r#"let a = string.pack("i16", -1)
+            print(#a, a[1], a[9], a[16])
+            let u = string.pack("I16", -1)
+            print(u[1], u[9], u[16])
+            print(string.unpack("i16", a))"#,
+            &["16\t255\t255\t255", "255\t0\t0", "-1\t17"],
+        );
+        assert!(run(r#"string.unpack("i16", string.pack("I16", -1))"#).is_err());
+        assert!(run(r#"string.pack("i17", 1)"#).is_err());
+        assert!(run(r#"string.pack("i0", 1)"#).is_err());
+    }
+
+    #[test]
+    fn pack_string_formats() {
+        assert_output(
+            r#"let p = string.pack("s2", "hi")
+            print(#p, p[1], p[2], p[3], p[4])
+            print(bytes.tostring(string.unpack("s2", p)))
+            print(#string.unpack("c5", string.pack("c5", "ab")))"#,
+            &["4\t2\t0\t104\t105", "hi", "5"],
+        );
+        assert!(run(r#"string.pack("s1", string.rep("x", 300))"#).is_err());
+        assert!(run(r#"string.pack("c3", "abcd")"#).is_err());
+    }
+
+    #[test]
+    fn unpack_accepts_string_and_bytes() {
+        assert_output(
+            r#"let b = string.pack("<i2", 258)
+            print(string.unpack("<i2", b))
+            print(string.unpack("<i2", bytes.tostring(b)))"#,
+            &["258\t3", "258\t3"],
+        );
+    }
+
+    #[test]
+    fn io_binary_mode_roundtrip() {
+        let path = "umbra_test_bytes_io_xyz.bin";
+        let result = run_capture(&format!(
+            "let f = io.open(\"{path}\", \"wb\")
+            f:write(string.pack(\"<i4\", 0x01020304))
+            f:write(string.pack(\"BB\", 0, 255))
+            f:close()
+            let g = io.open(\"{path}\", \"rb\")
+            let d = g:read(6)
+            print(type(d), #d, d[1], d[4], d[5], d[6])
+            print(string.unpack(\"<i4\", d))
+            g:close()"
+        ));
+        std::fs::remove_file(path).ok();
+        assert_eq!(result.unwrap(), vec!["bytes\t6\t4\t1\t0\t255", "16909060\t5"]);
+    }
+
+    #[test]
+    fn bytes_are_gc_tracked_and_mutable() {
+        // Survives collection and stays mutable afterwards.
+        assert_output(
+            r#"let b = bytes.new(8)
+            b[1] = 7
+            for i = 1, 2000 { let t = {i, i + 1} }
+            b[8] = 9
+            print(b[1], b[8], #b)"#,
+            &["7\t9\t8"],
+        );
     }
 }

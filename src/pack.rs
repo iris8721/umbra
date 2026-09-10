@@ -1,8 +1,14 @@
-// Lua-style string.pack/string.unpack: a subset of Lua 5.3/5.4's format
-// language covering the formats scripts actually reach for (fixed-width
-// integers, floats, fixed and length-prefixed strings, padding, endianness).
-// Not covered: alignment ('!' is parsed and ignored) and platform-native
-// size/endianness detection (native '=' is treated as little-endian).
+// Lua 5.4 string.pack/string.unpack: the full format language — fixed-width
+// and native-size integers, floats, fixed-length/length-prefixed/zero-
+// terminated strings, padding, endianness ('<', '>', '=') and alignment
+// ('!n', 'Xop'). Native sizes match Lua on a 64-bit build: int 4, long/
+// lua_Integer/size_t 8, float 4, double/lua_Number 8, native alignment 8.
+
+// Widest integer size the format accepts ('i16', 's16', '!16').
+const MAXINTSIZE: usize = 16;
+// offsetof(struct { char c; union { maxalign_t } u; }, u) on x86-64.
+const NATIVE_ALIGN: usize = 8;
+const NATIVE_LITTLE: bool = true;
 
 #[derive(Debug, Clone)]
 pub enum PackValue {
@@ -16,8 +22,8 @@ fn as_int(v: &PackValue) -> Result<i64, String> {
         PackValue::Int(n) => Ok(*n),
         PackValue::Float(f) if f.fract() == 0.0
             && *f >= -9223372036854775808.0 && *f < 9223372036854775808.0 => Ok(*f as i64),
-        PackValue::Float(_) => Err("string.pack: number has no integer representation".to_string()),
-        PackValue::Str(_) => Err("string.pack: number expected".to_string()),
+        PackValue::Float(_) => Err("number has no integer representation".to_string()),
+        PackValue::Str(_) => Err("number expected".to_string()),
     }
 }
 
@@ -25,244 +31,321 @@ fn as_float(v: &PackValue) -> Result<f64, String> {
     match v {
         PackValue::Int(n) => Ok(*n as f64),
         PackValue::Float(f) => Ok(*f),
-        PackValue::Str(_) => Err("string.pack: number expected".to_string()),
+        PackValue::Str(_) => Err("number expected".to_string()),
     }
 }
 
 fn as_bytes(v: &PackValue) -> Result<&[u8], String> {
     match v {
         PackValue::Str(s) => Ok(s),
-        _ => Err("string.pack: string expected".to_string()),
+        _ => Err("string expected".to_string()),
     }
 }
 
-fn read_size(fmt: &[u8], i: &mut usize, default: usize) -> usize {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opt {
+    Int,      // b h l j i[n]
+    Uint,     // B H L J T I[n]
+    F32,      // f
+    F64,      // d n
+    Chars,    // c[n]
+    LenStr,   // s[n]
+    ZStr,     // z
+    Pad,      // x
+    PadAlign, // X<op>
+    Nop,      // space, < > = !
+}
+
+struct Header {
+    little: bool,
+    maxalign: usize,
+}
+
+// getnum: digits or the default; saturates so an overflowing numeral fails
+// the caller's range check instead of wrapping.
+fn read_num(fmt: &[u8], i: &mut usize, default: usize) -> usize {
     let start = *i;
-    while *i < fmt.len() && fmt[*i].is_ascii_digit() { *i += 1; }
-    if *i == start { default } else {
-        // Saturate rather than silently fall back: an overflowing size must
-        // fail the format's own range check, not be read as the default.
-        std::str::from_utf8(&fmt[start..*i]).unwrap().parse().unwrap_or(usize::MAX)
+    let mut n: usize = 0;
+    while *i < fmt.len() && fmt[*i].is_ascii_digit() {
+        n = n.saturating_mul(10).saturating_add((fmt[*i] - b'0') as usize);
+        *i += 1;
     }
+    if *i == start { default } else { n }
 }
 
-fn read_required_size(fmt: &[u8], i: &mut usize, opt: char) -> Result<usize, String> {
-    let start = *i;
-    while *i < fmt.len() && fmt[*i].is_ascii_digit() { *i += 1; }
-    if *i == start { return Err(format!("string.pack: missing size for '{opt}'")); }
-    std::str::from_utf8(&fmt[start..*i]).unwrap().parse()
-        .map_err(|_| format!("string.pack: bad size for '{opt}'"))
+// getnumlimit: sizes for i/I/s/! must be in 1..=MAXINTSIZE.
+fn read_num_limit(fmt: &[u8], i: &mut usize, default: usize, who: &str) -> Result<usize, String> {
+    let n = read_num(fmt, i, default);
+    if n == 0 || n > MAXINTSIZE {
+        return Err(format!("{who}: integral size ({n}) out of limits [1,{MAXINTSIZE}]"));
+    }
+    Ok(n)
 }
 
-fn push_int_bytes(out: &mut Vec<u8>, n: i64, size: usize, signed: bool, little: bool) -> Result<(), String> {
-    if size == 0 || size > 8 { return Err(format!("string.pack: unsupported integer size {size}")); }
-    if size < 8 {
-        let bits = size as u32 * 8;
-        let in_range = if signed {
-            n >= -(1i64 << (bits - 1)) && n < (1i64 << (bits - 1))
-        } else {
-            n >= 0 && n < (1i64 << bits)
-        };
-        if !in_range {
-            return Err(format!("string.pack: integer overflow for {}-byte {}", size, if signed { "signed" } else { "unsigned" }));
+fn getoption(h: &mut Header, fmt: &[u8], i: &mut usize, who: &str) -> Result<(Opt, usize), String> {
+    let c = fmt[*i];
+    *i += 1;
+    let (opt, size) = match c {
+        b'b' => (Opt::Int, 1),
+        b'B' => (Opt::Uint, 1),
+        b'h' => (Opt::Int, 2),
+        b'H' => (Opt::Uint, 2),
+        b'l' => (Opt::Int, 8),
+        b'L' => (Opt::Uint, 8),
+        b'j' => (Opt::Int, 8),
+        b'J' => (Opt::Uint, 8),
+        b'T' => (Opt::Uint, 8),
+        b'f' => (Opt::F32, 4),
+        b'n' | b'd' => (Opt::F64, 8),
+        b'i' => (Opt::Int, read_num_limit(fmt, i, 4, who)?),
+        b'I' => (Opt::Uint, read_num_limit(fmt, i, 4, who)?),
+        b's' => (Opt::LenStr, read_num_limit(fmt, i, 8, who)?),
+        b'c' => {
+            let start = *i;
+            let n = read_num(fmt, i, 0);
+            if *i == start {
+                return Err(format!("{who}: missing size for format option 'c'"));
+            }
+            (Opt::Chars, n)
         }
-    } else if !signed && n < 0 {
-        return Err("string.pack: unsigned overflow".into());
+        b'z' => (Opt::ZStr, 0),
+        b'x' => (Opt::Pad, 1),
+        b'X' => (Opt::PadAlign, 0),
+        b' ' => (Opt::Nop, 0),
+        b'<' => { h.little = true; (Opt::Nop, 0) }
+        b'>' => { h.little = false; (Opt::Nop, 0) }
+        b'=' => { h.little = NATIVE_LITTLE; (Opt::Nop, 0) }
+        b'!' => { h.maxalign = read_num_limit(fmt, i, NATIVE_ALIGN, who)?; (Opt::Nop, 0) }
+        _ => return Err(format!("{who}: invalid format option '{}'", c as char)),
+    };
+    Ok((opt, size))
+}
+
+// getdetails: the option, its size, and the padding needed to align it.
+// Alignment follows size, capped at maxalign; 'X' takes its alignment from
+// the option that follows it (which is consumed but packs/skips nothing).
+fn getdetails(h: &mut Header, fmt: &[u8], i: &mut usize, totalsize: usize, who: &str)
+    -> Result<(Opt, usize, usize), String>
+{
+    let (opt, size) = getoption(h, fmt, i, who)?;
+    let mut align = size;
+    if opt == Opt::PadAlign {
+        if *i >= fmt.len() {
+            return Err(format!("{who}: invalid next option for option 'X'"));
+        }
+        let (next, next_size) = getoption(h, fmt, i, who)?;
+        if next == Opt::Chars || next_size == 0 {
+            return Err(format!("{who}: invalid next option for option 'X'"));
+        }
+        align = next_size;
     }
-    let full = n.to_le_bytes();
-    if little {
-        out.extend_from_slice(&full[..size]);
+    let ntoalign = if align <= 1 || opt == Opt::Chars {
+        0
     } else {
-        out.extend(full[..size].iter().rev());
+        if align > h.maxalign { align = h.maxalign; }
+        if align & (align - 1) != 0 {
+            return Err(format!("{who}: format asks for alignment not power of 2"));
+        }
+        (align - (totalsize & (align - 1))) & (align - 1)
+    };
+    Ok((opt, size, ntoalign))
+}
+
+// packint: low 8 bytes of n in the chosen endianness; bytes past 8 are the
+// sign extension for negative signed values, zero otherwise.
+fn push_int(out: &mut Vec<u8>, n: i64, size: usize, little: bool, neg: bool) {
+    let b = n.to_le_bytes();
+    let at = |k: usize| if k < 8 { b[k] } else if neg { 0xFF } else { 0 };
+    if little {
+        for k in 0..size { out.push(at(k)); }
+    } else {
+        for k in (0..size).rev() { out.push(at(k)); }
     }
-    Ok(())
 }
 
 pub fn pack(fmt: &str, args: &[PackValue]) -> Result<Vec<u8>, String> {
+    const WHO: &str = "string.pack";
     let f = fmt.as_bytes();
+    let mut h = Header { little: NATIVE_LITTLE, maxalign: 1 };
     let mut i = 0;
-    let mut little = true;
     let mut arg_i = 0;
     let mut out = Vec::new();
 
     macro_rules! next_arg {
         () => {{
-            let v = args.get(arg_i).ok_or_else(|| "string.pack: not enough arguments".to_string())?;
+            let v = args.get(arg_i).ok_or_else(|| format!("{WHO}: too few arguments"))?;
             arg_i += 1;
             v
         }};
     }
 
     while i < f.len() {
-        let c = f[i]; i += 1;
-        match c {
-            b' ' => {}
-            b'<' => little = true,
-            b'>' => little = false,
-            b'=' => little = true,
-            b'!' => { while i < f.len() && f[i].is_ascii_digit() { i += 1; } }
-            b'b' | b'B' => push_int_bytes(&mut out, as_int(next_arg!())?, 1, c == b'b', little)?,
-            b'h' | b'H' => push_int_bytes(&mut out, as_int(next_arg!())?, 2, c == b'h', little)?,
-            b'i' | b'I' => {
-                let size = read_size(f, &mut i, 4);
-                push_int_bytes(&mut out, as_int(next_arg!())?, size, c == b'i', little)?;
+        let (opt, size, ntoalign) = getdetails(&mut h, f, &mut i, out.len(), WHO)?;
+        out.resize(out.len() + ntoalign, 0);
+        match opt {
+            Opt::Int => {
+                let n = as_int(next_arg!()).map_err(|e| format!("{WHO}: {e}"))?;
+                if size < 8 {
+                    let lim = 1i64 << (size * 8 - 1);
+                    if n < -lim || n >= lim {
+                        return Err(format!("{WHO}: integer overflow"));
+                    }
+                }
+                push_int(&mut out, n, size, h.little, n < 0);
             }
-            b'l' | b'L' | b'j' | b'J' | b'T' => {
-                // j/J are lua_Integer (i64 here); T is size_t — all 8 bytes.
-                push_int_bytes(&mut out, as_int(next_arg!())?, 8, c != b'J' && c != b'L' && c != b'T', little)?
+            Opt::Uint => {
+                let n = as_int(next_arg!()).map_err(|e| format!("{WHO}: {e}"))?;
+                if size < 8 && (n as u64) >= (1u64 << (size * 8)) {
+                    return Err(format!("{WHO}: unsigned overflow"));
+                }
+                push_int(&mut out, n, size, h.little, false);
             }
-            b'n' => {
-                let v = as_float(next_arg!())?;
-                out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
+            Opt::F32 => {
+                let v = as_float(next_arg!()).map_err(|e| format!("{WHO}: {e}"))? as f32;
+                out.extend_from_slice(&if h.little { v.to_le_bytes() } else { v.to_be_bytes() });
             }
-            b'f' => {
-                let v = as_float(next_arg!())? as f32;
-                out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
+            Opt::F64 => {
+                let v = as_float(next_arg!()).map_err(|e| format!("{WHO}: {e}"))?;
+                out.extend_from_slice(&if h.little { v.to_le_bytes() } else { v.to_be_bytes() });
             }
-            b'd' => {
-                let v = as_float(next_arg!())?;
-                out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
-            }
-            b'c' => {
-                let n = read_required_size(f, &mut i, 'c')?;
-                if n > crate::vm::MAX_ALLOC_LEN { return Err(format!("string.pack: 'c{n}' too large")); }
-                let s = as_bytes(next_arg!())?;
-                if s.len() > n { return Err(format!("string.pack: string longer than 'c{n}'")); }
+            Opt::Chars => {
+                if size > crate::vm::MAX_ALLOC_LEN {
+                    return Err(format!("{WHO}: 'c{size}' too large"));
+                }
+                let s = as_bytes(next_arg!()).map_err(|e| format!("{WHO}: {e}"))?;
+                if s.len() > size {
+                    return Err(format!("{WHO}: string longer than given size"));
+                }
                 out.extend_from_slice(s);
-                out.resize(out.len() + (n - s.len()), 0);
+                out.resize(out.len() + (size - s.len()), 0);
             }
-            b's' => {
-                let size = read_size(f, &mut i, 8);
-                let s = as_bytes(next_arg!())?.to_vec();
-                push_int_bytes(&mut out, s.len() as i64, size, false, little)?;
-                out.extend_from_slice(&s);
+            Opt::LenStr => {
+                let s = as_bytes(next_arg!()).map_err(|e| format!("{WHO}: {e}"))?;
+                if size < 8 && s.len() as u64 >= (1u64 << (size * 8)) {
+                    return Err(format!("{WHO}: string length does not fit in given size"));
+                }
+                push_int(&mut out, s.len() as i64, size, h.little, false);
+                out.extend_from_slice(s);
             }
-            b'x' => out.push(0),
-            b'z' => {
-                let s = as_bytes(next_arg!())?;
-                if s.contains(&0) { return Err("string.pack: 'z' string contains zeros".into()); }
+            Opt::ZStr => {
+                let s = as_bytes(next_arg!()).map_err(|e| format!("{WHO}: {e}"))?;
+                if s.contains(&0) {
+                    return Err(format!("{WHO}: string contains zeros"));
+                }
                 out.extend_from_slice(s);
                 out.push(0);
             }
-            b'X' => {
-                // Consumes the next option (plus any size digits) as its
-                // operand but packs nothing for it.
-                let op = *f.get(i).ok_or("string.pack: missing format option after 'X'")?;
-                if matches!(op, b'<' | b'>' | b'=' | b'!' | b' ' | b'X') {
-                    return Err(format!("string.pack: invalid format option 'X{}'", op as char));
-                }
-                i += 1;
-                while i < f.len() && f[i].is_ascii_digit() { i += 1; }
-            }
-            _ => return Err(format!("string.pack: invalid format option '{}'", c as char)),
+            Opt::Pad => out.push(0),
+            Opt::PadAlign | Opt::Nop => {}
         }
     }
     Ok(out)
 }
 
-fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], String> {
-    if pos.checked_add(n).is_none_or(|end| end > data.len()) {
-        return Err("string.unpack: data string too short".to_string());
+// unpackint: low min(size,8) bytes become the value; a signed value under 8
+// bytes sign-extends, and bytes past 8 must all match the sign extension.
+fn read_int(data: &[u8], pos: usize, size: usize, signed: bool, little: bool) -> Result<i64, String> {
+    let bs = &data[pos..pos + size];
+    let limit = size.min(8);
+    let mut res: u64 = 0;
+    for k in (0..limit).rev() {
+        res <<= 8;
+        res |= bs[if little { k } else { size - 1 - k }] as u64;
     }
-    let s = &data[*pos..*pos + n];
-    *pos += n;
-    Ok(s)
+    if size < 8 {
+        if signed {
+            let mask = 1u64 << (size * 8 - 1);
+            res = (res ^ mask).wrapping_sub(mask);
+        }
+    } else if size > 8 {
+        let ext = if !signed || (res as i64) >= 0 { 0x00 } else { 0xFF };
+        for k in 8..size {
+            if bs[if little { k } else { size - 1 - k }] != ext {
+                return Err(format!("string.unpack: {size}-byte integer does not fit into Lua Integer"));
+            }
+        }
+    }
+    Ok(res as i64)
 }
 
-fn read_int(data: &[u8], pos: &mut usize, size: usize, signed: bool, little: bool) -> Result<i64, String> {
-    if size == 0 || size > 8 { return Err(format!("string.unpack: unsupported integer size {size}")); }
-    let bs = read_bytes(data, pos, size)?;
-    let mut buf = [0u8; 8];
-    let sign_byte;
-    if little {
-        buf[..size].copy_from_slice(bs);
-        sign_byte = bs[size - 1];
-    } else {
-        for (idx, &b) in bs.iter().enumerate() { buf[size - 1 - idx] = b; }
-        sign_byte = bs[0];
-    }
-    if signed && size < 8 && (sign_byte & 0x80) != 0 {
-        for b in &mut buf[size..] { *b = 0xFF; }
-    }
-    Ok(i64::from_le_bytes(buf))
+// posrelatI: 1-based position; 0 and positions before the start clip to 1.
+fn pos_relat(init: i64, len: usize) -> i64 {
+    if init > 0 { init }
+    else if init == 0 || -init > len as i64 { 1 }
+    else { len as i64 + init + 1 }
 }
 
 /// Returns the unpacked values and the byte position just past the last one
-/// consumed (0-based, matching `start`).
-pub fn unpack(fmt: &str, data: &[u8], start: usize) -> Result<(Vec<PackValue>, usize), String> {
+/// consumed (0-based; the caller adds 1 for the 1-based result).
+pub fn unpack(fmt: &str, data: &[u8], start: i64) -> Result<(Vec<PackValue>, usize), String> {
+    const WHO: &str = "string.unpack";
+    let pos0 = pos_relat(start, data.len());
+    if pos0 > data.len() as i64 + 1 {
+        return Err(format!("{WHO}: initial position out of string"));
+    }
     let f = fmt.as_bytes();
+    let mut h = Header { little: NATIVE_LITTLE, maxalign: 1 };
     let mut i = 0;
-    let mut little = true;
-    let mut pos = start;
+    let mut pos = (pos0 - 1) as usize;
     let mut results = Vec::new();
 
     while i < f.len() {
-        let c = f[i]; i += 1;
-        match c {
-            b' ' => {}
-            b'<' => little = true,
-            b'>' => little = false,
-            b'=' => little = true,
-            b'!' => { while i < f.len() && f[i].is_ascii_digit() { i += 1; } }
-            b'b' => results.push(PackValue::Int(read_int(data, &mut pos, 1, true, little)?)),
-            b'B' => results.push(PackValue::Int(read_int(data, &mut pos, 1, false, little)?)),
-            b'h' => results.push(PackValue::Int(read_int(data, &mut pos, 2, true, little)?)),
-            b'H' => results.push(PackValue::Int(read_int(data, &mut pos, 2, false, little)?)),
-            b'i' => {
-                let size = read_size(f, &mut i, 4);
-                results.push(PackValue::Int(read_int(data, &mut pos, size, true, little)?));
-            }
-            b'I' => {
-                let size = read_size(f, &mut i, 4);
-                results.push(PackValue::Int(read_int(data, &mut pos, size, false, little)?));
-            }
-            b'l' | b'j' | b'T' => results.push(PackValue::Int(read_int(data, &mut pos, 8, true, little)?)),
-            b'L' | b'J' => results.push(PackValue::Int(read_int(data, &mut pos, 8, false, little)?)),
-            b'n' => {
-                let bs = read_bytes(data, &mut pos, 8)?;
-                let arr: [u8; 8] = bs.try_into().unwrap();
-                let v = if little { f64::from_le_bytes(arr) } else { f64::from_be_bytes(arr) };
-                results.push(PackValue::Float(v));
-            }
-            b'f' => {
-                let bs = read_bytes(data, &mut pos, 4)?;
-                let arr: [u8; 4] = bs.try_into().unwrap();
-                let v = if little { f32::from_le_bytes(arr) } else { f32::from_be_bytes(arr) };
+        let (opt, size, ntoalign) = getdetails(&mut h, f, &mut i, pos, WHO)?;
+        if ntoalign + size > data.len() - pos {
+            return Err(format!("{WHO}: data string too short"));
+        }
+        pos += ntoalign;
+        match opt {
+            Opt::Int => results.push(PackValue::Int(read_int(data, pos, size, true, h.little)?)),
+            Opt::Uint => results.push(PackValue::Int(read_int(data, pos, size, false, h.little)?)),
+            Opt::F32 => {
+                let arr: [u8; 4] = data[pos..pos + 4].try_into().unwrap();
+                let v = if h.little { f32::from_le_bytes(arr) } else { f32::from_be_bytes(arr) };
                 results.push(PackValue::Float(v as f64));
             }
-            b'd' => {
-                let bs = read_bytes(data, &mut pos, 8)?;
-                let arr: [u8; 8] = bs.try_into().unwrap();
-                let v = if little { f64::from_le_bytes(arr) } else { f64::from_be_bytes(arr) };
+            Opt::F64 => {
+                let arr: [u8; 8] = data[pos..pos + 8].try_into().unwrap();
+                let v = if h.little { f64::from_le_bytes(arr) } else { f64::from_be_bytes(arr) };
                 results.push(PackValue::Float(v));
             }
-            b'c' => {
-                let n = read_required_size(f, &mut i, 'c')?;
-                results.push(PackValue::Str(read_bytes(data, &mut pos, n)?.to_vec()));
+            Opt::Chars => results.push(PackValue::Str(data[pos..pos + size].to_vec())),
+            Opt::LenStr => {
+                let len = read_int(data, pos, size, false, h.little)? as usize;
+                if len > data.len() - pos - size {
+                    return Err(format!("{WHO}: data string too short"));
+                }
+                results.push(PackValue::Str(data[pos + size..pos + size + len].to_vec()));
+                pos += len;
             }
-            b's' => {
-                let size = read_size(f, &mut i, 8);
-                let len = read_int(data, &mut pos, size, false, little)? as usize;
-                results.push(PackValue::Str(read_bytes(data, &mut pos, len)?.to_vec()));
-            }
-            b'x' => { read_bytes(data, &mut pos, 1)?; }
-            b'z' => {
+            Opt::ZStr => {
                 let end = data[pos..].iter().position(|&b| b == 0)
                     .map(|p| pos + p)
-                    .ok_or("string.unpack: unfinished string for format 'z'")?;
+                    .ok_or_else(|| format!("{WHO}: unfinished string for format 'z'"))?;
                 results.push(PackValue::Str(data[pos..end].to_vec()));
-                pos = end + 1;
+                pos += end - pos + 1;
             }
-            b'X' => {
-                let op = *f.get(i).ok_or("string.unpack: missing format option after 'X'")?;
-                if matches!(op, b'<' | b'>' | b'=' | b'!' | b' ' | b'X') {
-                    return Err(format!("string.unpack: invalid format option 'X{}'", op as char));
-                }
-                i += 1;
-                while i < f.len() && f[i].is_ascii_digit() { i += 1; }
-            }
-            _ => return Err(format!("string.unpack: invalid format option '{}'", c as char)),
+            Opt::Pad | Opt::PadAlign | Opt::Nop => {}
         }
+        pos += size;
     }
     Ok((results, pos))
+}
+
+/// string.packsize: total bytes a format packs, or an error for the
+/// variable-length options ('s', 'z').
+pub fn packsize(fmt: &str) -> Result<usize, String> {
+    const WHO: &str = "string.packsize";
+    let f = fmt.as_bytes();
+    let mut h = Header { little: NATIVE_LITTLE, maxalign: 1 };
+    let mut i = 0;
+    let mut total = 0usize;
+    while i < f.len() {
+        let (opt, size, ntoalign) = getdetails(&mut h, f, &mut i, total, WHO)?;
+        if opt == Opt::LenStr || opt == Opt::ZStr {
+            return Err(format!("{WHO}: variable-length format"));
+        }
+        total = total.checked_add(ntoalign + size)
+            .ok_or_else(|| format!("{WHO}: format result too large"))?;
+    }
+    Ok(total)
 }

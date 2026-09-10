@@ -5,7 +5,7 @@ use crate::vm::FxMap;
 pub enum GcColor { White, Gray, Black }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum GcKind { Str, Table, Closure, BigInt }
+pub enum GcKind { Str, Table, Closure, BigInt, Bytes }
 
 // Every heap object starts with this header (the structs in vm.rs are
 // repr(C) with `gc` first, so the object pointer IS the header pointer).
@@ -249,7 +249,7 @@ impl Gc {
                 h.kind
             };
             match kind {
-                GcKind::Str | GcKind::BigInt => {}
+                GcKind::Str | GcKind::BigInt | GcKind::Bytes => {}
                 GcKind::Table   => self.propagate_table(ptr),
                 GcKind::Closure => self.propagate_closure(ptr),
             }
@@ -281,6 +281,7 @@ impl Gc {
             else if v.is_table() { v.as_table() }
             else if v.is_closure() { v.as_closure() }
             else if v.is_bigint() { v.as_bigint() }
+            else if v.is_bytes() { v.as_bytes_ptr() }
             else { None };
         let Some(ptr) = ptr else { return };
         let h = unsafe { &mut *(ptr as *mut GcHeader) };
@@ -288,7 +289,7 @@ impl Gc {
         match h.kind {
             // Leaf kinds have no outgoing edges: straight to black, no gray
             // round-trip through propagate().
-            GcKind::Str | GcKind::BigInt => { h.color = GcColor::Black; }
+            GcKind::Str | GcKind::BigInt | GcKind::Bytes => { h.color = GcColor::Black; }
             _ => {
                 h.color = GcColor::Gray;
                 self.gray_list.push(ptr as usize);
@@ -378,6 +379,7 @@ impl Gc {
             else if v.is_table() { v.as_table() }
             else if v.is_closure() { v.as_closure() }
             else if v.is_bigint() { v.as_bigint() }
+            else if v.is_bytes() { v.as_bytes_ptr() }
             else { None };
         match ptr {
             Some(p) => unsafe { (*(p as *const GcHeader)).color == GcColor::White },
@@ -387,13 +389,14 @@ impl Gc {
 }
 
 fn free_object(ptr: usize, kind: GcKind) {
-    use crate::vm::{GcBigInt, LuaClosure, RtString, Table};
+    use crate::vm::{GcBigInt, LuaClosure, RtBytes, RtString, Table};
     unsafe {
         match kind {
             GcKind::Str     => drop(Box::from_raw(ptr as *mut RtString)),
             GcKind::Table   => drop(Box::from_raw(ptr as *mut Table)),
             GcKind::Closure => drop(Box::from_raw(ptr as *mut LuaClosure)),
             GcKind::BigInt  => drop(Box::from_raw(ptr as *mut GcBigInt)),
+            GcKind::Bytes   => drop(Box::from_raw(ptr as *mut RtBytes)),
         }
     }
 }
@@ -403,7 +406,7 @@ fn free_object(ptr: usize, kind: GcKind) {
 // vec) plus the struct itself. Capacities, not lengths — the pacing question
 // is how much memory is outstanding, not how full each buffer is.
 fn object_bytes(ptr: usize, kind: GcKind) -> usize {
-    use crate::vm::{GcBigInt, LuaClosure, RtString, Table};
+    use crate::vm::{GcBigInt, LuaClosure, RtBytes, RtString, Table};
     unsafe {
         match kind {
             GcKind::Str => {
@@ -422,6 +425,10 @@ fn object_bytes(ptr: usize, kind: GcKind) -> usize {
                     + c.upvals.capacity() * std::mem::size_of::<Value>()
             }
             GcKind::BigInt => std::mem::size_of::<GcBigInt>(),
+            GcKind::Bytes => {
+                let b = &*(ptr as *const RtBytes);
+                std::mem::size_of::<RtBytes>() + b.data.len()
+            }
         }
     }
 }
