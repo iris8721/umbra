@@ -81,27 +81,25 @@ mojibake is the common bug. For the cases that genuinely need raw bytes
 there's a separate `bytes` type (byte buffer + `bytes.*` functions, binary
 `io` modes) so the string type doesn't have to be both things.
 
-## Stop-the-world GC
+## Incremental GC
 
 The collector is a tri-color mark-and-sweep over intrusive object headers:
 every heap object starts with a `GcHeader` (color, kind, next pointer), so
 marking reads the header through the value pointer itself and the sweep
 walks one linked list — no side tables, no per-object bookkeeping beyond
-the header. Collection is paced two ways: an allocation-count threshold
-(1024, raised to 2× the live count after each cycle, matching Lua's 200%
-pause) and a byte threshold (1 MiB, same 2× rule) so a few large
-allocations can't pile up dead memory waiting for the count.
+the header.
 
-It's stop-the-world: when a cycle triggers, the whole mark and sweep run
-before the next instruction. The cost shows up exactly where you'd expect —
-the 5M-short-lived-tables benchmark runs 3.24G cycles to Lua's 1.69G
-(1.9×), and large heaps will see pauses Lua 5.4's generational collector
-avoids. The reason it's still stop-the-world is that incremental marking
-needs a write barrier on every table store, and `SetTable`/`SetField` is
-already the hottest path in the VM — the barrier tax is paid by every
-program, while pause time is only paid by programs with big heaps. That
-trade is being revisited; the collector is being made incremental with the
-barrier confined to the store path.
+Marking is incremental in the Lua 5.1-5.3 style: a
+Pause/Propagate/Atomic/Sweep state machine stepped at allocation
+checkpoints, byte-paced with stepmul 200%, so pauses are bounded instead of
+stop-the-world. The price is a write barrier on every table, upvalue, and
+global store — a store of a black object into a black container has to
+re-gray the container or the marker would miss it. That barrier sits on
+`SetTable`/`SetField`, already the hottest path in the VM, which is why the
+collector started life stop-the-world: the barrier tax is paid by every
+program, while pause time is only paid by programs with big heaps. The
+5M-short-lived-tables benchmark (3.24G cycles to Lua's 1.69G, 1.9×) made
+the pause cost concrete enough to pay the tax.
 
 ## No threaded dispatch
 

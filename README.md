@@ -39,9 +39,12 @@ Familiar to anyone who knows Lua, with a C-flavored syntax:
 
 - `string` — `len sub rep upper lower reverse byte char format`, plus
   Lua-style pattern matching: `find match gmatch gsub`
-- `string.pack` / `string.unpack` — a subset of Lua 5.3/5.4's format
-  language (fixed-width ints, floats, length-prefixed strings, endianness,
-  padding); see limitations below
+- `string.pack` / `string.unpack` / `string.packsize` — Lua 5.4's full
+  format language (fixed-width and native ints, floats, fixed/length-
+  prefixed/zero-terminated strings, endianness, `!`/`X` alignment); output
+  is wire-compatible with real Lua
+- `bytes` — mutable byte buffers: `new from tostring concat len`, 1-based
+  `b[i]` read/write, `#b`
 - `table` — `insert remove concat sort pack unpack move`
 - `io` — `open read write lines close` on file handles
 - `os` — `time clock date getenv`
@@ -65,9 +68,9 @@ source → lexer → parser (AST) → compiler → bytecode chunk → register V
 - `src/compiler.rs` — AST → bytecode for a register-based VM
 - `src/chunk.rs` — bytecode chunk format (opcodes, constants, line table)
 - `src/vm.rs` — interpreter loop, metatables, coroutines, stdlib
-- `src/gc.rs` — stop-the-world tri-color mark-and-sweep over strings, tables,
-  closures, and bigints; allocation-count threshold plus a host-settable hard
-  object ceiling
+- `src/gc.rs` — incremental tri-color mark-and-sweep over strings, bytes,
+  tables, closures, and bigints; write barrier on stores, byte-paced steps,
+  host-settable hard object ceiling
 - `src/value.rs` — NaN-boxed value representation
 - `src/api.rs` + `umbra.h` — the C embedding surface
 
@@ -181,10 +184,10 @@ threading a C interpreter gets. No JIT.
 These are deliberate and won't change:
 
 - **Strings are UTF-8, not bytes.** `string.char(200)` produces a two-byte
-  character; `string.sub`/`reverse` slice on bytes and re-validate. As a
-  consequence `string.pack` returns its output hex-encoded rather than as
-  raw bytes, alignment (`!`) is ignored, and native endianness is treated as
-  little-endian — its output isn't interchangeable with real Lua's.
+  character; `string.sub`/`reverse` slice on bytes and re-validate. Binary
+  data lives in the separate `bytes` type instead: `string.pack` returns
+  bytes, `string.unpack` accepts bytes or strings, and `io.open(path, "rb")`
+  reads bytes while `f:write` accepts them.
 - **NaN is `none`.** The value representation is NaN-boxed, so the NaN bit
   patterns carry the other types; `0/0` yields `none`.
 - **`none` instead of `nil`; `!=` is not-equal; `~=` is xor-assign.**
@@ -197,8 +200,10 @@ These are deliberate and won't change:
   boundary; it fails with "attempt to yield across a C-call boundary". Lua
   5.1 had the same restriction; 5.2 lifted it with continuation-passing
   (`lua_pcallk`), which this VM doesn't implement.
-- The GC is stop-the-world. Large heaps will see pauses; Lua 5.4's
-  generational collector doesn't have this problem.
+- The GC is incremental (Lua 5.1-5.3 design): marking and sweeping run in
+  small byte-paced steps interleaved with the mutator, so pauses stay
+  bounded as the heap grows. It is not generational — Lua 5.4's
+  generational mode still handles allocation-heavy churn better.
 - Expressions and blocks nest at most 100 levels; deeper sources are a
   parse error ("expected fewer nesting levels") rather than a stack overflow.
 
