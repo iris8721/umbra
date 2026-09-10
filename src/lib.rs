@@ -514,25 +514,25 @@ mod tests {
     #[test]
     fn vm_runtime_errors_carry_line_numbers() {
         let e = run("print(1)\nprint(2)\nerror(\"boom\")").unwrap_err();
-        assert_eq!(e, "line 3: boom");
+        assert_eq!(e, "[string \"...\"]:3: boom");
     }
 
     #[test]
     fn vm_type_errors_carry_line_numbers() {
-        let e = run("let x = nil\nprint(1)\nx + 1").unwrap_err();
-        assert!(e.starts_with("line 3:"), "expected line 3 prefix, got: {e}");
+        let e = run("let x = none\nprint(1)\nlet y = x + 1").unwrap_err();
+        assert!(e.starts_with("[string \"...\"]:3:"), "expected source:line prefix, got: {e}");
     }
 
     #[test]
     fn vm_error_level_2_attributes_to_caller_line() {
         let e = run("fn f() {\n    error(\"boom\", 2)\n}\nf()").unwrap_err();
-        assert_eq!(e, "line 4: boom");
+        assert_eq!(e, "[string \"...\"]:4: boom");
     }
 
     #[test]
     fn vm_error_level_1_is_same_as_default() {
         let e = run("fn f() {\n    error(\"boom\", 1)\n}\nf()").unwrap_err();
-        assert_eq!(e, "line 2: boom");
+        assert_eq!(e, "[string \"...\"]:2: boom");
     }
 
     #[test]
@@ -543,7 +543,7 @@ mod tests {
                 error(\"deep boom\")
             })
             print(msg)",
-            &["a", "line 3: deep boom"],
+            &["a", "[string \"...\"]:3: deep boom"],
         );
     }
 
@@ -564,7 +564,7 @@ mod tests {
             "let ok, msg = xpcall(fn() { error(\"boom\") }, fn(m) { return \"handled: \" .. m })
             print(ok)
             print(msg)",
-            &["false", "handled: line 1: boom"],
+            &["false", "handled: [string \"...\"]:1: boom"],
         );
     }
 
@@ -879,7 +879,7 @@ print(f, type(msg))"#,
         assert_output(
             r#"let f = load("error('boom')", "mychunk")
 print(pcall(f))"#,
-            &["false\tline 1 (mychunk): boom"],
+            &["false\tmychunk:1: boom"],
         );
     }
 
@@ -2708,7 +2708,7 @@ print(s:len())"#, &["5"]);
     fn stdlib_math_type() {
         assert_output(r#"print(math.type(1))"#, &["integer"]);
         assert_output(r#"print(math.type(1.0))"#, &["float"]);
-        assert_output(r#"print(math.type("x"))"#, &["false"]);
+        assert_output(r#"print(math.type("x"))"#, &["nil"]);
     }
 
     #[test]
@@ -3318,9 +3318,9 @@ let ok, err = pcall(fn() {
 })
 print(ok, err)"#,
             &[
-                "close b got line 5: x",
-                "close a got line 5: x",
-                "false\tline 5: x",
+                "close b got [string \"...\"]:5: x",
+                "close a got [string \"...\"]:5: x",
+                "false\t[string \"...\"]:5: x",
             ],
         );
     }
@@ -3334,7 +3334,7 @@ print(ok, err)"#,
     error("orig")
 })
 print(ok, err)"#,
-            &["false\tline 2: close-fail"],
+            &["false\t[string \"...\"]:2: close-fail"],
         );
     }
 
@@ -3351,7 +3351,7 @@ error("toplevel")"#,
         assert!(err.contains("toplevel"), "{err}");
         let key = vm.intern_pub("seen");
         let seen = vm.globals.raw_get(key);
-        assert_eq!(unsafe { vm::string_ref(seen) }, "line 2: toplevel");
+        assert_eq!(unsafe { vm::string_ref(seen) }, "[string \"...\"]:2: toplevel");
     }
 
     #[test]
@@ -3362,7 +3362,7 @@ error("toplevel")"#,
     error("co-boom")
 })
 print(coroutine.resume(co))"#,
-            &["closed line 3: co-boom", "false\tline 3: co-boom"],
+            &["closed [string \"...\"]:3: co-boom", "false\t[string \"...\"]:3: co-boom"],
         );
     }
 
@@ -4426,5 +4426,149 @@ mod bytes_and_pack_tests {
             print(b[1], b[8], #b)"#,
             &["7\t9\t8"],
         );
+    }
+}
+
+// Error-message naming (Lua's varinfo) and source:line tracebacks.
+#[cfg(test)]
+mod error_naming_tests {
+    use super::*;
+
+    fn assert_output(src: &str, expected: &[&str]) {
+        assert_eq!(run_capture(src).unwrap(), expected, "script: {src}");
+    }
+
+    #[test]
+    fn index_error_names_local_global_field_upvalue() {
+        let e = run("let x = none\nreturn x.f").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (local 'x')");
+        let e = run("return foo.bar").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:1: attempt to index a nil value (global 'foo')");
+        let e = run("let t = {}\nreturn t.a.b").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (field 'a')");
+        let e = run("let x = none\nfn f() { return x.f }\nf()").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (upvalue 'x')");
+    }
+
+    #[test]
+    fn index_error_names_set_and_method_receiver() {
+        let e = run("let x = none\nx.f = 1").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (local 'x')");
+        let e = run("let t = none\nt:m()").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (local 't')");
+    }
+
+    #[test]
+    fn call_error_names_callee() {
+        let e = run("let x = none\nx()").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to call a nil value (local 'x')");
+        let e = run("foo()").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:1: attempt to call a nil value (global 'foo')");
+        let e = run("let t = {}\nt.m()").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to call a nil value (field 'm')");
+        let e = run("let t = {}\nt:m()").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to call a nil value (method 'm')");
+    }
+
+    #[test]
+    fn arith_concat_compare_len_errors_name_operand() {
+        let e = run("let x = none\nreturn x + 1").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to perform arithmetic on a nil value (local 'x')");
+        let e = run("return \"a\" + 1").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:1: attempt to perform arithmetic on a string value (constant 'a')");
+        let e = run("let x = none\nreturn x .. \"a\"").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to concatenate a nil value (local 'x')");
+        let e = run("let x = none\nreturn x < {}").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to compare nil (local 'x') with table");
+        let e = run("let x = none\nreturn #x").unwrap_err();
+        assert_eq!(e, "[string \"...\"]:2: attempt to get length of a nil value (local 'x')");
+    }
+
+    #[test]
+    fn traceback_names_functions_and_main_chunk() {
+        assert_output(
+            r#"fn deep() { return debug.traceback("msg") }
+fn mid() { let t = deep() return t }
+fn outer() { let t = mid() return t }
+print(outer())"#,
+            &["msg\nstack traceback:\n\t[string \"...\"]:1: in function 'deep'\n\t[string \"...\"]:2: in function 'mid'\n\t[string \"...\"]:3: in function 'outer'\n\t[string \"...\"]:4: in main chunk"],
+        );
+    }
+
+    #[test]
+    fn traceback_marks_tail_calls() {
+        assert_output(
+            r#"fn tail() { error("boom") }
+fn f() { return tail() }
+let ok, tb = xpcall(f, debug.traceback)
+print(tb)"#,
+            &["[string \"...\"]:1: boom\nstack traceback:\n\t[string \"...\"]:1: in function <[string \"...\"]:1>\n\t(...tail calls...)"],
+        );
+    }
+
+    #[test]
+    fn type_is_number_and_math_type_splits() {
+        assert_output(
+            "print(type(1), type(1.5), type(\"s\"), type(none), type({}))",
+            &["number\tnumber\tstring\tnil\ttable"],
+        );
+        assert_output(
+            "print(math.type(1), math.type(1.5), math.type(\"s\"))",
+            &["integer\tfloat\tnil"],
+        );
+    }
+}
+
+#[cfg(test)]
+mod gc_incremental_tests {
+    use super::*;
+    use crate::gc::{GcColor, GcHeader, GcPhase};
+
+    // Storing a white object into a black (already-scanned) table mid-cycle
+    // must mark it through the write barrier; without it the sweep frees a
+    // reachable object and t.x dangles.
+    #[test]
+    fn gc_write_barrier_keeps_white_stored_into_black_table() {
+        let mut vm = vm::Vm::new();
+        run_with_vm("t = {}", &mut vm).unwrap();
+        let t_val = vm.globals.get_str("t").unwrap();
+        let t_hdr = t_val.as_table().unwrap() as *const GcHeader;
+
+        // Step the collector until the cycle is in flight and t is black.
+        let mut guard = 0;
+        loop {
+            vm.gc_step();
+            guard += 1;
+            assert!(guard < 1_000_000, "cycle never reached a state with t black");
+            if vm.gc.phase() == GcPhase::Pause { break; }
+            if unsafe { (*t_hdr).color } == GcColor::Black { break; }
+        }
+        assert_ne!(vm.gc.phase(), GcPhase::Pause, "cycle finished before t blackened");
+        assert_eq!(unsafe { (*t_hdr).color }, GcColor::Black);
+
+        run_with_vm("t.x = { y = 7 }", &mut vm).unwrap();
+        vm.gc_collect();
+        // Reuse the freed slot if the barrier missed the store.
+        run_with_vm("for i = 1, 2000 { let g = { i } }", &mut vm).unwrap();
+        run_with_vm("assert(t.x.y == 7)", &mut vm).unwrap();
+    }
+
+    // The incremental collector must bound each step: in a churn loop the
+    // largest single step's charged work stays a small fraction of a whole
+    // cycle's work (a stop-the-world collect would be nearly all of it).
+    #[test]
+    fn gc_incremental_steps_bound_max_pause() {
+        let mut vm = vm::Vm::new();
+        run_with_vm(
+            r#"let keep = {}
+for i = 1, 100000 { keep[i] = { i } }
+for i = 1, 5000000 { let t = { i } }"#,
+            &mut vm,
+        ).unwrap();
+        let max_step = vm.gc.max_step_work();
+        let cycle = vm.gc.last_cycle_work();
+        assert!(cycle > 0, "no incremental cycle ran during churn");
+        assert!(max_step * 10 <= cycle,
+            "max step {max_step} exceeds 10% of cycle work {cycle}");
     }
 }

@@ -621,6 +621,9 @@ pub struct Frame {
     // overwrites that window with the new arguments, so the reused frame
     // must hold the closure itself or its upvalues could be collected.
     pub callable: Value,
+    // Set when a tail call reused this frame: the traceback prints
+    // "(...tail calls...)" for the frames it replaced.
+    pub tail: bool,
 }
 
 pub struct Vm {
@@ -666,16 +669,167 @@ pub struct Vm {
     coroutine_depth: usize,
 }
 
-// Function names aren't tracked in Proto, so entries are line-only (innermost
-// first) rather than real Lua's "in function 'foo'" — still shows the call
-// chain, just not by name.
+// How a value got its name, for `attempt to ... (kind 'name')` suffixes and
+// traceback "in <kind> 'name'" entries.
+fn chunk_name(proto: &Proto) -> String {
+    match &proto.source {
+        Some(name) => name.clone(),
+        None => "[string \"...\"]".to_owned(),
+    }
+}
+
+// The last instruction before `pc` that writes `reg` — Lua's findsetreg.
+// A write sitting between a forward jump and its target is conditional, so
+// it doesn't count; backward jumps only bound the scan.
+fn find_set_reg(proto: &Proto, pc: usize, reg: usize) -> Option<usize> {
+    let mut set = None;
+    let mut jmptarget = 0usize;
+    for i in 0..pc.min(proto.code.len()) {
+        let instr = proto.code[i];
+        let op = Op::from_u8(iop(instr))?;
+        let a = ia(instr);
+        let writes = match op {
+            Op::SelfOp => reg == a || reg == a + 1,
+            Op::Call | Op::TailCall => reg >= a,
+            Op::Vararg => reg >= a,
+            Op::TForCall => reg >= a + 4,
+            Op::ForLoop => reg == a || reg == a + 3,
+            Op::TForLoop => reg == a + 2,
+            Op::SetTable | Op::SetField | Op::SetList | Op::SetGlobal | Op::SetUpval
+            | Op::Jmp | Op::Test | Op::Eq | Op::Lt | Op::Le
+            | Op::LtI | Op::LeI | Op::GtI | Op::GeI | Op::EqI
+            | Op::ForPrep | Op::Tbc | Op::TbcPop | Op::Return => false,
+            _ => reg == a,
+        };
+        if writes { set = Some(i); }
+        if matches!(op, Op::Jmp | Op::ForPrep) {
+            let target = (i as i32 + 1 + isbx(instr)) as usize;
+            if target <= pc { jmptarget = target; }
+        }
+        if i < jmptarget { set = None; }
+    }
+    set
+}
+
+// Names the value in `reg` at `pc` — Lua's getobjname: a live local wins,
+// otherwise the instruction that last wrote the register says where the
+// value came from (global, field, method, upvalue, constant, or another
+// local via Move). GetTable with a non-string key names the table operand
+// instead, which also unboxes captured locals (key 1 into the cell).
+fn reg_name(proto: &Proto, pc: usize, reg: usize) -> Option<(&'static str, String)> {
+    for lv in &proto.locvars {
+        if lv.reg as usize == reg && (lv.start_pc as usize) <= pc && pc < lv.end_pc as usize {
+            return Some(("local", lv.name.clone()));
+        }
+    }
+    let set = find_set_reg(proto, pc, reg)?;
+    let instr = proto.code[set];
+    let const_str = |i: usize| -> Option<&str> {
+        match proto.consts.get(i) { Some(Const::Str(s)) => Some(s.s.as_str()), _ => None }
+    };
+    match Op::from_u8(iop(instr))? {
+        Op::Move => reg_name(proto, set, ib(instr)),
+        Op::GetGlobal => const_str(ibx(instr)).map(|s| ("global", s.to_owned())),
+        Op::GetField => const_str(ic(instr)).map(|s| ("field", s.to_owned())),
+        Op::SelfOp => const_str(ic(instr)).map(|s| ("method", s.to_owned())),
+        Op::GetUpval => proto.upvals.get(ib(instr)).map(|u| ("upvalue", u.name.clone())),
+        Op::LoadK => Some(("constant", const_str(ibx(instr)).unwrap_or("?").to_owned())),
+        Op::GetTable => {
+            let k = ic(instr);
+            if is_rk(k) {
+                if let Some(s) = const_str(rk_idx(k)) {
+                    return Some(("field", s.to_owned()));
+                }
+            }
+            reg_name(proto, set, ib(instr))
+        }
+        _ => None,
+    }
+}
+
+// ` (kind 'name')` suffix for the value in `reg` at `pc`, or "" when the
+// register's provenance can't be named.
+fn varinfo(proto: &Proto, pc: usize, reg: usize) -> String {
+    match reg_name(proto, pc, reg) {
+        Some((kind, name)) => format!(" ({kind} '{name}')"),
+        None => String::new(),
+    }
+}
+// Same for an RK operand: registers resolve through reg_name, constants
+// report "(constant 'name')" for strings and "(constant '?')" otherwise.
+// usize::MAX marks a non-register operand (an immediate literal) that
+// shouldn't be named at all.
+fn rk_varinfo(proto: &Proto, pc: usize, rk: usize) -> String {
+    if rk == usize::MAX { return String::new(); }
+    if is_rk(rk) {
+        let name = match proto.consts.get(rk_idx(rk)) {
+            Some(Const::Str(s)) => s.s.clone(),
+            _ => "?".to_owned(),
+        };
+        format!(" (constant '{name}')")
+    } else {
+        varinfo(proto, pc, rk)
+    }
+}
+
+// Names the callee of the call instruction at `pc` in `proto` — used to
+// label the callee's frame in tracebacks ("in function 'f'" style).
+fn call_site_name(proto: &Proto, pc: usize) -> Option<(&'static str, String)> {
+    let instr = *proto.code.get(pc)?;
+    match Op::from_u8(iop(instr))? {
+        Op::Call | Op::TailCall => reg_name(proto, pc, ia(instr)),
+        Op::TForCall => Some(("for iterator", "for iterator".to_owned())),
+        _ => None,
+    }
+}
+
+// True when the message already carries a `source:line:` prefix — either
+// from an earlier enrichment or error(msg, 2) — so it isn't prefixed twice.
+fn has_position_prefix(msg: &str) -> bool {
+    let Some(colon) = msg.find(':') else { return false };
+    let rest = &msg[colon + 1..];
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    digits > 0 && rest[digits..].starts_with(':')
+}
+
+// Rebuilds a bare "attempt to compare" error with operand names appended.
+// Other errors (metamethod failures, already-positioned messages) pass
+// through untouched.
+fn name_order_err(e: VmError, proto: &Proto, pc: usize, a: Value, b: Value, ra: usize, rb: usize) -> VmError {
+    match &e {
+        VmError::RuntimeError(m) if m.starts_with("attempt to compare") => {
+            VmError::RuntimeError(format!(
+                "attempt to compare {}{} with {}{}",
+                a.type_name(), rk_varinfo(proto, pc, ra),
+                b.type_name(), rk_varinfo(proto, pc, rb)))
+        }
+        _ => e,
+    }
+}
+
 fn build_traceback(frames: &[Frame]) -> String {
-    frames.iter().enumerate().rev().map(|(i, f)| {
+    let mut out = Vec::with_capacity(frames.len());
+    for (i, f) in frames.iter().enumerate().rev() {
         let proto = unsafe { &*f.proto };
         let line = proto.lines.get(f.pc.saturating_sub(1)).copied().unwrap_or(0);
-        let where_ = if i == 0 { "in main chunk" } else { "in function" };
-        format!("\tline {line}: {where_}")
-    }).collect::<Vec<_>>().join("\n")
+        let src = chunk_name(proto);
+        if proto.is_main {
+            out.push(format!("\t{src}:{line}: in main chunk"));
+            continue;
+        }
+        let named = if i == 0 { None } else {
+            let caller = &frames[i - 1];
+            let cproto = unsafe { &*caller.proto };
+            call_site_name(cproto, caller.pc.saturating_sub(1))
+        };
+        match named {
+            Some(("global", name)) => out.push(format!("\t{src}:{line}: in function '{name}'")),
+            Some((kind, name)) => out.push(format!("\t{src}:{line}: in {kind} '{name}'")),
+            None => out.push(format!("\t{src}:{line}: in function <{src}:{}>", proto.line_defined)),
+        }
+        if f.tail { out.push("\t(...tail calls...)".to_owned()); }
+    }
+    out.join("\n")
 }
 
 pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -1351,7 +1505,7 @@ impl Vm {
             Box::new([])
         };
         // Manual push: Vec::push_mut's grow path never inlines and dominated
-        let f = Frame { proto, pc: 0, base, expected_results: expected, upvals_ptr, upvals_len, varargs, top: base, callable: Value::nil() };
+        let f = Frame { proto, pc: 0, base, expected_results: expected, upvals_ptr, upvals_len, varargs, top: base, callable: Value::nil(), tail: false };
         if self.frames.len() == self.frames.capacity() {
             self.frames.reserve(8);
         }
@@ -1387,17 +1541,14 @@ impl Vm {
     fn enrich_error_line(&mut self, e: VmError) -> VmError {
         match &e {
             VmError::RuntimeError(msg) => {
-                if !msg.starts_with("line ") {
-                    self.last_traceback = Some(build_traceback(&self.frames));
+                self.last_traceback = Some(build_traceback(&self.frames));
+                if !has_position_prefix(msg) {
                     if let Some(frame) = self.frames.last() {
                         let proto = unsafe { &*frame.proto };
                         let pc = frame.pc.saturating_sub(1);
                         if let Some(&line) = proto.lines.get(pc) {
-                            let at = match &proto.source {
-                                Some(name) => format!("line {line} ({name})"),
-                                None => format!("line {line}"),
-                            };
-                            return VmError::RuntimeError(format!("{at}: {msg}"));
+                            return VmError::RuntimeError(
+                                format!("{}:{}: {}", chunk_name(proto), line, msg));
                         }
                     }
                 }
@@ -1476,9 +1627,10 @@ impl Vm {
                     } else {
                         let mm = self.get_mm2(bv, cv, $mm_name);
                         if mm.is_nil() {
-                            let bad = if !bv.is_number() { bv } else { cv };
+                            let bad = if !bv.is_number() { ($b, bv) } else { ($c, cv) };
                             return Err(VmError::RuntimeError(format!(
-                                "attempt to perform arithmetic on a {} value", bad.type_name())));
+                                "attempt to perform arithmetic on a {} value{}",
+                                bad.1.type_name(), rk_varinfo(proto, frame.pc - 1, bad.0))));
                         }
                         let res = self.call_value_isolated(mm, &[bv, cv])?;
                         self.regs[base + $dst] = res.into_iter().next().unwrap_or(Value::nil());
@@ -1506,7 +1658,7 @@ impl Vm {
             // the looked-up value. The metamethod path can swap frames, so
             // it refreshes the cached frame/proto/base/regs before yielding.
             macro_rules! get_table {
-                ($tv:expr, $kv:expr) => {{
+                ($tv:expr, $kv:expr, $treg:expr) => {{
                     let tv = $tv;
                     let kv = $kv;
                     if tv.is_table() {
@@ -1544,12 +1696,13 @@ impl Vm {
                             Value::nil()
                         }
                     } else {
-                        return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
+                        return Err(VmError::RuntimeError(format!("attempt to index a {} value{}",
+                            tv.type_name(), varinfo(proto, frame.pc - 1, $treg))));
                     }
                 }}
             }
             macro_rules! set_table {
-                ($tv:expr, $kv:expr, $vv:expr) => {{
+                ($tv:expr, $kv:expr, $vv:expr, $treg:expr) => {{
                     let tv = $tv;
                     let kv = $kv;
                     let vv = $vv;
@@ -1577,7 +1730,8 @@ impl Vm {
                         };
                         b.data[(i - 1) as usize] = n;
                     } else {
-                        return Err(VmError::RuntimeError(format!("attempt to index a {} value", tv.type_name())));
+                        return Err(VmError::RuntimeError(format!("attempt to index a {} value{}",
+                            tv.type_name(), varinfo(proto, frame.pc - 1, $treg))));
                     }
                 }}
             }
@@ -1634,9 +1788,9 @@ impl Vm {
                             let cv = Value::int(k);
                             let mm = self.get_mm2(bv, cv, "__add");
                             if mm.is_nil() {
-                                let bad = if !bv.is_number() { bv } else { cv };
                                 return Err(VmError::RuntimeError(format!(
-                                    "attempt to perform arithmetic on a {} value", bad.type_name())));
+                                    "attempt to perform arithmetic on a {} value{}",
+                                    bv.type_name(), varinfo(proto, frame.pc - 1, b()))));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
@@ -1655,9 +1809,9 @@ impl Vm {
                             let cv = Value::int(k);
                             let mm = self.get_mm2(bv, cv, "__sub");
                             if mm.is_nil() {
-                                let bad = if !bv.is_number() { bv } else { cv };
                                 return Err(VmError::RuntimeError(format!(
-                                    "attempt to perform arithmetic on a {} value", bad.type_name())));
+                                    "attempt to perform arithmetic on a {} value{}",
+                                    bv.type_name(), varinfo(proto, frame.pc - 1, b()))));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
@@ -1672,9 +1826,10 @@ impl Vm {
                         } else {
                             let mm = self.get_mm2(bv, cv, "__div");
                             if mm.is_nil() {
-                                let bad = if !bv.is_number() { bv } else { cv };
+                                let bad = if !bv.is_number() { (b(), bv) } else { (c(), cv) };
                                 return Err(VmError::RuntimeError(format!(
-                                    "attempt to perform arithmetic on a {} value", bad.type_name())));
+                                    "attempt to perform arithmetic on a {} value{}",
+                                    bad.1.type_name(), rk_varinfo(proto, frame.pc - 1, bad.0))));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
@@ -1698,9 +1853,10 @@ impl Vm {
                         } else {
                             let mm = self.get_mm2(bv, cv, "__pow");
                             if mm.is_nil() {
-                                let bad = if !bv.is_number() { bv } else { cv };
+                                let bad = if !bv.is_number() { (b(), bv) } else { (c(), cv) };
                                 return Err(VmError::RuntimeError(format!(
-                                    "attempt to perform arithmetic on a {} value", bad.type_name())));
+                                    "attempt to perform arithmetic on a {} value{}",
+                                    bad.1.type_name(), rk_varinfo(proto, frame.pc - 1, bad.0))));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
@@ -1718,7 +1874,8 @@ impl Vm {
                             let mm = self.get_mm(v, "__unm");
                             if mm.is_nil() {
                                 return Err(VmError::RuntimeError(format!(
-                                    "attempt to perform arithmetic on a {} value", v.type_name())));
+                                    "attempt to perform arithmetic on a {} value{}",
+                                    v.type_name(), varinfo(proto, frame.pc - 1, b()))));
                             }
                             let res = self.call_value_isolated(mm, &[v, v])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
@@ -1780,14 +1937,36 @@ impl Vm {
                             }
                             unsafe { *regs.add(base + a()) = Value::int(len); }
                         } else {
-                            return Err(VmError::RuntimeError(format!("attempt to get length of a {} value", v.type_name())));
+                            return Err(VmError::RuntimeError(format!("attempt to get length of a {} value{}",
+                                v.type_name(), varinfo(proto, frame.pc - 1, b()))));
                         }
                     }
                     Op::Concat => {
-                        let mut vals: Vec<Value> = (b()..=c()).map(|i| unsafe { *regs.add(base + i) }).collect();
+                        // Snapshot the operand registers: concat_two can run
+                        // a __concat metamethod that reallocates self.regs.
+                        let lo = b();
+                        let mut vals: Vec<Value> = (lo..=c()).map(|i| unsafe { *regs.add(base + i) }).collect();
                         let mut acc = vals.pop().unwrap_or(Value::nil());
-                        for &left in vals.iter().rev() {
-                            acc = self.concat_two(left, acc)?;
+                        // Rightmost operand's register, for error naming.
+                        let mut acc_reg = c();
+                        for (k, &left) in vals.iter().enumerate().rev() {
+                            match self.concat_two(left, acc) {
+                                Ok(v) => { acc = v; acc_reg = lo + k; }
+                                Err(e) => {
+                                    let (bad, reg) = if !left.is_string() && !left.is_number() {
+                                        (left, lo + k)
+                                    } else {
+                                        (acc, acc_reg)
+                                    };
+                                    return Err(match e {
+                                        VmError::RuntimeError(m) if m.starts_with("attempt to concatenate") =>
+                                            VmError::RuntimeError(format!(
+                                                "attempt to concatenate a {} value{}",
+                                                bad.type_name(), varinfo(proto, frame.pc - 1, reg))),
+                                        other => other,
+                                    });
+                                }
+                            }
                         }
                         self.regs[base + a()] = acc;
                         continue 'outer;
@@ -1819,7 +1998,8 @@ impl Vm {
                         } else if bv.is_number() && cv.is_number() {
                             value_lt(bv, cv)?
                         } else {
-                            let lt = self.value_lt_mm(bv, cv)?;
+                            let lt = self.value_lt_mm(bv, cv)
+                                .map_err(|e| name_order_err(e, proto, frame.pc - 1, bv, cv, b(), c()))?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
@@ -1836,7 +2016,8 @@ impl Vm {
                         } else if bv.is_number() && cv.is_number() {
                             value_le(bv, cv)?
                         } else {
-                            let le = self.value_le_mm(bv, cv)?;
+                            let le = self.value_le_mm(bv, cv)
+                                .map_err(|e| name_order_err(e, proto, frame.pc - 1, bv, cv, b(), c()))?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
@@ -1860,7 +2041,8 @@ impl Vm {
                         } else if bv.is_number() {
                             value_lt(bv, Value::int(k))?
                         } else {
-                            let lt = self.value_lt_mm(bv, Value::int(k))?;
+                            let lt = self.value_lt_mm(bv, Value::int(k))
+                                .map_err(|e| name_order_err(e, proto, frame.pc - 1, bv, Value::int(k), b(), usize::MAX))?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
@@ -1878,7 +2060,8 @@ impl Vm {
                         } else if bv.is_number() {
                             value_le(bv, Value::int(k))?
                         } else {
-                            let le = self.value_le_mm(bv, Value::int(k))?;
+                            let le = self.value_le_mm(bv, Value::int(k))
+                                .map_err(|e| name_order_err(e, proto, frame.pc - 1, bv, Value::int(k), b(), usize::MAX))?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
@@ -1896,7 +2079,8 @@ impl Vm {
                         } else if bv.is_number() {
                             value_lt(Value::int(k), bv)?
                         } else {
-                            let gt = self.value_lt_mm(Value::int(k), bv)?;
+                            let gt = self.value_lt_mm(Value::int(k), bv)
+                                .map_err(|e| name_order_err(e, proto, frame.pc - 1, Value::int(k), bv, usize::MAX, b()))?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
@@ -1914,7 +2098,8 @@ impl Vm {
                         } else if bv.is_number() {
                             value_le(Value::int(k), bv)?
                         } else {
-                            let ge = self.value_le_mm(Value::int(k), bv)?;
+                            let ge = self.value_le_mm(Value::int(k), bv)
+                                .map_err(|e| name_order_err(e, proto, frame.pc - 1, Value::int(k), bv, usize::MAX, b()))?;
                             frame = unsafe { &mut *(self.frames.last_mut().unwrap() as *mut Frame) };
                             proto = unsafe { &*frame.proto };
                             base = frame.base;
@@ -1962,26 +2147,26 @@ impl Vm {
                         ck!();
                     }
                     Op::GetTable => {
-                        let v = get_table!(R!(b()), RK!(c()));
+                        let v = get_table!(R!(b()), RK!(c()), b());
                         R!(a()) = v;
                     }
                     Op::SetTable => {
-                        set_table!(R!(a()), RK!(b()), RK!(c()));
+                        set_table!(R!(a()), RK!(b()), RK!(c()), a());
                     }
                     Op::GetField => {
                         let kv = self.resolve_const(proto, c());
-                        let v = get_table!(R!(b()), kv);
+                        let v = get_table!(R!(b()), kv, b());
                         R!(a()) = v;
                     }
                     Op::SetField => {
                         let kv = self.resolve_const(proto, b());
-                        set_table!(R!(a()), kv, RK!(c()));
+                        set_table!(R!(a()), kv, RK!(c()), a());
                     }
                     Op::SelfOp => {
                         let tv = R!(b());
                         let kv = self.resolve_const(proto, c());
                         R!(a() + 1) = tv;
-                        let v = get_table!(tv, kv);
+                        let v = get_table!(tv, kv, b());
                         R!(a()) = v;
                     }
                     Op::SetList => {
@@ -2057,7 +2242,8 @@ impl Vm {
                         } else if fn_val.is_table() {
                             let mm = self.get_mm(fn_val, "__call");
                             if mm.is_nil() {
-                                return Err(VmError::RuntimeError("attempt to call a table value".into()));
+                                return Err(VmError::RuntimeError(format!("attempt to call a table value{}",
+                                    varinfo(proto, frame.pc - 1, a()))));
                             }
                             let args_base = base + a() + 1;
                             let mut mm_args = Vec::with_capacity(nargs as usize + 1);
@@ -2067,7 +2253,8 @@ impl Vm {
                             self.place_results(base + a(), results, nresults);
                             continue 'outer;
                         } else {
-                            return Err(VmError::RuntimeError(format!("attempt to call a {}", fn_val.type_name())));
+                            return Err(VmError::RuntimeError(format!("attempt to call a {} value{}",
+                                fn_val.type_name(), varinfo(proto, frame.pc - 1, a()))));
                         }
                     }
 
@@ -2106,6 +2293,7 @@ impl Vm {
                             frame.varargs = varargs;
                             frame.top = base;
                             frame.callable = fn_val;
+                            frame.tail = true;
                             proto = p;
                             ck!();
                             continue;
@@ -2131,7 +2319,8 @@ impl Vm {
                         } else if fn_val.is_table() {
                             let mm = self.get_mm(fn_val, "__call");
                             if mm.is_nil() {
-                                return Err(VmError::RuntimeError("attempt to call a table value".into()));
+                                return Err(VmError::RuntimeError(format!("attempt to call a table value{}",
+                                    varinfo(proto, frame.pc - 1, a()))));
                             }
                             let args_base = base + a() + 1;
                             let mut mm_args = Vec::with_capacity(nargs + 1);
@@ -2148,7 +2337,8 @@ impl Vm {
                             self.place_results(base_save - 1, results, expected);
                             continue 'outer;
                         } else {
-                            return Err(VmError::RuntimeError(format!("attempt to call a {}", fn_val.type_name())));
+                            return Err(VmError::RuntimeError(format!("attempt to call a {} value{}",
+                                fn_val.type_name(), varinfo(proto, frame.pc - 1, a()))));
                         }
                     }
 
@@ -2221,7 +2411,9 @@ impl Vm {
                             continue 'outer;
                         } else {
                             let cp = get_proto_callable(fn_val)
-                                .ok_or_else(|| VmError::RuntimeError("attempt to call non-function in for-in".into()))?;
+                                .ok_or_else(|| VmError::RuntimeError(format!(
+                                    "attempt to call a {} value (for iterator 'for iterator')",
+                                    fn_val.type_name())))?;
                             let new_base = base + a() + 5;
                             let needed = new_base + unsafe { &*cp.proto }.max_regs as usize + 8;
                             if needed > self.regs.len() { self.regs.resize(needed, Value::nil()); }
@@ -2403,7 +2595,10 @@ impl Vm {
 
         self.set_global_cfn("type", |args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            Ok(vec![alloc_string_val(v.type_name())])
+            // Lua semantics: integers and floats are both "number";
+            // math.type distinguishes them.
+            let name = if v.is_number() { "number" } else { v.type_name() };
+            Ok(vec![alloc_string_val(name)])
         });
 
         self.set_global_cfn("assert", |args| {
@@ -2451,7 +2646,7 @@ impl Vm {
                         Some(frame) => {
                             let proto = unsafe { &*frame.proto };
                             let line = proto.lines.get(frame.pc.saturating_sub(1)).copied().unwrap_or(0);
-                            format!("line {line}: {s}")
+                            format!("{}:{}: {}", chunk_name(proto), line, s)
                         }
                         None => s.clone(),
                     }
@@ -3242,7 +3437,7 @@ impl Vm {
             let v = args.first().copied().unwrap_or(Value::nil());
             if v.is_int_like() { return Ok(vec![alloc_string_val("integer")]); }
             if v.is_float() { return Ok(vec![alloc_string_val("float")]); }
-            Ok(vec![Value::bool(false)])
+            Ok(vec![Value::nil()])
         });
         let v_math_tointeger = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());

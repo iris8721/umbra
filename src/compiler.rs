@@ -190,6 +190,9 @@ struct Local {
     // inside one closure being visible to another closure or the outer
     // scope, since each copy would be independent. See box_in_place.
     boxed: bool,
+    // pc at which the local's register starts holding its value; paired
+    // with the pop-site pc to build Proto::locvars for error naming.
+    start_pc: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +269,9 @@ struct FnComp {
     // collect_captured_names. Consulted when a local/param is declared to
     // decide whether it needs boxing.
     captured: std::collections::HashSet<String>,
+    // Finished (name, reg, live-range) entries for Proto::locvars; a local
+    // moves here when its scope pops it.
+    locvars: Vec<crate::chunk::LocVar>,
 }
 
 impl FnComp {
@@ -278,7 +284,7 @@ impl FnComp {
             labels: std::collections::HashMap::new(), pending_gotos: Vec::new(),
             block_parent: vec![None], block_tail: vec![false], blocks: vec![0],
             tail_stmt: true, depth, is_vararg,
-            captured,
+            captured, locvars: Vec::new(),
         }
     }
 
@@ -353,7 +359,7 @@ impl FnComp {
     fn push_local(&mut self, name: String, mutable: bool) -> CResult<u8> {
         let boxed = self.captured.contains(&name);
         let r = self.alloc_reg()?;
-        self.locals.push(Local { name, reg: r, mutable, close: false, boxed });
+        self.locals.push(Local { name, reg: r, mutable, close: false, boxed, start_pc: self.pc() });
         Ok(r)
     }
 
@@ -386,7 +392,14 @@ impl FnComp {
 
     fn pop_locals_to(&mut self, top: usize) {
         let new_free = self.locals.get(top).map(|l| l.reg).unwrap_or(self.free_reg);
-        self.locals.truncate(top);
+        // Record the live range of every local leaving scope so the VM can
+        // name it in error messages and tracebacks.
+        let end = self.pc() as u32;
+        for l in self.locals.drain(top..) {
+            self.locvars.push(crate::chunk::LocVar {
+                name: l.name, reg: l.reg, start_pc: l.start_pc as u32, end_pc: end, boxed: l.boxed,
+            });
+        }
         self.free_reg = new_free;
     }
 
@@ -808,7 +821,7 @@ impl FnComp {
                 }
                 for (i, name) in names.iter().enumerate() {
                     let boxed = self.captured.contains(name);
-                    self.locals.push(Local { name: name.clone(), reg: base + i as u8, mutable: *mutable, close: closes[i], boxed });
+                    self.locals.push(Local { name: name.clone(), reg: base + i as u8, mutable: *mutable, close: closes[i], boxed, start_pc: self.pc() });
                 }
                 if self.free_reg < base + nn as u8 { self.free_reg = base + nn as u8; }
                 for (i, name) in names.iter().enumerate() {
@@ -831,7 +844,7 @@ impl FnComp {
                         None => { let fki = self.rk_str(name)?; self.emit(enc_abc(Op::GetTable, dst, vr, fki)); }
                     };
                     let boxed = self.captured.contains(name);
-                    self.locals.push(Local { name: name.clone(), reg: dst, mutable: *mutable, close: false, boxed });
+                    self.locals.push(Local { name: name.clone(), reg: dst, mutable: *mutable, close: false, boxed, start_pc: self.pc() });
                     if boxed { self.box_in_place(dst)?; }
                 }
                 if self.proto.max_regs < self.free_reg { self.proto.max_regs = self.free_reg; }
@@ -996,7 +1009,7 @@ impl FnComp {
                 // A closure capturing the loop variable shares one variable across
                 // all iterations — the classic pre-5.4-Lua for-loop-capture wart,
                 // not something this fix attempts to solve.
-                self.locals.push(Local { name: var.clone(), reg: lv_reg, mutable: true, close: false, boxed: false });
+                self.locals.push(Local { name: var.clone(), reg: lv_reg, mutable: true, close: false, boxed: false, start_pc: self.pc() });
                 let locals_save = self.locals.len() - 1;
 
                 self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
@@ -1031,7 +1044,7 @@ impl FnComp {
                 }
                 self.proto.code[prep] = enc_asbx(Op::ForPrep, base as u8, prep_off as i32);
 
-                self.locals.truncate(locals_save);
+                self.pop_locals_to(locals_save);
                 for bj in scope.break_jumps { self.patch(bj, here)?; }
                 self.free_reg_to(base);
             }
@@ -1071,7 +1084,7 @@ impl FnComp {
                 // Never boxed, same reasoning as ForNum: TForCall overwrites these
                 // registers directly every iteration.
                 for (i, v) in vars.iter().enumerate() {
-                    self.locals.push(Local { name: v.clone(), reg: base + 4 + i as u8, mutable: true, close: false, boxed: false });
+                    self.locals.push(Local { name: v.clone(), reg: base + 4 + i as u8, mutable: true, close: false, boxed: false, start_pc: self.pc() });
                 }
 
                 self.loops.push(LoopScope { break_jumps: Vec::new(), continue_jumps: Vec::new(), locals_top: self.locals_top() });
@@ -1096,7 +1109,7 @@ impl FnComp {
                 self.emit_back(Op::TForLoop, base as u8, loop_top)?;
 
                 let here = self.pc();
-                self.locals.truncate(lv_base);
+                self.pop_locals_to(lv_base);
                 for bj in scope.break_jumps { self.patch(bj, here)?; }
                 self.free_reg_to(base);
             }
@@ -1163,7 +1176,7 @@ impl FnComp {
                 let r = self.alloc_reg()?;
                 let boxed = self.captured.contains(name);
                 if boxed { self.emit(enc_abc(Op::NewTable, r, 0, 0)); }
-                self.locals.push(Local { name: name.clone(), reg: r, mutable: true, close: false, boxed });
+                self.locals.push(Local { name: name.clone(), reg: r, mutable: true, close: false, boxed, start_pc: self.pc() });
                 let proto = compile_fn(body, self.proto.source.clone(), outer, self.depth)?;
                 let pi = self.proto.protos.len();
                 self.proto.protos.push(proto);
@@ -1944,6 +1957,12 @@ fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp
         crate::chunk::UpvalDesc { name: u.name.clone(), in_stack: u.in_stack, idx: u.outer_idx }
     }).collect();
 
+    // Locals still live at function end (params, outermost block) get the
+    // end of the code as their range end.
+    fc.pop_locals_to(0);
+    fc.proto.locvars = std::mem::take(&mut fc.locvars);
+    fc.proto.line_defined = body.line;
+
     Ok(fc.proto)
 }
 
@@ -1955,5 +1974,8 @@ pub fn compile(block: Block, source: Option<String>) -> CResult<Proto> {
         body: block,
         line,
     };
-    compile_fn(&chunk_body, source, None, 0)
+    let mut proto = compile_fn(&chunk_body, source, None, 0)?;
+    proto.is_main = true;
+    Ok(proto)
 }
+

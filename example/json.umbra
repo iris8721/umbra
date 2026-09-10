@@ -1,10 +1,8 @@
 @ JSON-ish serializer + recursive-descent parser roundtrip.
 @ Exercises string building, pattern matching, recursion, and a
 @ __tostring metamethod that renders a wrapped table as JSON.
-@ (umbra's type() splits Lua's "number" into "integer"/"float")
 fn is_number(v) {
-    let t = type(v)
-    return t == "integer" or t == "float"
+    return type(v) == "number"
 }
 
 fn is_array(t) {

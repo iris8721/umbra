@@ -169,6 +169,20 @@ pub struct UpvalDesc {
     pub idx: u8,
 }
 
+// Debug info for naming locals in error messages and tracebacks: the
+// register a local occupies and the half-open pc range [start_pc, end_pc)
+// over which that register holds it. `boxed` marks locals captured by a
+// nested closure — their register holds a 1-element cell, so the value
+// itself lives behind a GetTable with key 1.
+#[derive(Debug, Clone)]
+pub struct LocVar {
+    pub name: String,
+    pub reg: u8,
+    pub start_pc: u32,
+    pub end_pc: u32,
+    pub boxed: bool,
+}
+
 #[derive(Debug)]
 pub struct Proto {
     pub code: Vec<u32>,
@@ -179,6 +193,13 @@ pub struct Proto {
     pub params: u8,
     pub is_vararg: bool,
     pub source: Option<String>,
+    // Line the function definition starts on; used for the
+    // `function <source:line>` fallback name in tracebacks.
+    pub line_defined: u32,
+    // True for the top-level chunk proto (compile's entry point), so
+    // tracebacks can print "in main chunk" instead of a function name.
+    pub is_main: bool,
+    pub locvars: Vec<LocVar>,
     pub lines: Vec<u32>,
     // Per-const GetGlobal cache, parallel to `consts`: (owner VM, globals
     // generation, cached value bits). Filled lazily by the VM; a globals
@@ -198,6 +219,9 @@ impl Proto {
             params: 0,
             is_vararg: false,
             source: None,
+            line_defined: 0,
+            is_main: false,
+            locvars: Vec::new(),
             lines: Vec::new(),
             global_cache: Vec::new(),
         }
