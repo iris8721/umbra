@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use crate::chunk::{Const, Op, Proto, StrConst, ia, ib, ic, ibx, isbx, iop, ici, is_rk, rk_idx};
-use crate::gc::Gc;
+use crate::gc::{Gc, GcColor};
 use crate::pack;
 use crate::pattern;
 
@@ -543,6 +543,17 @@ impl Table {
 
     #[inline(always)]
     pub fn raw_set(&mut self, key: Value, val: Value) {
+        // Incremental-GC write barrier: a black table has already been
+        // scanned this cycle, so storing a white key/value into it would
+        // leave a live object for the sweep to free. One predictable branch
+        // when idle — registered objects are white between cycles.
+        if self.gc.color == GcColor::Black {
+            crate::gc::GC_ACTIVE.with(|a| {
+                if a.get() != 0 {
+                    with_current_vm(|vm| vm.gc.barrier_store(key, val));
+                }
+            });
+        }
         if key.is_int() {
             let i = key.as_int().unwrap();
             if i >= 1 && i <= (self.array.len() + 1) as i64 {
@@ -989,16 +1000,31 @@ impl Vm {
         }
         roots
     }
+    // One incremental step, called from 'outer's top when a checkpoint fires.
+    // Roots are gathered only for the phases that need them (cycle start and
+    // the atomic step) so ordinary propagate/sweep steps stay cheap.
+    pub(crate) fn gc_step(&mut self) {
+        let roots = if self.gc.needs_roots() { Some(self.gc_roots()) } else { None };
+        self.gc.step(roots, &mut self.string_cache, false);
+    }
 
-    pub fn gc_collect(&mut self) {
-        let roots = self.gc_roots();
-        self.gc.collect(roots.into_iter(), &mut self.string_cache);
+    // Run the state machine to Pause with an unbounded budget — a
+    // stop-the-world collection on demand. Steps taken here are forced, so
+    // they don't count toward the max-pause accounting.
+    fn gc_full_cycle(&mut self) {
+        loop {
+            let roots = if self.gc.needs_roots() { Some(self.gc_roots()) } else { None };
+            self.gc.step(roots, &mut self.string_cache, true);
+            if self.gc.phase() == crate::gc::GcPhase::Pause { break; }
+        }
+    }
 
-        // A collection triggered from inside a finalizer (or any nested
-        // collect while finalizers are draining) must not run the finalizers
-        // it just queued: that would recurse gc_collect on the Rust stack
-        // without bound. They stay pending and the outermost collect drains
-        // them iteratively below.
+    // Runs the __gc callbacks the last completed cycle queued. A collection
+    // triggered from inside a finalizer (or any nested collect while
+    // finalizers are draining) must not drain the queue itself: that would
+    // recurse on the Rust stack without bound. The outermost caller drains
+    // iteratively instead.
+    fn run_pending_finalizers(&mut self) {
         if !self.gc.running_finalizers.is_empty() { return; }
         let batch = std::mem::take(&mut self.gc.pending_finalizers);
         if batch.is_empty() { return; }
@@ -1012,8 +1038,15 @@ impl Vm {
             i += 1;
         }
         self.gc.running_finalizers.clear();
-        let roots = self.gc_roots();
-        self.gc.collect(roots.into_iter(), &mut self.string_cache);
+    }
+
+    // Full collection: finish any in-flight cycle, run a fresh one to
+    // completion, drain the finalizers it queued, then collect once more so
+    // objects the finalizers released are reclaimed too.
+    pub fn gc_collect(&mut self) {
+        self.gc_full_cycle();
+        self.run_pending_finalizers();
+        self.gc_full_cycle();
     }
 
 
@@ -1568,20 +1601,27 @@ impl Vm {
     #[allow(unused_unsafe)]
     pub fn run_inner(&mut self) -> VmResult<()> {
         'outer: loop {
-            // GC runs here, before `frame` becomes a raw pointer into self.frames:
-            // gc_collect may run __gc finalizers that push frames of their own.
-            if self.gc.should_collect() { self.gc_collect(); }
+            // GC work runs here, before `frame` becomes a raw pointer into
+            // self.frames: a step may finish a cycle and queue __gc
+            // finalizers, which push frames of their own when drained.
+            if self.gc.should_step() { self.gc_step(); }
 
-            // >= not >: at the ceiling the allocating instruction never gets to
-            // run, so > would spin here instead of reporting.
+            // The hard ceiling can't wait for an incremental cycle to finish:
+            // force a full collection, then error if it's still exceeded.
+            // >= not >: at the ceiling the allocating instruction never gets
+            // to run, so > would spin here instead of reporting.
             if self.gc.max_objects != 0 && self.gc.live_count() >= self.gc.max_objects {
-                return Err(VmError::RuntimeError("memory limit exceeded".into()));
+                self.gc_collect();
+                if self.gc.live_count() >= self.gc.max_objects {
+                    return Err(VmError::RuntimeError("memory limit exceeded".into()));
+                }
             }
 
             if self.step_limit != 0 && self.step_count > self.step_limit {
                 return Err(VmError::RuntimeError("instruction budget exceeded".into()));
             }
 
+            self.run_pending_finalizers();
             let frame = self.frames.last_mut().unwrap() as *mut Frame;
             let mut frame = unsafe { &mut *frame };
             let mut proto = unsafe { &*frame.proto };
@@ -1608,7 +1648,7 @@ impl Vm {
             // created — checking every instruction was pure dispatch cost.
             macro_rules! ck {
                 () => {
-                    if self.gc.should_collect() || (self.step_limit != 0 && self.step_count > self.step_limit) {
+                    if self.gc.should_step() || (self.step_limit != 0 && self.step_count > self.step_limit) {
                         continue 'outer;
                     }
                 }
@@ -2472,7 +2512,14 @@ impl Vm {
                     }
                     Op::SetUpval => {
                         if b() < frame.upvals_len {
-                            unsafe { *frame.upvals_ptr.add(b()) = R!(a()); }
+                            let v = R!(a());
+                            // Write barrier: the owning closure may already be
+                            // black this cycle. upvals_ptr borrows the closure's
+                            // Vec, so the owner isn't reachable from here —
+                            // mark the value unconditionally when a cycle is
+                            // live (over-marking only costs retention).
+                            self.gc.barrier_val(v);
+                            unsafe { *frame.upvals_ptr.add(b()) = v; }
                         }
                     }
 
@@ -2903,6 +2950,20 @@ impl Vm {
             } else {
                 None
             };
+            with_current_vm(|vm| {
+                // Write barrier: a black table gaining a white metatable
+                // mid-cycle would leave it for the sweep.
+                vm.gc.barrier_val(mt);
+                // __gc is noticed when the metatable is attached (like Lua):
+                // record the table as a finalizer candidate for every cycle
+                // until it's freed.
+                if mt.is_table() && t.gc.fin_idx == u32::MAX {
+                    let mt_ref = unsafe { &*(mt.as_table().unwrap() as *const Table) };
+                    if mt_ref.get_str("__gc").is_some() {
+                        vm.gc.add_fin_candidate(tbl.as_table().unwrap());
+                    }
+                }
+            });
             Ok(vec![tbl])
         });
 
