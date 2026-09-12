@@ -1616,7 +1616,7 @@ impl Vm {
                     }
                 }
             }
-            // Thrown values keep their identity (no line prefix), but the
+            // Thrown values keep their identity (no position prefix), but the
             // traceback is still captured for debug.traceback.
             VmError::Thrown(_) => {
                 self.last_traceback = Some(build_traceback(&self.frames));

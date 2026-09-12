@@ -168,10 +168,10 @@ Release build, cycles on one pinned core (`perf stat -e cycles`, mean of
 
 | | umbra | lua 5.4 | |
 |---|---|---|---|
-| `fib(30)` — call overhead | 325M | 202M | 1.6× |
-| 2M array writes + reads | 422M | 174M | 2.4× |
-| 200k string concat + `gmatch` | 368M | 408M | 0.9× |
-| 5M short-lived tables, 100k live | 3.24G | 1.69G | 1.9× |
+| `fib(30)` — call overhead | 262M | 164M | 1.6× |
+| 2M array writes + reads | 306M | 134M | 2.3× |
+| 200k string concat + `gmatch` | 269M | 387M | 0.7× |
+| 5M short-lived tables, 100k live | 2.86G | 1.25G | 2.3× |
 
 The bytecode has the same superinstructions Lua 5.4 added (immediate-operand
 arithmetic and compares, `GetField`/`SelfOp`, tail calls) plus a per-callsite
