@@ -211,7 +211,7 @@ impl Gc {
         let work = if forced {
             usize::MAX / 4
         } else {
-            (self.bytes_since_step / 64).max(1) * (self.stepmul as usize / 2).max(1)
+            (self.bytes_since_step * self.stepmul as usize / 100).max(1)
         };
         self.bytes_since_step = 0;
         let mut done = 0usize;
@@ -225,7 +225,7 @@ impl Gc {
                 if self.gray_list.is_empty() { self.phase = GcPhase::Atomic; }
             }
             GcPhase::Atomic => {
-                done += self.atomic(roots.unwrap_or_default(), string_cache);
+                done += self.atomic(roots.expect("atomic step needs roots"), string_cache);
             }
             GcPhase::Sweep => {
                 done += self.sweep_step(work);
