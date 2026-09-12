@@ -51,14 +51,19 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 // Inverse of civil_from_days (Howard Hinnant's days_from_civil).
+// Inverse of civil_from_days (Howard Hinnant's days_from_civil). Out-of-range
+// months/days normalize like mktime: month 13 rolls into the next year, day 0
+// is the last day of the previous month.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = y + (m - 1).div_euclid(12);
+    let m = (m - 1).rem_euclid(12) + 1;
     let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
-    let doy = (153 * mp + 2) / 5 + (d - 1) as u64;
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + (d - 1);
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe as i64 - 719468
+    era * 146097 + doe - 719468
 }
 
 // (year, month, day, yday, weekday-since-Sunday) for an epoch second.
@@ -70,10 +75,16 @@ fn civil_fields(epoch_secs: i64) -> (i64, u32, u32, u32, u32) {
     (year, month, day, yday, wday)
 }
 
-pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> String {
+// strftime over the proleptic Gregorian calendar in UTC (Umbra has no
+// timezone database; os.date's '!' prefix is accepted but changes nothing).
+// Specifiers follow Lua's C99 list, including the E/O modifier characters
+// which are no-ops in the C locale. Unknown specifiers are an error, like
+// Lua's checkoption.
+pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> Result<String, VmError> {
     const WDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
     const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June",
                                 "July", "August", "September", "October", "November", "December"];
+    let days = epoch_secs.div_euclid(86400);
     let secs_of_day = epoch_secs.rem_euclid(86400);
     let (year, month, day, yday, wday) = civil_fields(epoch_secs);
     let (hour, min, sec) = (secs_of_day / 3600, (secs_of_day / 60) % 60, secs_of_day % 60);
@@ -81,13 +92,23 @@ pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> String {
     // Week-of-year: %U counts Sundays, %W counts Mondays (strftime rules).
     let week_u = (yday as i64 + 6 - wday as i64).div_euclid(7);
     let week_w = (yday as i64 + 6 - (wday as i64 + 6) % 7).div_euclid(7);
+    // ISO 8601 week date: the ISO year is the year of this week's Thursday.
+    let iso_wday = (days + 3).rem_euclid(7) + 1; // Monday = 1
+    let thursday = days + (4 - iso_wday);
+    let iso_year = civil_from_days(thursday).0;
+    let iso_week = (thursday - days_from_civil(iso_year, 1, 1)).div_euclid(7) + 1;
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '%' { out.push(c); continue; }
-        match chars.next() {
+        let mut spec = chars.next();
+        // E/O modifiers select alternative locale representations; the C
+        // locale has none, so they reduce to the base specifier.
+        if matches!(spec, Some('E') | Some('O')) { spec = chars.next(); }
+        match spec {
             Some('Y') => out.push_str(&year.to_string()),
             Some('y') => out.push_str(&format!("{:02}", year.rem_euclid(100))),
+            Some('C') => out.push_str(&format!("{:02}", year.div_euclid(100))),
             Some('m') => out.push_str(&format!("{month:02}")),
             Some('d') => out.push_str(&format!("{day:02}")),
             Some('e') => out.push_str(&format!("{day:2}")),
@@ -103,24 +124,33 @@ pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> String {
             Some('j') => out.push_str(&format!("{yday:03}")),
             Some('U') => out.push_str(&format!("{week_u:02}")),
             Some('W') => out.push_str(&format!("{week_w:02}")),
+            Some('V') => out.push_str(&format!("{iso_week:02}")),
+            Some('g') => out.push_str(&format!("{:02}", iso_year.rem_euclid(100))),
+            Some('G') => out.push_str(&iso_year.to_string()),
             Some('w') => out.push_str(&wday.to_string()),
-            Some('c') => out.push_str(&format!("{} {} {:02} {:02}:{:02}:{:02} {}",
+            Some('u') => out.push_str(&iso_wday.to_string()),
+            Some('c') => out.push_str(&format!("{} {} {:2} {:02}:{:02}:{:02} {}",
                 &WDAYS[wday as usize][..3], &MONTHS[(month - 1) as usize][..3],
                 day, hour, min, sec, year)),
             Some('x') => out.push_str(&format!("{month:02}/{day:02}/{:02}", year.rem_euclid(100))),
             Some('X') | Some('T') => out.push_str(&format!("{hour:02}:{min:02}:{sec:02}")),
+            Some('r') => out.push_str(&format!("{hour12:02}:{min:02}:{sec:02} {}",
+                if hour < 12 { "AM" } else { "PM" })),
             Some('D') => out.push_str(&format!("{month:02}/{day:02}/{:02}", year.rem_euclid(100))),
             Some('F') => out.push_str(&format!("{year}-{month:02}-{day:02}")),
             Some('R') => out.push_str(&format!("{hour:02}:{min:02}")),
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
-            Some('Z') => out.push_str("UTC"),
+            Some('z') => out.push_str("+0000"),
+            Some('Z') => out.push_str("GMT"),
             Some('%') => out.push('%'),
-            Some(other) => { out.push('%'); out.push(other); }
-            None => out.push('%'),
+            Some(other) => return Err(VmError::RuntimeError(
+                format!("os.date: invalid conversion specifier '%{other}'"))),
+            None => return Err(VmError::RuntimeError(
+                "os.date: invalid conversion specifier '%'".into())),
         }
     }
-    out
+    Ok(out)
 }
 
 use crate::value::Value;
@@ -2580,64 +2610,50 @@ impl Vm {
         });
 
         self.set_global_cfn("tostring", |args| {
-            let v = args.first().copied().unwrap_or(Value::nil());
+            let v = args.first().copied().ok_or_else(||
+                VmError::RuntimeError("tostring: value expected".into()))?;
             if v.is_string() { return Ok(vec![v]); }
             Ok(vec![alloc_string_val(&tostring_value(v)?)])
         });
 
         self.set_global_cfn("tonumber", |args| {
-            let v = args.first().copied().unwrap_or(Value::nil());
+            let v = args.first().copied().ok_or_else(||
+                VmError::RuntimeError("tonumber: value expected".into()))?;
+            // lua_isnoneornil: an absent or nil base means standard
+            // conversion; the base itself is checked first either way.
             let base = match args.get(1) {
-                None => 10,
-                Some(&b) => int_arg(b, "tonumber")?,
+                None => None,
+                Some(&b) if b.is_nil() => None,
+                Some(&b) => Some(int_arg(b, "tonumber")?),
             };
-            if base == 10 && (v.is_int_like() || v.is_float()) { return Ok(vec![v]); }
+            let Some(base) = base else {
+                if v.is_number() { return Ok(vec![v]); }
+                if !v.is_string() { return Ok(vec![Value::nil()]); }
+                let s = unsafe { string_ref(v) };
+                return Ok(vec![str_to_number(s).unwrap_or(Value::nil())]);
+            };
             // With an explicit base the argument must be a string, like Lua.
             if !v.is_string() {
-                return if base == 10 { Ok(vec![Value::nil()]) }
-                       else { Err(VmError::RuntimeError("tonumber: string expected".into())) };
+                return Err(VmError::RuntimeError("tonumber: string expected".into()));
             }
+            if !(2..=36).contains(&base) {
+                return Err(VmError::RuntimeError("tonumber: base out of range".into()));
+            }
+            // b_str2int: leading space skipped, optional sign, then digits
+            // only — any trailing junk fails, and overflow wraps modulo 2^64.
             let s = unsafe { string_ref(v) };
-            if base != 10 {
-                if !(2..=36).contains(&base) {
-                    return Err(VmError::RuntimeError("tonumber: base out of range".into()));
-                }
-                // Lua: leading space skipped, optional sign, optional 0x for
-                // base 16, then digits only — any trailing junk fails, and
-                // overflow wraps modulo 2^64.
-                let mut t = s.trim();
-                let neg = t.starts_with('-');
-                if neg || t.starts_with('+') { t = &t[1..]; }
-                if base == 16 { t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t); }
-                if t.is_empty() { return Ok(vec![Value::nil()]); }
-                let mut n: u64 = 0;
-                for c in t.bytes() {
-                    let d = (c as char).to_digit(base as u32);
-                    match d { Some(d) => n = n.wrapping_mul(base as u64).wrapping_add(d as u64),
-                              None => return Ok(vec![Value::nil()]) }
-                }
-                let n = n as i64;
-                return Ok(vec![make_int_via_current_vm(if neg { n.wrapping_neg() } else { n })]);
+            let mut t = s.trim();
+            let neg = t.starts_with('-');
+            if neg || t.starts_with('+') { t = &t[1..]; }
+            if t.is_empty() { return Ok(vec![Value::nil()]); }
+            let mut n: u64 = 0;
+            for c in t.bytes() {
+                let d = (c as char).to_digit(base as u32);
+                match d { Some(d) => n = n.wrapping_mul(base as u64).wrapping_add(d as u64),
+                          None => return Ok(vec![Value::nil()]) }
             }
-            let s = s.trim();
-            let (neg, body) = match s.strip_prefix('-') { Some(r) => (true, r), None => (false, s) };
-            if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-                // Integer hex wraps modulo 2^64 like the lexer; failing that,
-                // a hex float (0xA.8p1) is still a number.
-                if !hex.is_empty() && hex.bytes().all(|b| (b as char).is_ascii_hexdigit()) {
-                    let mut n: u64 = 0;
-                    for c in hex.bytes() { n = n.wrapping_mul(16).wrapping_add((c as char).to_digit(16).unwrap() as u64); }
-                    let n = n as i64;
-                    return Ok(vec![make_int_via_current_vm(if neg { n.wrapping_neg() } else { n })]);
-                }
-                if let Ok(f) = crate::lexer::parse_hex_float(body) {
-                    return Ok(vec![Value::float(if neg { -f } else { f })]);
-                }
-                return Ok(vec![Value::nil()]);
-            }
-            if let Ok(n) = s.parse::<i64>() { return Ok(vec![make_int_via_current_vm(n)]); }
-            if let Ok(f) = s.parse::<f64>() { return Ok(vec![Value::float(f)]); }
-            Ok(vec![Value::nil()])
+            let n = n as i64;
+            Ok(vec![make_int_via_current_vm(if neg { n.wrapping_neg() } else { n })])
         });
 
         self.set_global_cfn("type", |args| {
@@ -3096,8 +3112,8 @@ impl Vm {
         let v_str_sub = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.sub")?;
             let len = s.len();
-            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "string.sub")? };
-            let j = match args.get(2) { None => -1, Some(&v) => int_arg(v, "string.sub")? };
+            let i = opt_int_arg(args, 1, "string.sub", 1)?;
+            let j = opt_int_arg(args, 2, "string.sub", -1)?;
             let start = lua_str_start(len, i);
             let end   = lua_str_end(len, j);
             if start >= end { return Ok(vec![alloc_string_val("")]); }
@@ -3105,7 +3121,7 @@ impl Vm {
         });
         let v_str_rep = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.rep")?;
-            let n = match args.get(1) { None => 0, Some(&v) => int_arg(v, "string.rep")? };
+            let n = int_arg(args.get(1).copied().unwrap_or(Value::nil()), "string.rep")?;
             let sep = match args.get(2) {
                 None => String::new(),
                 Some(&v) if v.is_string() => unsafe { string_ref(v) }.to_owned(),
@@ -3134,19 +3150,27 @@ impl Vm {
             Ok(vec![Value::string(raw)])
         });
         let v_str_upper = self.make_cfn_val(|args| {
-            Ok(vec![alloc_string_val(&str_arg(args, 0, "string.upper")?.to_uppercase())])
+            // C-locale toupper: ASCII only, like Lua. Byte-wise mapping keeps
+            // multibyte UTF-8 sequences untouched.
+            let bytes: Vec<u8> = str_arg(args, 0, "string.upper")?.bytes()
+                .map(|b| b.to_ascii_uppercase()).collect();
+            Ok(vec![alloc_string_val(&String::from_utf8_lossy(&bytes))])
         });
         let v_str_lower = self.make_cfn_val(|args| {
-            Ok(vec![alloc_string_val(&str_arg(args, 0, "string.lower")?.to_lowercase())])
+            let bytes: Vec<u8> = str_arg(args, 0, "string.lower")?.bytes()
+                .map(|b| b.to_ascii_lowercase()).collect();
+            Ok(vec![alloc_string_val(&String::from_utf8_lossy(&bytes))])
         });
         let v_str_reverse = self.make_cfn_val(|args| {
-            let rev: String = str_arg(args, 0, "string.reverse")?.chars().rev().collect();
-            Ok(vec![alloc_string_val(&rev)])
+            // Byte reversal like Lua; slicing mid-character re-validates.
+            let mut bytes: Vec<u8> = str_arg(args, 0, "string.reverse")?.as_bytes().to_vec();
+            bytes.reverse();
+            Ok(vec![alloc_string_val(&String::from_utf8_lossy(&bytes))])
         });
         let v_str_byte = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "string.byte")?;
-            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "string.byte")? };
-            let j = match args.get(2) { None => i, Some(&v) => int_arg(v, "string.byte")? };
+            let i = opt_int_arg(args, 1, "string.byte", 1)?;
+            let j = opt_int_arg(args, 2, "string.byte", i)?;
             let start = lua_str_start(s.len(), i);
             let end   = lua_str_end(s.len(), j).min(s.len());
             if end.saturating_sub(start) > MAX_ALLOC_LEN / 8 {
@@ -3418,81 +3442,75 @@ impl Vm {
         let v_math_floor = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
             if v.is_int_like() { return Ok(vec![v]); }
-            let f = v.as_float().ok_or_else(|| VmError::RuntimeError("math.floor: number expected".into()))?;
+            let f = num_arg(v, "math.floor")?;
             Ok(vec![float_to_int_or_float(f.floor())])
         });
         let v_math_ceil = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
             if v.is_int_like() { return Ok(vec![v]); }
-            let f = v.as_float().ok_or_else(|| VmError::RuntimeError("math.ceil: number expected".into()))?;
+            let f = num_arg(v, "math.ceil")?;
             Ok(vec![float_to_int_or_float(f.ceil())])
         });
         let v_math_abs = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
             if v.is_int_like() { return Ok(vec![make_int_via_current_vm(v.as_int().unwrap().wrapping_abs())]); }
-            let f = v.as_float().ok_or_else(|| VmError::RuntimeError("math.abs: number expected".into()))?;
+            let f = num_arg(v, "math.abs")?;
             Ok(vec![Value::float(f.abs())])
         });
         let v_math_sqrt = self.make_cfn_val(|args| {
-            let f = args.first().copied().unwrap_or(Value::nil()).to_float()
-                .ok_or_else(|| VmError::RuntimeError("math.sqrt: number expected".into()))?;
+            let f = num_arg(args.first().copied().unwrap_or(Value::nil()), "math.sqrt")?;
             Ok(vec![Value::float(f.sqrt())])
         });
         let v_math_max = self.make_cfn_val(|args| {
             if args.is_empty() { return Err(VmError::RuntimeError("math.max: at least one arg required".into())); }
+            num_value_arg(args[0], "math.max")?;
+            // The winner is the original argument, like Lua's lua_pushvalue —
+            // a numeric string stays a string.
             let mut best = args[0];
             for &v in &args[1..] {
-                let better = if best.is_int_like() && v.is_int_like() {
-                    best.as_int().unwrap() < v.as_int().unwrap()
-                } else {
-                    best.to_float().unwrap_or(f64::NEG_INFINITY) < v.to_float().unwrap_or(f64::NEG_INFINITY)
-                };
-                if better { best = v; }
+                let bv = num_value_arg(best, "math.max")?;
+                let vv = num_value_arg(v, "math.max")?;
+                if num_cmp(bv, vv).is_some_and(|o| o.is_lt()) { best = v; }
             }
             Ok(vec![best])
         });
         let v_math_min = self.make_cfn_val(|args| {
             if args.is_empty() { return Err(VmError::RuntimeError("math.min: at least one arg required".into())); }
+            num_value_arg(args[0], "math.min")?;
             let mut best = args[0];
             for &v in &args[1..] {
-                let better = if best.is_int_like() && v.is_int_like() {
-                    best.as_int().unwrap() > v.as_int().unwrap()
-                } else {
-                    best.to_float().unwrap_or(f64::INFINITY) > v.to_float().unwrap_or(f64::INFINITY)
-                };
-                if better { best = v; }
+                let bv = num_value_arg(best, "math.min")?;
+                let vv = num_value_arg(v, "math.min")?;
+                if num_cmp(bv, vv).is_some_and(|o| o.is_gt()) { best = v; }
             }
             Ok(vec![best])
         });
         let v_math_sin  = self.make_cfn_val(|args| {
-            Ok(vec![Value::float(args.first().copied().unwrap_or(Value::nil()).to_float()
-                .ok_or_else(|| VmError::RuntimeError("math.sin: number expected".into()))?.sin())])
+            Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.sin")?.sin())])
         });
         let v_math_cos  = self.make_cfn_val(|args| {
-            Ok(vec![Value::float(args.first().copied().unwrap_or(Value::nil()).to_float()
-                .ok_or_else(|| VmError::RuntimeError("math.cos: number expected".into()))?.cos())])
+            Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.cos")?.cos())])
         });
         let v_math_tan  = self.make_cfn_val(|args| {
-            Ok(vec![Value::float(args.first().copied().unwrap_or(Value::nil()).to_float()
-                .ok_or_else(|| VmError::RuntimeError("math.tan: number expected".into()))?.tan())])
+            Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.tan")?.tan())])
         });
         let v_math_exp  = self.make_cfn_val(|args| {
-            Ok(vec![Value::float(args.first().copied().unwrap_or(Value::nil()).to_float()
-                .ok_or_else(|| VmError::RuntimeError("math.exp: number expected".into()))?.exp())])
+            Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.exp")?.exp())])
         });
         let v_math_log = self.make_cfn_val(|args| {
-            let x = args.first().copied().unwrap_or(Value::nil()).to_float()
-                .ok_or_else(|| VmError::RuntimeError("math.log: number expected".into()))?;
+            let x = num_arg(args.first().copied().unwrap_or(Value::nil()), "math.log")?;
             let result = match args.get(1) {
-                Some(&b) => x.log(b.to_float().ok_or_else(|| VmError::RuntimeError("math.log: number expected for base".into()))?),
-                None => x.ln(),
+                Some(&b) if !b.is_nil() => x.log(num_arg(b, "math.log")?),
+                _ => x.ln(),
             };
             Ok(vec![Value::float(result)])
         });
         let v_math_modf = self.make_cfn_val(|args| {
-            let f = args.first().copied().unwrap_or(Value::nil()).to_float()
-                .ok_or_else(|| VmError::RuntimeError("math.modf: number expected".into()))?;
-            Ok(vec![Value::float(f.trunc()), Value::float(f.fract())])
+            let v = args.first().copied().unwrap_or(Value::nil());
+            if v.is_int_like() { return Ok(vec![v, Value::float(0.0)]); }
+            let f = num_arg(v, "math.modf")?;
+            // Lua returns the integral part as an integer when it fits.
+            Ok(vec![float_to_int_or_float(f.trunc()), Value::float(f.fract())])
         });
         let v_math_type = self.make_cfn_val(|args| {
             let v = args.first().copied().unwrap_or(Value::nil());
@@ -3501,7 +3519,15 @@ impl Vm {
             Ok(vec![Value::nil()])
         });
         let v_math_tointeger = self.make_cfn_val(|args| {
-            let v = args.first().copied().unwrap_or(Value::nil());
+            let v = args.first().copied().ok_or_else(||
+                VmError::RuntimeError("math.tointeger: value expected".into()))?;
+            // lua_tointegerx coerces numeric strings too.
+            let v = if v.is_string() {
+                match str_to_number(unsafe { string_ref(v) }) {
+                    Some(nv) => nv,
+                    None => return Ok(vec![Value::nil()]),
+                }
+            } else { v };
             if v.is_int_like() { return Ok(vec![v]); }
             if v.is_float() {
                 let f = v.as_float().unwrap();
@@ -3524,7 +3550,9 @@ impl Vm {
                 0 => Ok(vec![Value::float((r >> 11) as f64 * (1.0_f64 / (1u64 << 53) as f64))]),
                 1 => {
                     let m = int_arg(args[0], "math.random")?;
-                    if m < 1 { return Err(VmError::RuntimeError("math.random: interval is empty".into())); }
+                    // m == 0 means "any bits", like Lua's project.
+                    if m == 0 { return Ok(vec![make_int_via_current_vm(r as i64)]); }
+                    if m < 0 { return Err(VmError::RuntimeError("math.random: interval is empty".into())); }
                     Ok(vec![make_int_via_current_vm(1 + (r % m as u64) as i64)])
                 }
                 _ => {
@@ -3554,8 +3582,8 @@ impl Vm {
                 if y == 0 { return Err(VmError::RuntimeError("math.fmod: zero divisor".into())); }
                 return Ok(vec![make_int_via_current_vm(x.wrapping_rem(y))]);
             }
-            let x = a.to_float().ok_or_else(|| VmError::RuntimeError("math.fmod: number expected".into()))?;
-            let y = b.to_float().ok_or_else(|| VmError::RuntimeError("math.fmod: number expected".into()))?;
+            let x = num_arg(a, "math.fmod")?;
+            let y = num_arg(b, "math.fmod")?;
             Ok(vec![Value::float(x % y)])
         });
         let v_math_ult = self.make_cfn_val(|args| {
@@ -3625,8 +3653,13 @@ impl Vm {
             if !t.is_table() { return Err(VmError::RuntimeError("table.remove: table expected".into())); }
             let tbl = unsafe { table_ref(t) };
             let n = tbl.length();
-            let pos = match args.get(1) { None => n, Some(&v) => int_arg(v, "table.remove")? };
-            if n == 0 || pos < 1 || pos > n { return Ok(vec![Value::nil()]); }
+            let pos = opt_int_arg(args, 1, "table.remove", n)?;
+            // Lua: pos == n removes the last element unconditionally; any
+            // other position must satisfy 1 <= pos <= n+1.
+            if pos != n && (pos < 1 || pos > n + 1) {
+                return Err(VmError::RuntimeError("table.remove: position out of bounds".into()));
+            }
+            if pos < 1 || pos > n { return Ok(vec![Value::nil()]); }
             let removed = tbl.raw_get(Value::int(pos));
             for i in pos..n {
                 let next = tbl.raw_get(Value::int(i + 1));
@@ -3647,8 +3680,8 @@ impl Vm {
                 Some(_) => return Err(VmError::RuntimeError("table.concat: string expected".into())),
             };
             let n = tbl.length();
-            let i = match args.get(2) { None => 1, Some(&v) => int_arg(v, "table.concat")? };
-            let j = match args.get(3) { None => n, Some(&v) => int_arg(v, "table.concat")? };
+            let i = opt_int_arg(args, 2, "table.concat", 1)?;
+            let j = opt_int_arg(args, 3, "table.concat", n)?;
             if checked_range_len(i, j).is_none() {
                 return Err(VmError::RuntimeError("table.concat: range too large".into()));
             }
@@ -3681,25 +3714,6 @@ impl Vm {
                             Ok(res) => Ok(res.into_iter().next().unwrap_or(Value::nil()).is_truthy()),
                             Err(e)  => Err(e),
                         }
-                    }).and_then(|lt| {
-                        // Lua's "invalid order function": a comparator that
-                        // claims both a<b and b<a can't drive a sort.
-                        if !lt { return Ok(false); }
-                        CURRENT_VM.with(|c| {
-                            let vm_ptr = c.get();
-                            if vm_ptr.is_null() { return Ok(false); }
-                            let vm = unsafe { &mut *vm_ptr };
-                            match vm.call_value_isolated(cf, &[*b, *a]) {
-                                Ok(res) => {
-                                    if res.into_iter().next().unwrap_or(Value::nil()).is_truthy() {
-                                        Err(VmError::RuntimeError("invalid order function for sorting".into()))
-                                    } else {
-                                        Ok(true)
-                                    }
-                                }
-                                Err(e) => Err(e),
-                            }
-                        })
                     }),
                     None => value_lt(*a, *b),
                 };
@@ -3732,8 +3746,8 @@ impl Vm {
             if !t.is_table() { return Err(VmError::RuntimeError("table.unpack: table expected".into())); }
             let tbl = unsafe { &*(t.as_table().unwrap() as *const Table) };
             let n = tbl.length();
-            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "table.unpack")? };
-            let j = match args.get(2) { None => n, Some(&v) => int_arg(v, "table.unpack")? };
+            let i = opt_int_arg(args, 1, "table.unpack", 1)?;
+            let j = opt_int_arg(args, 2, "table.unpack", n)?;
             if checked_range_len(i, j).is_none() {
                 return Err(VmError::RuntimeError("table.unpack: range too large".into()));
             }
@@ -3751,8 +3765,9 @@ impl Vm {
                 Some(_) => return Err(VmError::RuntimeError("table.move: table expected".into())),
             };
             if e >= f {
-                if checked_range_len(f, e).is_none() {
-                    return Err(VmError::RuntimeError("table.move: range too large".into()));
+                if checked_range_len(f, e).is_none()
+                    || t.checked_add(e - f).is_none() {
+                    return Err(VmError::RuntimeError("table.move: too many elements to move".into()));
                 }
                 let vals: Vec<Value> = (f..=e)
                     .map(|k| unsafe { (*(a1.as_table().unwrap() as *const Table)).raw_get(make_int_via_current_vm(k)) })
@@ -3960,11 +3975,12 @@ impl Vm {
         self.gc.register(os_table_ptr);
 
         let v_os_time = self.make_cfn_val(|args| {
-            if let Some(&t) = args.first() {
+            // lua_isnoneornil: no argument (or nil) means the current time.
+            if let Some(&t) = args.first().filter(|v| !v.is_nil()) {
                 if !t.is_table() {
                     return Err(VmError::RuntimeError("os.time: table expected".into()));
                 }
-                let tbl = unsafe { &*(t.as_table().unwrap() as *const Table) };
+                let tbl = unsafe { table_ref(t) };
                 let get = |name: &str| tbl.raw_get(alloc_string_val(name));
                 let field = |name: &str, who: &str| -> VmResult<i64> {
                     let v = get(name);
@@ -3979,9 +3995,30 @@ impl Vm {
                 let hour   = if get("hour").is_nil() { 12 } else { int_arg(get("hour"), "os.time")? };
                 let min    = if get("min").is_nil() { 0 } else { int_arg(get("min"), "os.time")? };
                 let sec    = if get("sec").is_nil() { 0 } else { int_arg(get("sec"), "os.time")? };
-                let isdst  = get("isdst").is_truthy();
-                return Ok(vec![make_int_via_current_vm(days_from_civil(year, month, day) * 86400
-                    + hour * 3600 + min * 60 + sec - if isdst { 3600 } else { 0 })]);
+                // isdst is read but ignored: Umbra's clock is UTC, which has
+                // no DST, so mktime would not shift the result either.
+                let _isdst = get("isdst").is_truthy();
+                let days = days_from_civil(year, month, day);
+                let Some(secs) = days.checked_mul(86400)
+                    .and_then(|d| d.checked_add(hour * 3600 + min * 60 + sec))
+                else {
+                    return Err(VmError::RuntimeError(
+                        "os.time: time result cannot be represented".into()));
+                };
+                // mktime writes the normalized fields back into the table.
+                let (ny, nm, nd, yday, wday) = civil_fields(secs);
+                let sod = secs.rem_euclid(86400);
+                let mut set = |k: &str, v: i64| tbl.raw_set(alloc_string_val(k), make_int_via_current_vm(v));
+                set("year", ny);
+                set("month", nm as i64);
+                set("day", nd as i64);
+                set("hour", sod / 3600);
+                set("min", (sod / 60) % 60);
+                set("sec", sod % 60);
+                set("wday", wday as i64 + 1);
+                set("yday", yday as i64);
+                tbl.raw_set(alloc_string_val("isdst"), Value::bool(false));
+                return Ok(vec![make_int_via_current_vm(secs)]);
             }
             let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64).unwrap_or(0);
@@ -4001,7 +4038,10 @@ impl Vm {
         let v_os_date = self.make_cfn_val(|args| {
             let mut fmt = match args.first() {
                 None => "%c".to_owned(),
+                Some(&v) if v.is_nil() => "%c".to_owned(),
                 Some(&v) if v.is_string() => unsafe { string_ref(v) }.to_owned(),
+                // luaL_optlstring coerces numbers to strings.
+                Some(&v) if v.is_number() => coerce_to_concat_str(v),
                 Some(_) => return Err(VmError::RuntimeError("os.date: string expected".into())),
             };
             // '!' selects UTC; Umbra only has UTC, so it's a no-op marker.
@@ -4009,6 +4049,8 @@ impl Vm {
             let secs = match args.get(1) {
                 None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64).unwrap_or(0),
+                Some(&v) if v.is_nil() => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
                 Some(&v) => int_arg(v, "os.date")?,
             };
             if fmt == "*t" {
@@ -4036,7 +4078,7 @@ impl Vm {
                     Value::table(ptr)
                 })]);
             }
-            Ok(vec![alloc_string_val(&format_civil_time(secs, &fmt))])
+            Ok(vec![alloc_string_val(&format_civil_time(secs, &fmt)?)])
         });
         {
             let ot = unsafe { &mut *(os_table_ptr as *mut Table) };
@@ -4063,35 +4105,92 @@ impl Vm {
         });
         let v_utf8_len = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "utf8.len")?;
-            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "utf8.len")? };
-            let j = match args.get(2) { None => -1, Some(&v) => int_arg(v, "utf8.len")? };
-            let start = lua_str_start(s.len(), i);
-            let end = lua_str_end(s.len(), j);
-            // An empty range is 0 characters, not an error.
-            if start > end { return Ok(vec![Value::int(0)]); }
-            if !s.is_char_boundary(start) || !s.is_char_boundary(end) {
+            let i = opt_int_arg(args, 1, "utf8.len", 1)?;
+            let j = opt_int_arg(args, 2, "utf8.len", -1)?;
+            // u_posrelat + bounds checks, like Lua: i in [1, len+1], j <= len.
+            let posi = u_posrelat(i, s.len());
+            let posj = u_posrelat(j, s.len());
+            if !(1..=s.len() as i64 + 1).contains(&posi) {
+                return Err(VmError::RuntimeError("utf8.len: initial position out of bounds".into()));
+            }
+            if posj - 1 >= s.len() as i64 {
+                return Err(VmError::RuntimeError("utf8.len: final position out of bounds".into()));
+            }
+            // Counts characters that START in [i, j]; a mid-character j is
+            // fine, but a mid-character i is an invalid position.
+            if posi > posj { return Ok(vec![Value::int(0)]); }
+            let (start, end) = ((posi - 1) as usize, (posj - 1) as usize);
+            if !s.is_char_boundary(start) {
                 return Ok(vec![Value::nil(), Value::int(start as i64 + 1)]);
             }
-            Ok(vec![make_int_via_current_vm(s[start..end].chars().count() as i64)])
+            let n = s[start..].char_indices().take_while(|(off, _)| start + off <= end).count();
+            Ok(vec![make_int_via_current_vm(n as i64)])
         });
         let v_utf8_codepoint = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "utf8.codepoint")?;
-            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "utf8.codepoint")? };
-            let j = match args.get(2) { None => i, Some(&v) => int_arg(v, "utf8.codepoint")? };
-            let start = lua_str_start(s.len(), i);
-            // i/j are start-of-character byte positions, not a byte range end —
-            // a multi-byte char's last byte can't be an exact "j" on its own.
-            let last_start = lua_str_start(s.len(), j);
-            if start > last_start { return Ok(vec![]); }
-            if start > s.len() || !s.is_char_boundary(start) {
+            let i = opt_int_arg(args, 1, "utf8.codepoint", 1)?;
+            let j = match args.get(2) {
+                None => i,
+                Some(&v) if v.is_nil() => i,
+                Some(&v) => int_arg(v, "utf8.codepoint")?,
+            };
+            let posi = u_posrelat(i, s.len());
+            let pose = u_posrelat(j, s.len());
+            if posi < 1 {
+                return Err(VmError::RuntimeError("utf8.codepoint: initial position out of bounds".into()));
+            }
+            if pose > s.len() as i64 {
+                return Err(VmError::RuntimeError("utf8.codepoint: final position out of bounds".into()));
+            }
+            if posi > pose { return Ok(vec![]); }
+            let start = (posi - 1) as usize;
+            // Characters that start in [posi, pose]; pose may sit mid-character.
+            if !s.is_char_boundary(start) {
                 return Err(VmError::RuntimeError("utf8.codepoint: invalid byte position".into()));
             }
             let mut result = Vec::new();
             for (off, ch) in s[start..].char_indices() {
-                if start + off > last_start { break; }
+                if start + off >= pose as usize { break; }
                 result.push(make_int_via_current_vm(ch as i64));
             }
             Ok(result)
+        });
+        let v_utf8_offset = self.make_cfn_val(|args| {
+            let s = str_arg(args, 0, "utf8.offset")?;
+            let n = int_arg(args.get(1).copied().unwrap_or(Value::nil()), "utf8.offset")?;
+            let default_i = if n >= 0 { 1 } else { s.len() as i64 + 1 };
+            let i = opt_int_arg(args, 2, "utf8.offset", default_i)?;
+            let posi = u_posrelat(i, s.len());
+            if !(1..=s.len() as i64 + 1).contains(&posi) {
+                return Err(VmError::RuntimeError("utf8.offset: position out of bounds".into()));
+            }
+            let mut posi = (posi - 1) as usize;
+            let mut n = n;
+            if n == 0 {
+                // Beginning of the byte sequence containing position i.
+                while posi > 0 && !s.is_char_boundary(posi) { posi -= 1; }
+            } else {
+                if posi < s.len() && !s.is_char_boundary(posi) {
+                    return Err(VmError::RuntimeError(
+                        "utf8.offset: initial position is a continuation byte".into()));
+                }
+                if n < 0 {
+                    while n < 0 && posi > 0 {
+                        posi -= 1;
+                        while posi > 0 && !s.is_char_boundary(posi) { posi -= 1; }
+                        n += 1;
+                    }
+                } else {
+                    n -= 1;
+                    while n > 0 && posi < s.len() {
+                        posi += 1;
+                        while posi < s.len() && !s.is_char_boundary(posi) { posi += 1; }
+                        n -= 1;
+                    }
+                }
+            }
+            if n == 0 { Ok(vec![make_int_via_current_vm(posi as i64 + 1)]) }
+            else { Ok(vec![Value::nil()]) }
         });
         let v_utf8_codes = self.make_cfn_val(|args| {
             let s = str_arg(args, 0, "utf8.codes")?.to_owned();
@@ -4100,12 +4199,12 @@ impl Vm {
                 if vm_ptr.is_null() { return Value::nil(); }
                 unsafe { &mut *vm_ptr }.make_cfn_val(move |cargs| {
                     let prev = match cargs.get(1) { None => 0, Some(&v) => int_arg(v, "utf8.codes")? };
+                    // The control value is the 1-based start of the previous
+                    // character; skip its continuation bytes like iter_aux.
                     let next_byte = if prev <= 0 { 0usize } else {
-                        let p = (prev - 1) as usize;
-                        if p >= s.len() || !s.is_char_boundary(p) {
-                            return Err(VmError::RuntimeError("utf8.codes: invalid byte position".into()));
-                        }
-                        p + s[p..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+                        let mut p = prev as usize;
+                        while p < s.len() && !s.is_char_boundary(p) { p += 1; }
+                        p
                     };
                     match s.get(next_byte..).and_then(|rest| rest.chars().next()) {
                         Some(ch) => Ok(vec![
@@ -4124,6 +4223,7 @@ impl Vm {
             let k = self.intern("len");       ut.raw_set(k, v_utf8_len);
             let k = self.intern("codepoint"); ut.raw_set(k, v_utf8_codepoint);
             let k = self.intern("codes");     ut.raw_set(k, v_utf8_codes);
+            let k = self.intern("offset");    ut.raw_set(k, v_utf8_offset);
         }
         let k_utf8 = self.intern("utf8");
         self.globals.raw_set(k_utf8, Value::table(utf8_table_ptr));
@@ -4391,7 +4491,10 @@ fn tostring_value(v: Value) -> VmResult<String> {
             let mm = vm.get_mm(v, "__tostring");
             if mm.is_nil() { return Ok(None); }
             let sv = vm.call_value_isolated(mm, &[v])?.into_iter().next().unwrap_or(Value::nil());
-            Ok(Some(if sv.is_string() { unsafe { string_ref(sv) }.to_owned() } else { format!("{sv}") }))
+            // luaL_tolstring: __tostring must return a string or a number.
+            if sv.is_string() { return Ok(Some(unsafe { string_ref(sv) }.to_owned())); }
+            if sv.is_number() { return Ok(Some(format!("{sv}"))); }
+            Err(VmError::RuntimeError("'__tostring' must return a string".into()))
         });
         if let Some(s) = via_mm.transpose()?.flatten() { return Ok(s); }
     }
@@ -4417,14 +4520,81 @@ fn int_val(v: Value) -> VmResult<i64> {
     Err(VmError::RuntimeError(format!("integer expected, got {}", v.type_name())))
 }
 
+// Lua's lua_stringtonumber: full-string parse of a decimal or hex numeral
+// (leading/trailing whitespace allowed, hex ints wrap, 'inf'/'nan' rejected
+// like l_str2d's 'n' check). Returns None on any trailing junk.
+fn str_to_number(s: &str) -> Option<Value> {
+    let s = s.trim();
+    let (neg, body) = match s.strip_prefix('-') { Some(r) => (true, r), None => (false, s) };
+    let body = body.strip_prefix('+').unwrap_or(body);
+    if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        if !hex.is_empty() && hex.bytes().all(|b| (b as char).is_ascii_hexdigit()) {
+            let mut n: u64 = 0;
+            for c in hex.bytes() { n = n.wrapping_mul(16).wrapping_add((c as char).to_digit(16).unwrap() as u64); }
+            let n = n as i64;
+            return Some(make_int_via_current_vm(if neg { n.wrapping_neg() } else { n }));
+        }
+        if let Ok(f) = crate::lexer::parse_hex_float(body) {
+            return Some(Value::float(if neg { -f } else { f }));
+        }
+        return None;
+    }
+    // l_str2d rejects strings whose first '.', 'x'/'X', or 'n'/'N' is an
+    // 'n'/'N' — that's how 'inf'/'nan' are excluded from strtod's grammar.
+    if s.bytes().find(|b| matches!(b, b'.' | b'x' | b'X' | b'n' | b'N'))
+        .is_some_and(|b| b == b'n' || b == b'N') {
+        return None;
+    }
+    if let Ok(n) = s.parse::<i64>() { return Some(make_int_via_current_vm(n)); }
+    if let Ok(f) = s.parse::<f64>() { return Some(Value::float(f)); }
+    None
+}
+
 // Strict integer argument for stdlib calls, matching Lua's luaL_checkinteger:
-// integral floats convert, anything else is an error (int_from_val silently
-// truncated non-integral floats and defaulted non-numbers to 0).
+// integral floats and numeric strings convert, anything else is an error
+// (int_from_val silently truncated non-integral floats and defaulted
+// non-numbers to 0).
 fn int_arg(v: Value, who: &str) -> VmResult<i64> {
+    let v = if v.is_string() {
+        match str_to_number(unsafe { string_ref(v) }) {
+            Some(nv) => nv,
+            None => return Err(VmError::RuntimeError(format!("{who}: integer expected, got string"))),
+        }
+    } else { v };
     int_val(v).map_err(|e| match e {
         VmError::RuntimeError(m) => VmError::RuntimeError(format!("{who}: {m}")),
         other => other,
     })
+}
+
+// Optional integer argument: nil means "use the default", like luaL_optinteger.
+fn opt_int_arg(args: &[Value], idx: usize, who: &'static str, default: i64) -> VmResult<i64> {
+    match args.get(idx) {
+        None => Ok(default),
+        Some(&v) if v.is_nil() => Ok(default),
+        Some(&v) => int_arg(v, who),
+    }
+}
+
+// Float argument for stdlib calls, matching luaL_checknumber: numbers and
+// numeric strings convert (as a float even for integral strings).
+fn num_arg(v: Value, who: &str) -> VmResult<f64> {
+    if let Some(f) = v.to_float() { return Ok(f); }
+    if v.is_string() {
+        if let Some(nv) = str_to_number(unsafe { string_ref(v) }) {
+            return Ok(nv.to_float().unwrap());
+        }
+    }
+    Err(VmError::RuntimeError(format!("{who}: number expected, got {}", v.type_name())))
+}
+// Same coercion as num_arg but keeps the Value (int stays int) — for
+// comparisons that must not go through f64, like math.max/min.
+fn num_value_arg(v: Value, who: &str) -> VmResult<Value> {
+    if v.is_number() { return Ok(v); }
+    if v.is_string() {
+        if let Some(nv) = str_to_number(unsafe { string_ref(v) }) { return Ok(nv); }
+    }
+    Err(VmError::RuntimeError(format!("{who}: number expected, got {}", v.type_name())))
 }
 
 // Lua shift semantics: negative counts shift the other way, |n| >= 64 gives 0.
@@ -4604,6 +4774,14 @@ fn read_number_from_file(file: &mut std::fs::File) -> VmResult<Value> {
     }
     Ok(v)
 }
+// u_posrelat from lutf8lib: 1-based position, negative counts back from the
+// end; too-far-negative clamps to 0 (which callers then reject or treat as
+// an empty range).
+fn u_posrelat(pos: i64, len: usize) -> i64 {
+    if pos >= 0 { pos }
+    else if pos.wrapping_neg() as u64 > len as u64 { 0 }
+    else { len as i64 + pos + 1 }
+}
 
 fn read_file_format(file: &mut std::fs::File, fv: &Value, binary: bool) -> VmResult<Value> {
     use std::io::{Read, Seek};
@@ -4772,7 +4950,7 @@ fn fmt_e(f: f64, prec: usize, upper: bool) -> String {
 
 // C-style %g: shortest of %e/%f at the given significant-digit count, with
 // trailing zeros stripped.
-fn fmt_g(f: f64, prec: usize, upper: bool) -> String {
+fn fmt_g(f: f64, prec: usize, upper: bool, alt: bool) -> String {
     if f.is_nan() { return if upper { "NAN".into() } else { "nan".into() }; }
     if f.is_infinite() { return if upper { "INF".into() } else { "inf".into() }; }
     let p = if prec == 0 { 1 } else { prec };
@@ -4783,7 +4961,8 @@ fn fmt_g(f: f64, prec: usize, upper: bool) -> String {
         let epos = t.rfind('e').unwrap();
         let ex: i32 = t[epos + 1..].parse().unwrap();
         let mut m: String = t[..epos].into();
-        if m.contains('.') {
+        // '#' keeps trailing zeros (and the point) instead of stripping.
+        if !alt && m.contains('.') {
             while m.ends_with('0') { m.pop(); }
             if m.ends_with('.') { m.pop(); }
         }
@@ -4791,7 +4970,7 @@ fn fmt_g(f: f64, prec: usize, upper: bool) -> String {
     } else {
         let decimals = (p as i32 - 1 - exp).max(0) as usize;
         let mut t = format!("{:.*}", decimals, f);
-        if t.contains('.') {
+        if !alt && t.contains('.') {
             while t.ends_with('0') { t.pop(); }
             if t.ends_with('.') { t.pop(); }
         }
@@ -4820,7 +4999,11 @@ fn fmt_a(f: f64, prec: Option<usize>, upper: bool) -> String {
             for d in ds { digits.push(char::from_digit(d as u32, 16).unwrap()); }
         }
         Some(p) => {
-            if p < 13 {
+            if p == 0 {
+                // glibc rounds the whole significand (leading digit included)
+                // without renormalizing: %.0a of 1.5 is 0x2p+0, not 0x1p+1.
+                if frac >= 1u64 << 51 { lead += 1; }
+            } else if p < 13 {
                 // Round the 52-bit mantissa to p hex digits (half up).
                 let drop = 52 - p as u32 * 4;
                 frac += 1u64 << (drop - 1);
@@ -4863,6 +5046,11 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
         }
         if bytes[pos] == b'%' { out.push('%'); pos += 1; continue; }
 
+        // Lua checks the argument exists before parsing the specifier.
+        arg_idx += 1;
+        let v = args.get(arg_idx - 1).copied().ok_or_else(|| VmError::RuntimeError(
+            format!("bad argument #{arg_idx} to 'format' (value expected)")))?;
+
         let mut left = false;
         let mut plus = false;
         let mut zero = false;
@@ -4878,18 +5066,29 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
                 _ => break,
             }
         }
+        // Lua's get2digits: width and precision are at most two digits.
         let mut width = 0usize;
-        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-            width = (width.saturating_mul(10) + (bytes[pos] - b'0') as usize).min(MAX_ALLOC_LEN);
-            pos += 1;
+        for _ in 0..2 {
+            if pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                width = width * 10 + (bytes[pos] - b'0') as usize;
+                pos += 1;
+            }
+        }
+        if pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            return Err(VmError::RuntimeError("invalid conversion specification to 'format'".into()));
         }
         let mut prec: Option<usize> = None;
         if pos < bytes.len() && bytes[pos] == b'.' {
             pos += 1;
             let mut p = 0usize;
-            while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-                p = (p.saturating_mul(10) + (bytes[pos] - b'0') as usize).min(MAX_ALLOC_LEN);
-                pos += 1;
+            for _ in 0..2 {
+                if pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                    p = p * 10 + (bytes[pos] - b'0') as usize;
+                    pos += 1;
+                }
+            }
+            if pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                return Err(VmError::RuntimeError("invalid conversion specification to 'format'".into()));
             }
             prec = Some(p);
         }
@@ -4898,11 +5097,21 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
         }
         let spec = bytes[pos] as char; pos += 1;
 
-        arg_idx += 1;
-        let v = args.get(arg_idx - 1).copied().ok_or_else(|| VmError::RuntimeError(
-            format!("bad argument #{arg_idx} to 'format' (value expected)")))?;
         let num_err = |m: &str| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' ({m})"));
+        let conv_err = || VmError::RuntimeError("invalid conversion specification to 'format'".into());
+        // checkformat: each conversion allows a subset of the flags.
+        let check_flags = |allowed: &str, allow_prec: bool| -> VmResult<()> {
+            for (on, f) in [(left, '-'), (plus, '+'), (zero, '0'), (space, ' '), (alt, '#')] {
+                if on && !allowed.contains(f) { return Err(conv_err()); }
+            }
+            if prec.is_some() && !allow_prec { return Err(conv_err()); }
+            Ok(())
+        };
         let fmt_int = |v: Value| -> VmResult<i64> {
+            let v = if v.is_string() {
+                str_to_number(unsafe { string_ref(v) })
+                    .ok_or_else(|| num_err("number expected"))?
+            } else { v };
             if let Some(n) = v.as_int() { return Ok(n); }
             if let Some(f) = v.as_float() {
                 if f.fract() == 0.0 && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
@@ -4913,7 +5122,13 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
             Err(num_err("number expected"))
         };
         let fmt_num = |v: Value| -> VmResult<f64> {
-            v.to_float().ok_or_else(|| num_err("number expected"))
+            if let Some(f) = v.to_float() { return Ok(f); }
+            if v.is_string() {
+                if let Some(nv) = str_to_number(unsafe { string_ref(v) }) {
+                    return Ok(nv.to_float().unwrap());
+                }
+            }
+            Err(num_err("number expected"))
         };
         // Sign + zero-padding shared by the float conversions.
         let float_body = |f: f64, body: String| -> String {
@@ -4925,6 +5140,7 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
         let s = match spec {
             'd' | 'i' => {
                 let n = fmt_int(v)?;
+                check_flags("-+0 ", true)?;
                 let mut raw = n.unsigned_abs().to_string();
                 // Precision for integers means minimum digits (zero-filled),
                 // disables the '0' flag, and %.0d of zero prints nothing.
@@ -4940,6 +5156,7 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
             }
             'u' => {
                 let n = fmt_int(v)? as u64;
+                check_flags("-0", true)?;
                 let mut raw = n.to_string();
                 if let Some(p) = prec {
                     if p == 0 && n == 0 { raw.clear(); }
@@ -4949,13 +5166,14 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
             }
             'x' | 'X' | 'o' => {
                 let n = fmt_int(v)? as u64;
+                check_flags("-#0", true)?;
                 let mut raw = match spec { 'x' => format!("{n:x}"), 'X' => format!("{n:X}"), _ => format!("{n:o}") };
                 if let Some(p) = prec {
                     if p == 0 && n == 0 { raw.clear(); }
                     while raw.len() < p { raw.insert(0, '0'); }
                 }
-                // For octal, '#' forces a leading zero even at precision 0.
-                if alt && spec == 'o' && raw.is_empty() { raw = "0".into(); }
+                // For octal, '#' forces a leading zero.
+                if alt && spec == 'o' && !raw.starts_with('0') { raw = format!("0{raw}"); }
                 let prefix = if alt && n != 0 {
                     match spec { 'x' => "0x", 'X' => "0X", _ => "" }
                 } else { "" };
@@ -4968,59 +5186,122 @@ fn string_format(fmt: &str, args: &[Value]) -> VmResult<Vec<Value>> {
             }
             'c' => {
                 let n = fmt_int(v)?;
-                let ch = u8::try_from(n).map(|b| b as char)
-                    .map_err(|_| num_err("char out of range"))?;
-                pad_str(ch.to_string(), width, left, false)
+                check_flags("-", false)?;
+                // C's %c takes the int mod 256; bytes >= 0x80 become the
+                // corresponding UTF-8 char (documented UTF-8 difference).
+                pad_str((n as u8 as char).to_string(), width, left, false)
             }
-            'f' | 'F' => {
+            'f' => {
                 let f = fmt_num(v)?;
-                let body = format!("{:.*}", prec.unwrap_or(6), f.abs());
+                check_flags("-+#0 ", true)?;
+                let mut body = format!("{:.*}", prec.unwrap_or(6), f.abs());
+                if alt && !body.contains('.') { body.push('.'); }
                 pad_str(float_body(f, body), width, left, zero && f.is_finite())
             }
             'e' | 'E' => {
                 let f = fmt_num(v)?;
-                let body = fmt_e(f.abs(), prec.unwrap_or(6), spec == 'E');
+                check_flags("-+#0 ", true)?;
+                let mut body = fmt_e(f.abs(), prec.unwrap_or(6), spec == 'E');
+                if alt {
+                    let epos = body.find(['e', 'E']).unwrap_or(body.len());
+                    if !body[..epos].contains('.') { body.insert(epos, '.'); }
+                }
                 pad_str(float_body(f, body), width, left, zero && f.is_finite())
             }
             'g' | 'G' => {
                 let f = fmt_num(v)?;
-                let body = fmt_g(f.abs(), prec.unwrap_or(6), spec == 'G');
+                check_flags("-+#0 ", true)?;
+                let body = fmt_g(f.abs(), prec.unwrap_or(6), spec == 'G', alt);
                 pad_str(float_body(f, body), width, left, zero && f.is_finite())
             }
             'a' | 'A' => {
                 let f = fmt_num(v)?;
-                let body = fmt_a(f.abs(), prec, spec == 'A');
+                check_flags("-+#0 ", true)?;
+                let mut body = fmt_a(f.abs(), prec, spec == 'A');
+                if alt && !body.contains('.') {
+                    let ppos = body.find(['p', 'P']).unwrap_or(body.len());
+                    body.insert(ppos, '.');
+                }
                 pad_str(float_body(f, body), width, left, zero && f.is_finite())
             }
             's' => {
                 let raw = tostring_value(v)?;
-                let raw = if let Some(p) = prec { raw.chars().take(p).collect::<String>() } else { raw };
+                let has_mods = left || plus || zero || space || alt || width > 0 || prec.is_some();
+                if has_mods {
+                    if raw.contains('\0') {
+                        return Err(num_err("string contains zeros"));
+                    }
+                    check_flags("-", true)?;
+                }
+                // Precision counts bytes like C; cut at a char boundary so
+                // the result stays valid UTF-8.
+                let raw = if let Some(p) = prec {
+                    let mut cut = p.min(raw.len());
+                    while !raw.is_char_boundary(cut) { cut -= 1; }
+                    raw[..cut].to_owned()
+                } else { raw };
                 pad_str(raw, width, left, false)
             }
             'q' => {
+                if left || plus || zero || space || alt || width > 0 || prec.is_some() {
+                    return Err(VmError::RuntimeError(
+                        "specifier '%q' cannot have modifiers".into()));
+                }
                 if v.is_int_like() {
-                    v.as_int().unwrap().to_string()
+                    let n = v.as_int().unwrap();
+                    // LUA_MININTEGER can't be negated for decimal printing;
+                    // Lua emits it as hex.
+                    if n == i64::MIN { "0x8000000000000000".into() } else { n.to_string() }
                 } else if v.is_float() {
-                    // {:?} prints the shortest round-trip form with a
-                    // mandatory fraction/exponent, so it re-reads as a float.
-                    format!("{:?}", v.as_float().unwrap())
+                    let f = v.as_float().unwrap();
+                    // Lua quotes floats as %a hex so they re-read exactly.
+                    if f.is_infinite() {
+                        if f > 0.0 { "1e9999".into() } else { "-1e9999".into() }
+                    } else if f.is_nan() {
+                        "(0/0)".into()
+                    } else {
+                        let body = fmt_a(f.abs(), None, false);
+                        if f.is_sign_negative() { format!("-{body}") } else { body }
+                    }
                 } else if v.is_string() {
-                    let s = unsafe { string_ref(v) };
-                    let mut q = String::from("\"");
-                    for ch in s.chars() {
-                        match ch {
-                            '"'  => q.push_str("\\\""),
-                            '\\' => q.push_str("\\\\"),
-                            '\n' => q.push_str("\\n"),
-                            '\r' => q.push_str("\\r"),
-                            c if (c as u32) < 0x20 || (c as u32) == 0x7f =>
-                                q.push_str(&format!("\\{:03}", c as u32)),
-                            _    => q.push(ch),
+                    let sb = unsafe { string_ref(v) }.as_bytes();
+                    let mut q: Vec<u8> = Vec::with_capacity(sb.len() + 2);
+                    q.push(b'"');
+                    for (i, &b) in sb.iter().enumerate() {
+                        match b {
+                            b'"' | b'\\' | b'\n' => { q.push(b'\\'); q.push(b); }
+                            _ if b < 0x20 || b == 0x7f => {
+                                // \ddd only when a digit follows (else \d).
+                                if i + 1 < sb.len() && sb[i + 1].is_ascii_digit() {
+                                    q.extend_from_slice(format!("\\{b:03}").as_bytes());
+                                } else {
+                                    q.extend_from_slice(format!("\\{b}").as_bytes());
+                                }
+                            }
+                            _ => q.push(b),
                         }
                     }
-                    q.push('"'); q
+                    q.push(b'"');
+                    // Valid UTF-8 in, ASCII escapes out: still valid UTF-8.
+                    String::from_utf8(q).unwrap()
+                } else if v.is_nil() || v.is_bool() {
+                    format!("{v}")
                 } else {
                     return Err(num_err("value has no literal form"));
+                }
+            }
+            'p' => {
+                check_flags("-", false)?;
+                let ptr = if v.is_table() { v.as_table() }
+                    else if v.is_string() { v.as_string() }
+                    else if v.is_closure() { v.as_closure() }
+                    else if v.is_coroutine() { v.as_coroutine() }
+                    else if v.is_userdata() { v.as_userdata() }
+                    else if v.is_bytes() { v.as_bytes_ptr() }
+                    else { None };
+                match ptr {
+                    Some(p) => pad_str(format!("0x{}", p as usize), width, left, false),
+                    None => pad_str("(null)".into(), width, left, false),
                 }
             }
             _ => return Err(VmError::RuntimeError(format!("invalid option '%{spec}' to 'format'"))),

@@ -346,11 +346,13 @@ mod tests {
     }
 
     #[test]
-    fn stdlib_string_format_clamps_huge_width() {
-        assert_output(
-            "print(string.len(string.format(\"%999999999999d\", 1)))",
-            &["67108864"],
-        );
+    fn stdlib_string_format_rejects_huge_width() {
+        // Lua's get2digits caps width/precision at two digits.
+        assert!(run("string.format(\"%999999999999d\", 1)").is_err());
+        assert!(run("string.format(\"%.100f\", 1.5)").is_err());
+        assert_output("print(string.format(\"%99d\", 1))", &[
+            "                                                                                                  1",
+        ]);
     }
 
     #[test]
@@ -1173,9 +1175,9 @@ print(pcall(f))"#,
 
     #[test]
     fn os_date_matches_known_epoch_values() {
-        assert_eq!(vm::format_civil_time(0, "%Y-%m-%d %H:%M:%S"), "1970-01-01 00:00:00");
-        assert_eq!(vm::format_civil_time(1700000000, "%Y-%m-%d %H:%M:%S"), "2023-11-14 22:13:20");
-        assert_eq!(vm::format_civil_time(1000000000, "%Y-%m-%d %H:%M:%S"), "2001-09-09 01:46:40");
+        assert_eq!(vm::format_civil_time(0, "%Y-%m-%d %H:%M:%S").unwrap(), "1970-01-01 00:00:00");
+        assert_eq!(vm::format_civil_time(1700000000, "%Y-%m-%d %H:%M:%S").unwrap(), "2023-11-14 22:13:20");
+        assert_eq!(vm::format_civil_time(1000000000, "%Y-%m-%d %H:%M:%S").unwrap(), "2001-09-09 01:46:40");
     }
 
     #[test]
@@ -3445,8 +3447,12 @@ print(ok, #t, t[1] + t[2] + t[3])"#,
     }
 
     #[test]
-    fn table_remove_out_of_range_leaves_table_alone() {
-        assert_output("let t = {1, 2, 3}\nprint(table.remove(t, 7), #t)", &["nil\t3"]);
+    fn table_remove_out_of_range_errors() {
+        // Lua: pos must satisfy 1 <= pos <= n+1 unless pos == n.
+        assert!(run("let t = {1, 2, 3}\ntable.remove(t, 7)").is_err());
+        assert!(run("let t = {1, 2, 3}\ntable.remove(t, 0)").is_err());
+        assert_output("let t = {1, 2, 3}\nprint(table.remove(t, 4), #t)", &["nil\t3"]);
+        assert_output("print(table.remove({}), table.remove({}, 0))", &["nil\tnil"]);
     }
 
     #[test]
@@ -3464,12 +3470,14 @@ print(n)"#, &["1"]);
     }
 
     #[test]
-    fn utf8_codes_rejects_positions_inside_a_character() {
+    fn utf8_codes_skips_continuation_positions() {
         assert_output(r#"var n = 0
 for p, c in utf8.codes("héllo") { n = n + 1 }
 print(n)"#, &["5"]);
-        assert!(run(r#"let it = utf8.codes("héllo")
-it("héllo", 3)"#).is_err());
+        // Like Lua's iter_aux: a control value inside a character skips
+        // forward to the next character rather than erroring.
+        assert_output(r#"let it = utf8.codes("héllo")
+print(it("héllo", 3))"#, &["4\t108"]);
     }
 
     #[test]
@@ -4109,10 +4117,12 @@ mod stdlib_second_pass_tests {
     #[test]
     fn string_format_q_quotes_only_literal_forms() {
         assert_output(r#"print(string.format("%q", 42))"#, &["42"]);
-        assert_output(r#"print(string.format("%q", 4.5))"#, &["4.5"]);
-        assert_output(r#"print(string.format("%q", "tab\there"))"#, &[r#""tab\009here""#]);
-        assert!(run(r#"string.format("%q", true)"#).is_err());
+        // Lua quotes floats as %a hex so they re-read exactly.
+        assert_output(r#"print(string.format("%q", 4.5))"#, &["0x1.2p+2"]);
+        assert_output(r#"print(string.format("%q", "tab\there"))"#, &[r#""tab\9here""#]);
+        assert_output(r#"print(string.format("%q", true), string.format("%q", none))"#, &["true\tnil"]);
         assert!(run(r#"string.format("%q", {})"#).is_err());
+        assert!(run(r#"string.format("%5q", "x")"#).is_err());
     }
 
     #[test]
@@ -4121,7 +4131,9 @@ mod stdlib_second_pass_tests {
         assert_output(r#"print(tonumber("0x8000000000000000"))"#, &["-9223372036854775808"]);
         assert_output(r#"print(tonumber("0x1.8p1"))"#, &["3.0"]);
         assert_output(r#"print(tonumber("0x.8"))"#, &["0.5"]);
-        assert_output(r#"print(tonumber("0x10", 16))"#, &["16"]);
+        // With an explicit base Lua parses digits only: no 0x prefix, no
+        // floats, no decimal points.
+        assert_output(r#"print(tonumber("0x10", 16), tonumber("1.5", 10))"#, &["nil\tnil"]);
         assert_output(r#"print(tonumber("ff ", 16))"#, &["255"]);
         assert!(run(r#"tonumber(10, 16)"#).is_err());
         assert!(run(r#"tonumber("ff", 1.5)"#).is_err());
@@ -4162,19 +4174,29 @@ mod stdlib_second_pass_tests {
             "let r = math.random(math.mininteger, math.maxinteger)\nprint(math.type(r))",
             &["integer"],
         );
+        // random(0) is a full-range integer, like Lua.
+        assert_output("print(math.type(math.random(0)))", &["integer"]);
         assert!(run("math.random(1, 2, 3)").is_err());
         assert!(run("math.random(1.5)").is_err());
-        assert!(run("math.random(0)").is_err());
+        assert!(run("math.random(-1)").is_err());
     }
 
     #[test]
-    fn table_sort_rejects_inconsistent_comparator() {
-        assert!(run(r#"table.sort({3, 1, 2}, fn(a, b) { return true })"#).is_err());
+    fn table_sort_runs_comparator() {
+        // Lua detects invalid order functions only incidentally during
+        // partitioning; an always-true comparator on an ordered table is
+        // not an error there, so it isn't one here either.
         assert_output(
             r#"let t = {3, 1, 2}
             table.sort(t, fn(a, b) { return a < b })
             print(table.concat(t, ","))"#,
             &["1,2,3"],
+        );
+        assert_output(
+            r#"let t = {3, 1, 2}
+            table.sort(t, fn(a, b) { return a > b })
+            print(table.concat(t, ","))"#,
+            &["3,2,1"],
         );
     }
 
@@ -4570,5 +4592,341 @@ for i = 1, 5000000 { let t = { i } }"#,
         assert!(cycle > 0, "no incremental cycle ran during churn");
         assert!(max_step * 10 <= cycle,
             "max step {max_step} exceeds 10% of cycle work {cycle}");
+    }
+}
+
+// stdlib format coverage
+#[cfg(test)]
+mod stdlib_format_coverage_tests {
+    use super::*;
+
+    fn assert_output(src: &str, expected: &[&str]) {
+        assert_eq!(run_capture(src).unwrap(), expected, "script: {src}");
+    }
+
+    #[test]
+    fn string_format_matches_lua_specifiers() {
+        // All values verified against Lua 5.4.7.
+        assert_output(
+            r#"print(string.format("%d %i %u %c %x %X %o", 42, -7, 300, 65, 255, 255, 8))"#,
+            &["42 -7 300 A ff FF 10"],
+        );
+        assert_output(
+            r#"print(string.format("%e %E %f %g %G", 1234.5678, 1234.5678, 1234.5678, 1234.5678, 1234.5678))"#,
+            &["1.234568e+03 1.234568E+03 1234.567800 1234.57 1234.57"],
+        );
+        assert_output(r#"print(string.format("%a %A", 1.0, 1.0))"#, &["0x1p+0 0X1P+0"]);
+        assert_output(
+            r#"print(string.format("%-5d|%+d|% d|%#x|%05d", 42, 42, 42, 255, 42))"#,
+            &["42   |+42| 42|0xff|00042"],
+        );
+        assert_output(
+            r#"print(string.format("%5.2f|%-10s|%.3s|%05d", 3.14159, "hi", "hello", 42))"#,
+            &[" 3.14|hi        |hel|00042"],
+        );
+        assert_output(r#"print(string.format("%x %o %u", -1, -1, -1))"#,
+            &["ffffffffffffffff 1777777777777777777777 18446744073709551615"]);
+        assert_output(r#"print(string.format("%#o %#x %#X", 8, 255, 255))"#, &["010 0xff 0XFF"]);
+        assert_output(r#"print(string.format("%.0f %.0f %.0f %.0f", -0.5, 0.5, 1.5, 2.5))"#,
+            &["-0 0 2 2"]);
+        assert_output(r#"print(string.format("%.0a %.3a", 1.5, 1.0))"#, &["0x2p+0 0x1.000p+0"]);
+        assert_output(r#"print(string.format("%#g %#.0f %#.0e", 1.0, 2.0, 100.0))"#,
+            &["1.00000 2. 1.e+02"]);
+        assert_output(r#"print(string.format("%g %g %g %g", 100000, 1000000, 1e-4, 1e-5))"#,
+            &["100000 1e+06 0.0001 1e-05"]);
+        assert_output(r#"print(string.format("%d", 3.0))"#, &["3"]);
+        assert_output(r#"print(string.format("%d", "0x1F"), string.format("%d", "  42  "))"#,
+            &["31\t42"]);
+        assert_output(r#"print(string.format("%s", setmetatable({}, {__tostring = fn() { return "MT!" }})))"#,
+            &["MT!"]);
+        assert_output(r#"print(string.format("%s", none), string.format("%s", true))"#, &["nil\ttrue"]);
+        assert_output(r#"print(string.format("%c", 0) == "\0")"#, &["true"]);
+        assert_output(r#"print(string.format("%.3s", "héllo"))"#, &["hé"]);
+        assert_output(r#"print(string.format("%p", none), string.format("%p", 5))"#, &["(null)\t(null)"]);
+    }
+
+    #[test]
+    fn string_format_q_matches_lua() {
+        assert_output(r#"print(string.format("%q", 1/3))"#, &["0x1.5555555555555p-2"]);
+        assert_output(r#"print(string.format("%q", 3.5), string.format("%q", 3.0))"#,
+            &["0x1.cp+1\t0x1.8p+1"]);
+        assert_output(r#"print(string.format("%q", -0.0))"#, &["-0x0p+0"]);
+        assert_output(r#"print(string.format("%q", 1/0), string.format("%q", -1/0))"#,
+            &["1e9999\t-1e9999"]);
+        assert_output(r#"print(string.format("%q", math.mininteger))"#, &["0x8000000000000000"]);
+        assert_output(r#"print(string.format("%q", "a\0b"))"#, &[r#""a\0b""#]);
+        assert_output(r#"print(string.format("%q", "\1\31\127"))"#, &[r#""\1\31\127""#]);
+        assert_output(r#"print(string.format("%q", "\r\n"))"#, &["\"\\13\\\n\""]);
+        assert_output(r#"print(string.format("%q", "back\\slash"))"#, &[r#""back\\slash""#]);
+        // %q output re-reads as the same value.
+        assert_output(r#"let s = string.format("%q", "a\"b\nc")
+print(load("return " .. s)() == "a\"b\nc")"#, &["true"]);
+        assert_output(r#"print(load("return " .. string.format("%q", 1/3))() == 1/3)"#, &["true"]);
+    }
+
+    #[test]
+    fn string_format_rejects_like_lua() {
+        assert!(run(r#"string.format("%F", 1.5)"#).is_err());
+        assert!(run(r#"string.format("%y", 1)"#).is_err());
+        assert!(run(r#"string.format("%d", 3.5)"#).is_err());
+        assert!(run(r#"string.format("%d")"#).is_err());
+        assert!(run(r#"string.format("%d %d", 1)"#).is_err());
+        assert!(run(r#"string.format("%#d", 5)"#).is_err());
+        assert!(run(r#"string.format("%+u", 5)"#).is_err());
+        assert!(run(r#"string.format("%#s", "x")"#).is_err());
+        assert!(run(r#"string.format("%.3c", 65)"#).is_err());
+        assert!(run(r#"string.format("%5q", "x")"#).is_err());
+        assert!(run(r#"string.format("%5s", "a\0b")"#).is_err());
+        assert!(run(r#"string.format("%")"#).is_err());
+        assert!(run(r#"string.format("abc%")"#).is_err());
+        assert!(run(r#"string.format("%d", {})"#).is_err());
+        assert!(run(r#"string.format("%d", "42a")"#).is_err());
+        // Extra arguments are ignored.
+        assert_output(r#"print(string.format("%d", 1, 2, 3))"#, &["1"]);
+    }
+
+    #[test]
+    fn os_date_time_match_lua() {
+        // Umbra is UTC-only; these are the TZ=UTC Lua values.
+        assert_output(r#"print(os.date("!%Y-%m-%d %H:%M:%S", 1700000000))"#, &["2023-11-14 22:13:20"]);
+        assert_output(r#"print(os.date("!%a %A %b %B", 1700000000))"#, &["Tue Tuesday Nov November"]);
+        assert_output(r#"print(os.date("!%c", 1700000000))"#, &["Tue Nov 14 22:13:20 2023"]);
+        assert_output(
+            r#"print(os.date("!%d %H %I %j %m %M %p %S %U %w %W %x %X %y %Y %%", 1700000000))"#,
+            &["14 22 10 318 11 13 PM 20 46 2 46 11/14/23 22:13:20 23 2023 %"],
+        );
+        assert_output(r#"print(os.date("!%u %V %g %G %C %z %r", 1700000000))"#,
+            &["2 46 23 2023 20 +0000 10:13:20 PM"]);
+        assert_output(r#"print(os.date("!%D %F %R %T %e %h", 1700000000))"#,
+            &["11/14/23 2023-11-14 22:13 22:13:20 14 Nov"]);
+        assert_output(r#"print(os.date("!%Y-%m-%d", -1))"#, &["1969-12-31"]);
+        assert_output(r#"print(os.date("!%Y-%m-%d", -62135596800))"#, &["1-01-01"]);
+        assert_output(
+            r#"let t = os.date("!*t", 1700000000)
+print(t.year, t.month, t.day, t.hour, t.min, t.sec, t.wday, t.yday, t.isdst)"#,
+            &["2023\t11\t14\t22\t13\t20\t3\t318\tfalse"],
+        );
+        // os.time normalizes out-of-range fields like mktime.
+        assert_output(r#"print(os.time({year=2024, month=1, day=1}))"#, &["1704110400"]);
+        assert_output(r#"print(os.time({year=2024, month=13, day=1, hour=0}))"#, &["1735689600"]);
+        assert_output(r#"print(os.time({year=2024, month=1, day=32, hour=0}))"#, &["1706745600"]);
+        assert_output(r#"print(os.time({year=2024, month=0, day=1, hour=0}))"#, &["1701388800"]);
+        assert_output(r#"print(os.time({year=2024, month=1, day=0, hour=0}))"#, &["1703980800"]);
+        assert_output(r#"print(os.time({year=2024, month=1, day=-1, hour=0}))"#, &["1703894400"]);
+        assert_output(r#"print(os.time({year=1970, month=1, day=1, hour=0}))"#, &["0"]);
+        assert_output(r#"print(os.time({year=1969, month=12, day=31, hour=0}))"#, &["-86400"]);
+        // mktime writes the normalized fields back into the table.
+        assert_output(
+            r#"let tt = {year=2024, month=3, day=1}
+os.time(tt)
+print(tt.wday, tt.yday, tt.isdst, tt.hour)"#,
+            &["6\t61\tfalse\t12"],
+        );
+        assert!(run(r#"os.time({})"#).is_err());
+        assert!(run(r#"os.time({year=2024, month=1})"#).is_err());
+        assert!(run(r#"os.time("x")"#).is_err());
+        assert!(run(r#"os.date("!%q", 0)"#).is_err());
+        assert!(run(r#"os.date("!%", 0)"#).is_err());
+        assert_output(r#"print(os.date(42, 0))"#, &["42"]);
+        assert_output(r#"print(os.time(none) != none, os.date() != none)"#, &["true\ttrue"]);
+    }
+
+    #[test]
+    fn tonumber_tostring_match_lua() {
+        assert_output(
+            r#"print(tostring(1e15), tostring(1e16), tostring(2^53), tostring(-0.0), tostring(1/0), tostring(3.0), tostring(0.1))"#,
+            &["1e+15\t1e+16\t9.007199254741e+15\t-0.0\tinf\t3.0\t0.1"],
+        );
+        assert_output(
+            r#"print(tonumber("0x10"), tonumber("1e2"), tonumber(" 12 "), tonumber("12a"), tonumber("z", 36))"#,
+            &["16\t100.0\t12\tnil\t35"],
+        );
+        assert_output(
+            r#"print(tonumber("0x1.8p1"), tonumber("  0x10  "), tonumber("-0x10"), tonumber("10", 2), tonumber("-z", 36))"#,
+            &["3.0\t16\t-16\t2\t-35"],
+        );
+        assert_output(r#"print(tonumber("0x10000000000000000"), tonumber("0xFFFFFFFFFFFFFFFFF"))"#,
+            &["0\t-1"]);
+        assert_output(r#"print(tonumber("1e999"), tonumber("nan"), tonumber("inf"), tonumber("0x"), tonumber("."))"#,
+            &["inf\tnil\tnil\tnil\tnil"]);
+        assert_output(r#"print(tonumber("1."), tonumber(".5"), tonumber("1e"), tonumber(""))"#,
+            &["1.0\t0.5\tnil\tnil"]);
+        assert_output(r#"print(tonumber(42), tonumber(4.5), tonumber(none))"#, &["42\t4.5\tnil"]);
+        assert_output(r#"print(math.type(tonumber("0x10")), math.type(tonumber("1e2")), math.type(tonumber("10.0")))"#,
+            &["integer\tfloat\tfloat"]);
+        assert!(run("tonumber()").is_err());
+        assert!(run("tonumber(42, 10)").is_err());
+        assert!(run("tonumber(42, 16)").is_err());
+        assert!(run(r#"tonumber("10", 1)"#).is_err());
+        assert!(run(r#"tonumber("10", 37)"#).is_err());
+        assert!(run("tostring()").is_err());
+    }
+
+    #[test]
+    fn string_edge_cases_match_lua() {
+        assert_output(
+            r#"let s = "hello"
+print(string.sub(s, -1), string.sub(s, 0), string.sub(s, 100), string.sub(s, -100), string.sub(s, 2, -2), string.sub(s, -3, -1), string.sub(s, 0, 0), string.sub(s, 3, 2), string.sub(s, -100, 100))"#,
+            &["o\thello\t\thello\tell\tllo\t\t\thello"],
+        );
+        assert_output(r#"print(string.rep("ab", 0), "|", string.rep("ab", -1), "|", string.rep("ab", 3, "-"), "|", string.rep("", 5))"#,
+            &["\t|\t\t|\tab-ab-ab\t|\t"]);
+        assert_output(r#"print(string.byte("ABC", 1, 3), string.byte("ABC", -1), string.byte("ABC", 0))"#,
+            &["65\t67"]);
+        assert_output(r#"print(string.byte("ABC", 2, 1) == none)"#, &["true"]);
+        assert_output(r#"print(string.char(72, 105), #string.char(0), string.byte(string.char(0)))"#,
+            &["Hi\t1\t0"]);
+        // C-locale case mapping: ASCII only, like Lua.
+        assert_output(r#"print(string.upper("héllo"), string.lower("HÉLLO"))"#, &["HéLLO\thÉllo"]);
+        assert_output(r#"print(string.upper("ß"), string.lower("İ"))"#, &["ß\tİ"]);
+        // Byte reversal like Lua; mid-character cuts re-validate.
+        assert_output(r#"print(string.reverse("héllo") == "oll\169\195h")"#, &["true"]);
+        assert_output(r##"print(string.len("héllo"), #"héllo", utf8.len("héllo"))"##, &["6\t6\t5"]);
+        assert_output(r#"print(string.byte("héllo", 1, 4))"#, &["104\t195\t169\t108"]);
+        assert_output(r#"print(string.byte("abc", 1, 1e18))"#, &["97\t98\t99"]);
+        assert!(run(r#"string.rep("x")"#).is_err());
+        assert!(run(r#"string.char(256)"#).is_err());
+        assert!(run(r#"string.char(-1)"#).is_err());
+        assert!(run(r#"string.rep("x", 1e18)"#).is_err());
+    }
+
+    #[test]
+    fn table_edge_cases_match_lua() {
+        assert_output(r#"print(table.concat({1,2,3}), table.concat({1,2,3}, "-"), table.concat({1,2.5,"x"}, ","))"#,
+            &["123\t1-2-3\t1,2.5,x"]);
+        assert_output(r#"print(table.concat({1,2,3}, "-", 2, 3), table.concat({1,2,3}, "-", 3, 2), table.concat({}, "-"))"#,
+            &["2-3\t\t"]);
+        assert!(run(r#"table.concat({{}})"#).is_err());
+        assert_output(
+            r#"let t = {10,20,30}
+table.insert(t, 4)
+table.insert(t, 1, 5)
+print(table.concat(t, ","))"#,
+            &["5,10,20,30,4"],
+        );
+        assert!(run(r#"table.insert({1,2,3}, 6, 99)"#).is_err());
+        assert!(run(r#"table.insert({1,2,3}, 0, 99)"#).is_err());
+        assert!(run(r#"table.insert({1,2,3})"#).is_err());
+        assert_output(r#"print(table.remove({1,2,3}), table.remove({1,2,3}, 1))"#, &["3\t1"]);
+        assert_output(r#"print(table.concat(table.move({1,2,3,4,5}, 2, 4, 1), ","))"#, &["2,3,4,4,5"]);
+        assert_output(r#"print(table.concat(table.move({1,2,3,4,5}, 1, 3, 3), ","))"#, &["1,2,1,2,3"]);
+        assert_output(r#"print(table.concat(table.move({1,2,3}, 1, 3, 2, {9,9,9,9,9}), ","))"#, &["9,1,2,3,9"]);
+        assert_output(r#"print(table.unpack({1,2,3}, 0, 2))"#, &["nil\t1\t2"]);
+        assert_output(r##"print(select("#", table.unpack({1,2,3}, 4, 5)))"##, &["2"]);
+        assert_output(r#"let pk = table.pack(1, none, 3)
+print(pk.n, pk[1], pk[2], pk[3])"#, &["3\t1\tnil\t3"]);
+        assert_output(r#"print(table.pack().n)"#, &["0"]);
+        assert!(run(r#"table.unpack({1,2,3}, 1, 1e18)"#).is_err());
+        assert!(run(r#"table.move({1,2,3}, 1, 2, math.maxinteger)"#).is_err());
+        assert!(run(r#"table.sort({1,"x"})"#).is_err());
+        // An always-true comparator is not an error (Lua detects invalid
+        // order functions only incidentally during partitioning).
+        assert_output(r#"let t = {1,2,3}
+print(pcall(table.sort, t, fn(a,b) { return true }))"#, &["true"]);
+        assert_output(r#"print(pcall(table.sort, {1,2,3}, fn(a,b) { return 1 }))"#, &["true"]);
+    }
+
+    #[test]
+    fn math_edge_cases_match_lua() {
+        assert_output(r#"print(math.floor(3.7), math.floor(-3.7), math.type(math.floor(3.7)))"#,
+            &["3\t-4\tinteger"]);
+        assert_output(r#"print(math.ceil(3.2), math.ceil(-3.2), math.type(math.ceil(3.2)))"#,
+            &["4\t-3\tinteger"]);
+        assert_output(r#"print(math.floor(2^63), math.type(math.floor(2^63)))"#,
+            &["9.2233720368548e+18\tfloat"]);
+        assert_output(r#"print(math.floor(-2^63), math.type(math.floor(-2^63)))"#,
+            &["-9223372036854775808\tinteger"]);
+        assert_output(r#"print(math.abs(-5), math.abs(5.5), math.abs(math.mininteger))"#,
+            &["5\t5.5\t-9223372036854775808"]);
+        assert_output(r#"print(math.fmod(-7, 3), math.fmod(7, -3), -7 % 3, 7 % -3)"#,
+            &["-1\t1\t2\t-2"]);
+        assert_output(r#"print(math.fmod(5.5, 2), math.fmod(-5.5, 2))"#, &["1.5\t-1.5"]);
+        assert!(run("math.fmod(1, 0)").is_err());
+        assert_output(r#"print(math.tointeger("8"), math.tointeger("8.0"), math.tointeger("0x10"), math.tointeger(8.5), math.tointeger(2^63))"#,
+            &["8\t8\t16\tnil\tnil"]);
+        assert_output(r#"print(math.max(1, 2.5), math.type(math.max(1, 2.5)), math.min(1, 2.5), math.type(math.min(1, 2.5)))"#,
+            &["2.5\tfloat\t1\tinteger"]);
+        assert_output(r#"print(math.max(3, 3.0), math.type(math.max(3, 3.0)), math.min(3, 3.0), math.type(math.min(3, 3.0)))"#,
+            &["3\tinteger\t3\tinteger"]);
+        assert_output(r#"print(math.maxinteger + 1 == math.mininteger, math.mininteger - 1 == math.maxinteger)"#,
+            &["true\ttrue"]);
+        assert_output(r#"print(math.ult(1, 2), math.ult(-1, 2), math.ult(2, -1), math.ult(math.mininteger, 0))"#,
+            &["true\tfalse\ttrue\tfalse"]);
+        assert_output(r#"print(math.type(math.random(0)))"#, &["integer"]);
+        assert!(run("math.random(3, 1)").is_err());
+        assert!(run("math.random(-5)").is_err());
+        assert_output(r#"print(math.type(math.random()), math.type(math.random(5)), math.type(math.random(1,5)))"#,
+            &["float\tinteger\tinteger"]);
+        assert_output(r#"print(math.modf(3.7))"#, &["3\t0.7"]);
+        assert_output(r#"print(math.modf(-3.7))"#, &["-3\t-0.7"]);
+        assert_output(r#"print(math.modf(5), math.type(math.modf(5)))"#, &["5\tinteger"]);
+        assert_output(r#"print(math.log(8, 2), math.log(100, 10), math.log(math.exp(1)))"#,
+            &["3.0\t2.0\t1.0"]);
+        assert_output(r#"print(math.log(0), math.log(-1))"#, &["-inf\tnil"]);
+        // Numeric strings coerce like luaL_checknumber/luaL_checkinteger.
+        assert_output(r#"print(math.floor("3.5"), math.floor("3"), math.abs("-5"))"#, &["3\t3\t5.0"]);
+        assert!(run(r#"math.floor("x")"#).is_err());
+        assert!(run(r#"math.abs("x")"#).is_err());
+        assert!(run("math.tointeger()").is_err());
+        assert_output(r#"print(math.type(1), math.type(1.0), math.type("x"), math.type(none))"#,
+            &["integer\tfloat\tnil\tnil"]);
+    }
+
+    #[test]
+    fn utf8_edge_cases_match_lua() {
+        assert_output(r#"print(utf8.char(0x1F600), #utf8.char(0x1F600))"#, &["😀\t4"]);
+        assert_output(r#"print(utf8.codepoint("héllo", 1, -1))"#, &["104\t233\t108\t108\t111"]);
+        assert_output(r#"print(utf8.codepoint("héllo"), utf8.codepoint("héllo", 2, 3))"#, &["104\t233"]);
+        assert_output(r#"print(utf8.codepoint("héllo", 3, 2) == none)"#, &["true"]);
+        assert_output(r#"print(utf8.len("héllo"), utf8.len(""), utf8.len("😀"))"#, &["5\t0\t1"]);
+        // j may sit mid-character; i may not.
+        assert_output(r#"print(utf8.len("héllo", 1, 2))"#, &["2"]);
+        assert_output(r#"print(utf8.len("héllo", 3))"#, &["nil\t3"]);
+        assert_output(r#"print(utf8.len("abc", 2, 1), utf8.len("abc", 1, 3), utf8.len("abc", -1), utf8.len("abc", 4))"#,
+            &["0\t3\t1\t0"]);
+        assert!(run(r#"utf8.len("abc", 0)"#).is_err());
+        assert!(run(r#"utf8.len("abc", 1, 5)"#).is_err());
+        assert_output(r#"print(utf8.offset("héllo", 1), utf8.offset("héllo", 2), utf8.offset("héllo", 3), utf8.offset("héllo", 5), utf8.offset("héllo", 6))"#,
+            &["1\t2\t4\t6\t7"]);
+        assert_output(r#"print(utf8.offset("héllo", -1), utf8.offset("héllo", -2), utf8.offset("héllo", 0))"#,
+            &["6\t5\t1"]);
+        assert_output(r#"print(utf8.offset("héllo", 1, 2), utf8.offset("héllo", -1, 4))"#, &["2\t2"]);
+        assert_output(r#"print(utf8.offset("abc", 4), utf8.offset("abc", 5), utf8.offset("abc", -4))"#,
+            &["4\tnil\tnil"]);
+        assert_output(r#"print(utf8.offset("abc", 1, 4), utf8.offset("abc", 2, 4), utf8.offset("abc", 0, 4))"#,
+            &["4\tnil\t4"]);
+        assert_output(r#"print(utf8.offset("abc", -1, 4), utf8.offset("abc", -4, 4))"#, &["3\tnil"]);
+        assert_output(r#"print(utf8.offset("", 1), utf8.offset("", -1), utf8.offset("", 0))"#, &["1\tnil\t1"]);
+        assert_output(r#"print(utf8.offset("héllo", 2, -1), utf8.offset("héllo", -1, -1))"#, &["7\t5"]);
+        assert_output(r#"print(utf8.offset("héllo", 1, 2), utf8.offset("héllo", 0, 2), utf8.offset("héllo", 0, 3), utf8.offset("héllo", 0, 4))"#,
+            &["2\t2\t2\t4"]);
+        assert_output(r#"print(utf8.offset("héllo", -1, 6), utf8.offset("héllo", 1, 6), utf8.offset("héllo", 2, 6))"#,
+            &["5\t6\t7"]);
+        assert!(run(r#"utf8.offset("abc", 1, 5)"#).is_err());
+        assert!(run(r#"utf8.offset("abc", 1, 0)"#).is_err());
+        assert!(run(r#"utf8.offset("héllo", 1, 3)"#).is_err());
+        assert_output(r#"var out = ""
+for p, c in utf8.codes("a😀b") { out = out .. p .. ":" .. c .. " " }
+print(out)"#, &["1:97 2:128512 6:98 "]);
+        assert_output(r#"print(utf8.codepoint("😀"), utf8.codepoint("😀", 1, 4))"#, &["128512\t128512"]);
+        assert!(run(r#"utf8.codepoint("😀", 2)"#).is_err());
+        assert_output(r#"print(utf8.offset("😀x", 2), utf8.offset("😀x", -1), utf8.offset("😀x", 1, 5))"#,
+            &["5\t5\t5"]);
+        assert!(run(r#"utf8.char(0x110000)"#).is_err());
+        assert!(run(r#"utf8.char(-1)"#).is_err());
+        assert!(run(r#"utf8.char(0xD800)"#).is_err());
+    }
+
+    #[test]
+    fn table_sort_10k_is_not_quadratic() {
+        // An already-sorted 10k array must not degenerate; Rust's sort is
+        // O(n log n) worst case. This just checks it completes quickly.
+        let start = std::time::Instant::now();
+        run(r#"let t = {}
+for i = 1, 10000 { t[i] = i }
+table.sort(t)
+table.sort(t, fn(a, b) { return a < b })
+print(t[1], t[10000])"#).unwrap();
+        assert!(start.elapsed().as_secs() < 10);
     }
 }

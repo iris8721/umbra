@@ -47,8 +47,9 @@ Familiar to anyone who knows Lua, with a C-flavored syntax:
   `b[i]` read/write, `#b`
 - `table` — `insert remove concat sort pack unpack move`
 - `io` — `open read write lines close` on file handles
-- `os` — `time clock date getenv`
-- `utf8` — `char len codepoint codes`
+- `os` — `time clock date getenv`; the clock is UTC only, so `os.date`'s `!`
+  prefix is a no-op and `os.time` ignores `isdst`
+- `utf8` — `char len codepoint codes offset`
 - `math` — `floor ceil abs sqrt max min sin cos tan exp log modf random
   randomseed` and constants
 - `debug.traceback`, plus the base functions (`print tostring tonumber type
