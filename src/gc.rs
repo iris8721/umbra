@@ -4,7 +4,7 @@ use crate::vm::FxMap;
 // Incremental tri-color mark-sweep, Lua 5.1-5.3 style. A cycle is a state
 // machine — Pause → Propagate → Atomic → Sweep → Pause — advanced by
 // step() calls from the VM's allocation checkpoints, with work per step
-// proportional to bytes allocated since the last step (stepmul, 200%).
+// proportional to bytes allocated since the last step (stepmul, 3200%).
 // Two whites distinguish "unmarked this cycle" (cur_white) from "dead,
 // awaiting sweep" (dead_white): the sweep frees dead_white and flips
 // survivors to cur_white, so objects allocated mid-sweep are born the
