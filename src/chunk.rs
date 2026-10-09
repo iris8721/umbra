@@ -105,9 +105,15 @@ pub enum Op {
     // receiver move and the method lookup that a `obj:name(...)` call needs.
     SelfOp,
 
+    // String interpolation: R[A] = tostring(R[B]) .. ... .. tostring(R[C]).
+    // Its own op, not a call of the `tostring` global, so a script can't
+    // shadow it.
+    Interp,
+
     // `return f(...)`: reuses the current frame instead of pushing one.
     // Operands match Call; the compiler only emits it when no <close> local
-    // is pending and the call is the sole return value.
+    // is pending and the call is the sole return value. Keep it last: the
+    // decoders bound opcodes by it.
     TailCall,
 }
 
@@ -115,7 +121,8 @@ impl Op {
     #[inline(always)]
     pub fn from_u8(b: u8) -> Option<Self> {
         if b <= Op::TailCall as u8 {
-            Some(unsafe { std::mem::transmute(b) })
+            // SAFETY: Op is repr(u8) with contiguous variants 0..=TailCall.
+            Some(unsafe { std::mem::transmute::<u8, Op>(b) })
         } else {
             None
         }
@@ -135,14 +142,16 @@ pub enum Const {
     Str(StrConst),
 }
 
-// The interned Value is filled in by the first VM that resolves the constant;
-// the owner tag keeps a Proto shared across VMs from handing back a pointer
-// into another VM's heap. The VM keeps interned constants alive for its whole
-// lifetime (Vm::const_strings), so a cached pointer never dangles.
+// The interned Value is filled in by the VM that resolves the constant,
+// tagged with that VM's id (Vm::id, never reused), so a pointer into one
+// VM's heap is never handed to another. Not its address: a Vm that moves
+// keeps its caches, and a new one at a dropped one's address doesn't
+// inherit them. The collector marks a proto's cached strings with the
+// proto, so a cached pointer never dangles.
 #[derive(Debug)]
 pub struct StrConst {
     pub s: String,
-    cached: Cell<(usize, u64)>,
+    cached: Cell<(u64, u64)>,
 }
 
 impl StrConst {
@@ -150,8 +159,8 @@ impl StrConst {
         StrConst { s, cached: Cell::new((0, 0)) }
     }
 
-    pub fn cached(&self) -> (usize, u64) { self.cached.get() }
-    pub fn set_cached(&self, owner: usize, bits: u64) { self.cached.set((owner, bits)); }
+    pub fn cached(&self) -> (u64, u64) { self.cached.get() }
+    pub fn set_cached(&self, owner: u64, bits: u64) { self.cached.set((owner, bits)); }
 }
 
 impl Clone for StrConst {
@@ -183,33 +192,56 @@ pub struct LocVar {
     pub boxed: bool,
 }
 
-#[derive(Debug)]
+// A Proto as a collected object (GcKind::Proto). Frames, closures and
+// function values point at the GcProto; references into it borrow only
+// `proto` (heap::proto), never the header the collector writes while the
+// interpreter runs the code.
+#[repr(C)] // gc must stay first: the GC reads the header through the object pointer.
+pub struct GcProto {
+    pub(crate) gc: crate::gc::GcHeader,
+    pub(crate) proto: Proto,
+}
+
+// How a declaration names a function: (kind, name), as tracebacks print it.
+pub(crate) type FnDecl = (&'static str, String);
+
+// Crate-private throughout: the interpreter trusts a Proto's bytecode, so
+// only the compiler builds one, and hosts hold compiled code as
+// compiler::Compiled.
 pub struct Proto {
-    pub code: Vec<u32>,
-    pub consts: Vec<Const>,
-    pub protos: Vec<Proto>,
-    pub upvals: Vec<UpvalDesc>,
-    pub max_regs: u8,
-    pub params: u8,
-    pub is_vararg: bool,
-    pub source: Option<String>,
+    pub(crate) code: Vec<u32>,
+    pub(crate) consts: Vec<Const>,
+    // Nested functions, each its own collected object; the collector marks
+    // them through this list. Owned by compiler::Compiled until a Vm
+    // registers the tree.
+    pub(crate) protos: Vec<*mut GcProto>,
+    pub(crate) upvals: Vec<UpvalDesc>,
+    pub(crate) max_regs: u8,
+    pub(crate) params: u8,
+    pub(crate) is_vararg: bool,
+    pub(crate) source: Option<String>,
     // Line the function definition starts on; used for the
     // `function <source:line>` fallback name in tracebacks.
-    pub line_defined: u32,
+    pub(crate) line_defined: u32,
     // True for the top-level chunk proto (compile's entry point), so
     // tracebacks can print "in main chunk" instead of a function name.
-    pub is_main: bool,
-    pub locvars: Vec<LocVar>,
-    pub lines: Vec<u32>,
-    // Per-const GetGlobal cache, parallel to `consts`: (owner VM, globals
-    // generation, cached value bits). Filled lazily by the VM; a globals
-    // write bumps the generation and invalidates every entry. Sized to
-    // consts.len() at compile time; empty for hand-built protos.
-    pub global_cache: Vec<Cell<(usize, u64, u64)>>,
+    pub(crate) is_main: bool,
+    pub(crate) locvars: Vec<LocVar>,
+    pub(crate) lines: Vec<u32>,
+    // Per-const GetGlobal cache, parallel to `consts`: (owner Vm::id,
+    // globals generation, cached value bits). Filled lazily by the VM; a
+    // globals write bumps the generation and invalidates every entry. Sized
+    // to consts.len() at compile time.
+    pub(crate) global_cache: Vec<Cell<(u64, u64, u64)>>,
+    // The name the source declared the function under, for tracebacks of
+    // frames whose call site names nothing (a host call, pcall's target, a
+    // metamethod): `fn f` and `let f = fn` give ("function", "f"), `fn a.b`
+    // ("function", "a.b"), `fn A:m` ("method", "m").
+    pub(crate) decl: Option<FnDecl>,
 }
 
 impl Proto {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Proto {
             code: Vec::new(),
             consts: Vec::new(),
@@ -221,28 +253,29 @@ impl Proto {
             source: None,
             line_defined: 0,
             is_main: false,
+            decl: None,
             locvars: Vec::new(),
             lines: Vec::new(),
             global_cache: Vec::new(),
         }
     }
 
-    pub fn emit(&mut self, instr: u32, line: u32) -> usize {
+    pub(crate) fn emit(&mut self, instr: u32, line: u32) -> usize {
         let idx = self.code.len();
         self.code.push(instr);
         self.lines.push(line);
         idx
     }
 
-    pub fn emit_jump(&mut self, line: u32) -> usize {
+    pub(crate) fn emit_jump(&mut self, line: u32) -> usize {
         self.emit(enc_asbx(Op::Jmp, 0, 0), line)
     }
-    pub fn add_string(&mut self, s: &str) -> usize {
+    pub(crate) fn add_string(&mut self, s: &str) -> usize {
         self.add_const(Const::Str(StrConst::new(s.to_owned())))
     }
     // callers must turn that into a compile error rather than emit a
     // truncated offset that would jump somewhere arbitrary.
-    pub fn patch_jump(&mut self, idx: usize, target: usize) -> bool {
+    pub(crate) fn patch_jump(&mut self, idx: usize, target: usize) -> bool {
         let offset = target as i32 - idx as i32 - 1;
         if offset < -BIAS || offset > u16::MAX as i32 - BIAS {
             return false;
@@ -252,12 +285,7 @@ impl Proto {
         true
     }
 
-    pub fn patch_jump_here(&mut self, idx: usize) -> bool {
-        let here = self.code.len();
-        self.patch_jump(idx, here)
-    }
-
-    pub fn add_const(&mut self, c: Const) -> usize {
+    pub(crate) fn add_const(&mut self, c: Const) -> usize {
         for (i, existing) in self.consts.iter().enumerate() {
             if *existing == c { return i; }
         }
@@ -267,5 +295,5 @@ impl Proto {
     }
 
 
-    pub fn current_pc(&self) -> usize { self.code.len() }
+    pub(crate) fn current_pc(&self) -> usize { self.code.len() }
 }

@@ -132,7 +132,12 @@ typedef enum {
 "#,
     );
 
-    std::fs::write(&out, header).expect("failed to write umbra.h");
+    // Written only when the bytes differ, LF line endings included (git
+    // expects LF for this file, .gitattributes), so building umbra or a
+    // crate that depends on it doesn't touch the tracked header.
+    if std::fs::read(&out).ok().as_deref() != Some(header.as_bytes()) {
+        std::fs::write(&out, header).expect("failed to write umbra.h");
+    }
     println!("cargo:rerun-if-changed=src/api.rs");
     println!("cargo:rerun-if-changed=build.rs");
 }

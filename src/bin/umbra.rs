@@ -4,8 +4,9 @@
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
+use umbra::embed::Ctx;
 use umbra::value::Value;
-use umbra::vm::{RtString, Table, Vm};
+use umbra::vm::Vm;
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
@@ -54,7 +55,7 @@ fn main() -> ExitCode {
     install_arg(&mut vm, &argv[0], script.as_deref(), &script_args);
 
     for src in &evals {
-        if let Err(e) = run_src(&mut vm, src) {
+        if let Err(e) = run_src(&mut vm, src, None) {
             eprintln!("umbra: {e}");
             return ExitCode::FAILURE;
         }
@@ -67,7 +68,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        if let Err(e) = run_src(&mut vm, &src) {
+        if let Err(e) = run_src(&mut vm, &src, Some(path)) {
             eprintln!("umbra: {e}");
             return ExitCode::FAILURE;
         }
@@ -75,30 +76,38 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_src(vm: &mut Vm, src: &str) -> Result<Vec<Value>, String> {
+// A script file's errors cite its path (`scripts/x.umbra:3: ...`); a -e
+// string or REPL line has none.
+fn run_src(vm: &mut Vm, src: &str, chunk_name: Option<&str>) -> Result<Vec<Value>, String> {
     let (block, errs) = umbra::parse(src);
     if !errs.is_empty() {
-        return Err(errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n"));
+        let msg = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+        return Err(match chunk_name {
+            Some(name) => format!("{name}: {msg}"),
+            None => msg,
+        });
     }
-    let proto = umbra::compile(block, None).map_err(|e| e.to_string())?;
-    vm.exec_owned(proto).map_err(|e| e.to_string())
+    let chunk = umbra::compile(block, chunk_name.map(str::to_owned)).map_err(|e| e.to_string())?;
+    vm.exec(chunk).map_err(|e| e.to_string())
 }
 
 // Lua's convention: arg[0] is the script path, arg[1..] its arguments, and
 // arg[-1] the interpreter itself.
 fn install_arg(vm: &mut Vm, prog: &str, script: Option<&str>, args: &[String]) {
-    let ptr = Box::into_raw(Box::new(Table::new()));
-    vm.gc.register(ptr as *mut u8);
-    let t = unsafe { &mut *ptr };
-    t.raw_set(vm.make_int(-1), vm.intern_pub(prog));
+    let mut cx = vm.ctx();
+    let t = cx.new_table();
+    let set = |cx: &mut Ctx<'_>, i: i64, s: &str| {
+        let v = cx.new_string(s);
+        cx.raw_set(t, Value::int(i), v).expect("arg is a table");
+    };
+    set(&mut cx, -1, prog);
     if let Some(s) = script {
-        t.raw_set(Value::int(0), vm.intern_pub(s));
+        set(&mut cx, 0, s);
     }
     for (i, a) in args.iter().enumerate() {
-        let v = vm.intern_pub(a);
-        t.raw_set(vm.make_int(i as i64 + 1), v);
+        set(&mut cx, i as i64 + 1, a);
     }
-    vm.set_global("arg", Value::table(ptr as *mut u8));
+    cx.set_global("arg", t);
 }
 
 fn repl() {
@@ -124,12 +133,16 @@ fn repl() {
             (_, errs) if errs.is_empty() => src.to_owned(),
             _ => format!("return {src}"),
         };
-        match run_src(&mut vm, &src) {
+        match run_src(&mut vm, &src, None) {
             Ok(vals) if !vals.is_empty() => {
-                let tostring = vm.get_global("tostring");
+                let mut cx = vm.ctx();
+                // The chunk's results are reachable from nothing once it
+                // returned, and a __tostring can collect: root them first.
+                for &v in &vals { cx.root(v); }
+                let tostring = cx.get_global("tostring");
                 let mut out = Vec::with_capacity(vals.len());
                 for v in vals {
-                    out.push(stringify(&mut vm, tostring, v));
+                    out.push(stringify(&mut cx, tostring, v));
                 }
                 println!("{}", out.join("\t"));
             }
@@ -140,17 +153,10 @@ fn repl() {
 }
 
 // tostring() honors __tostring; fall back to the plain Display form.
-fn stringify(vm: &mut Vm, tostring: Value, v: Value) -> String {
-    let s = vm
-        .call_value_isolated(tostring, &[v])
-        .ok()
-        .and_then(|r| r.into_iter().next());
-    match s {
-        Some(s) if s.is_string() => unsafe {
-            let r = &*s.as_string().unwrap().cast::<RtString>();
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(r.as_c_ptr(), r.len))
-                .to_owned()
-        },
-        _ => format!("{v}"),
+fn stringify(cx: &mut Ctx<'_>, tostring: Value, v: Value) -> String {
+    let s = cx.call(tostring, &[v]).ok().and_then(|r| r.into_iter().next());
+    match s.and_then(|s| cx.to_str(s)) {
+        Some(s) => s.to_owned(),
+        None => format!("{v}"),
     }
 }

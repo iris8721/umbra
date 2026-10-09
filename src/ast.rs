@@ -22,6 +22,8 @@ pub enum Expr {
     Binop { op: Binop, lhs: Box<Expr>, rhs: Box<Expr>, line: u32 },
 
     Concat { parts: Vec<Expr>, line: u32 },
+    // "a${x}b": joins tostring() of each part (Op::Interp).
+    Interp { parts: Vec<Expr>, line: u32 },
 
     Call(CallExpr),
     MethodCall(MethodCallExpr),
@@ -43,7 +45,7 @@ impl Expr {
             Expr::Ident(i) => i.line,
             Expr::Index { line, .. } | Expr::Field { line, .. } => *line,
             Expr::Unop { line, .. } | Expr::Binop { line, .. } => *line,
-            Expr::Concat { line, .. } => *line,
+            Expr::Concat { line, .. } | Expr::Interp { line, .. } => *line,
             Expr::Call(c) => c.line,
             Expr::MethodCall(m) => m.line,
             Expr::Function(f) => f.line,

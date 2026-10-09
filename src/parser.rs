@@ -64,11 +64,13 @@ pub(crate) const MAX_DEPTH: u32 = 100;
 
 impl<'src> Parser<'src> {
     pub fn new(src: &'src str) -> PResult<Self> {
-        Self::at_depth(src, 0)
+        Self::at(src, 0, 1)
     }
 
-    fn at_depth(src: &'src str, depth: u32) -> PResult<Self> {
-        let mut lexer = Lexer::new(src);
+    // A parser for source nested `depth` levels deep that begins on `line`
+    // of its file (an interpolated expression).
+    fn at(src: &'src str, depth: u32, line: u32) -> PResult<Self> {
+        let mut lexer = Lexer::starting_at(src, line);
         let current = lexer.next_token()?;
         Ok(Self { lexer, current, lookahead: None, lookahead2: None, errors: Vec::new(), switch_counter: 0, depth, ternary_depth: 0 })
     }
@@ -714,12 +716,12 @@ impl<'src> Parser<'src> {
         }
     }
 
-    // Builds "a${expr}b" into Expr::Concat["a", expr, "b"], reusing the
-    // existing .. concatenation semantics (including its number->string
-    // coercion) rather than inventing separate stringification rules. Each
-    // ${...} is parsed as its own isolated expression, so a syntax error
-    // inside one reports line 1 relative to the embedded snippet, not the
-    // real file line — a known limitation of not tracking source offsets.
+    // Builds "a${expr}b" into Expr::Interp["a", expr, "b"], which joins
+    // what tostring() makes of each part: __tostring, booleans and none
+    // work as they do in print, and a script's own `tostring` can't change
+    // it. Each ${...} is parsed as its own expression, by a parser that
+    // starts counting at the line the expression starts on, so syntax and
+    // runtime errors in it cite the real line.
     fn build_interp_expr(&mut self, parts: Vec<InterpPart>, line: u32) -> PResult<Expr> {
         let mut out = Vec::new();
         for part in parts {
@@ -727,21 +729,23 @@ impl<'src> Parser<'src> {
                 InterpPart::Str(s) => {
                     if !s.is_empty() { out.push(Expr::String(s, line)); }
                 }
-                InterpPart::Expr(src) => {
-                    let mut sub = Parser::at_depth(&src, self.depth)?;
+                InterpPart::Expr(src, expr_line) => {
+                    let mut sub = Parser::at(&src, self.depth, expr_line)?;
                     let e = sub.parse_expr()?;
                     if !matches!(sub.peek(), TokenKind::Eof) {
                         return Err(ParseError::Unexpected {
                             tok: format!("{:?}", sub.peek()),
-                            line,
+                            line: sub.line(),
                         });
                     }
+                    // A function body inside records its errors and moves
+                    // on rather than returning them.
+                    if let Some(e) = sub.errors.into_iter().next() { return Err(e); }
                     out.push(e);
                 }
             }
         }
-        if out.is_empty() { out.push(Expr::String(String::new(), line)); }
-        Ok(Expr::Concat { parts: out, line })
+        Ok(Expr::Interp { parts: out, line })
     }
 
     fn parse_simple_expr(&mut self) -> PResult<Expr> {

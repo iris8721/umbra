@@ -2,8 +2,10 @@
 pub enum InterpPart {
     Str(String),
     // Raw source text of a ${...} embedded expression, parsed lazily by the
-    // parser rather than here, so the lexer doesn't need to know about Expr.
-    Expr(String),
+    // parser rather than here, so the lexer doesn't need to know about Expr,
+    // and the line it starts on, where the parser's sub-lexer starts
+    // counting so errors in it cite the real line.
+    Expr(String, u32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,7 +108,12 @@ pub struct Lexer<'src> {
 
 impl<'src> Lexer<'src> {
     pub fn new(src: &'src str) -> Self {
-        Self { src: src.as_bytes(), pos: 0, line: 1 }
+        Self::starting_at(src, 1)
+    }
+
+    // A lexer for source that begins on `line` of its file.
+    pub(crate) fn starting_at(src: &'src str, line: u32) -> Self {
+        Self { src: src.as_bytes(), pos: 0, line }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -235,7 +242,8 @@ impl<'src> Lexer<'src> {
                     has_interp = true;
                     parts.push(InterpPart::Str(String::from_utf8_lossy(&out).into_owned()));
                     out.clear();
-                    parts.push(InterpPart::Expr(self.read_interp_expr_src()?));
+                    let line = self.line;
+                    parts.push(InterpPart::Expr(self.read_interp_expr_src()?, line));
                 }
                 Some(b'\\') => {
                     match self.advance() {

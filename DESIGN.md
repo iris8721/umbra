@@ -47,11 +47,20 @@ instruction count for the same program, and no dispatch trick wins that back.
 ## `none` instead of `nil`
 
 Readability, nothing deeper. `none` reads as "no value" to someone who has
-never seen Lua. `nil` reads as a proper noun you have to look up. The runtime
-still calls the type `nil` internally, and `tostring(none)` prints `nil`,
-because every GC and VM comment already used that word and renaming the
-internals would have been churn for no gain. The keyword is the user-facing
-part.
+never seen Lua. `nil` reads as a proper noun you have to look up.
+
+At first only the keyword said `none`. `type(none)`, `tostring(none)`,
+`print` and the error messages all said `nil`, because the runtime calls the
+type `nil` internally. That left one value with two names: a script testing
+`type(x) == "none"` was always false, and "attempt to index a nil value"
+named a word the language doesn't have. Now everything a script or host reads
+says `none`. The internals still say nil (`Value::nil`, `is_nil`, and in the
+C API `umbra_pushnil`, `umbra_isnil` and the `umbra_type` codes). No script
+sees those names, and renaming them would be churn for no gain.
+
+As in Lua, storing under a `none` key is an error ("index is none") and
+reading one gives `none`. NaN is `none` here, so Lua's separate "index is
+NaN" case is the same error.
 
 ## `!=` for not-equal, `~=` for xor-assign
 

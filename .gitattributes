@@ -1,1 +1,5 @@
 *.umbra linguist-language=Lua
+# build.rs generates umbra.h with LF line endings. Git expects the same on
+# every checkout, so a build that leaves the header as it found it doesn't
+# show up as a change (core.autocrlf would otherwise expect CRLF).
+umbra.h text eol=lf

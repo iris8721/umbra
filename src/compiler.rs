@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::chunk::{Const, Op, Proto, RK_BIT, enc_abc, enc_abx, enc_asbx, iop, isbx};
+use crate::chunk::{Const, FnDecl, GcProto, Op, Proto, RK_BIT, enc_abc, enc_abx, enc_asbx, iop, isbx};
 const BIAS: i32 = crate::chunk::BIAS;
 // Register operands share an 8-bit field with RK constants (bit 7 set), so
 // both registers and RK-encodable constants are limited to 0..128.
@@ -129,7 +129,8 @@ fn scan_expr(expr: &Expr, in_closure: bool, depth: u32, out: &mut std::collectio
         Expr::Field { table, .. } => scan_expr(table, in_closure, depth + 1, out, overflow),
         Expr::Unop { operand, .. } => scan_expr(operand, in_closure, depth + 1, out, overflow),
         Expr::Binop { lhs, rhs, .. } => { scan_expr(lhs, in_closure, depth + 1, out, overflow); scan_expr(rhs, in_closure, depth + 1, out, overflow); }
-        Expr::Concat { parts, .. } => for e in parts { scan_expr(e, in_closure, depth + 1, out, overflow); },
+        Expr::Concat { parts, .. } | Expr::Interp { parts, .. } =>
+            for e in parts { scan_expr(e, in_closure, depth + 1, out, overflow); },
         Expr::Call(c) => scan_call(c, in_closure, depth + 1, out, overflow),
         Expr::MethodCall(m) => scan_methodcall(m, in_closure, depth + 1, out, overflow),
         Expr::Function(body) => scan_funcbody(body, depth + 1, out, overflow),
@@ -239,6 +240,9 @@ struct PendingGoto {
 
 struct FnComp {
     proto: Proto,
+    // Nested functions compiled so far, owned here until compile_fn moves
+    // them into proto.protos, so a compile error frees them.
+    children: Vec<Compiled>,
     locals: Vec<Local>,
     upvals: Vec<UpvalInfo>,
     // Raw pointer to the enclosing function's still-being-compiled FnComp
@@ -272,6 +276,9 @@ struct FnComp {
     // Finished (name, reg, live-range) entries for Proto::locvars; a local
     // moves here when its scope pops it.
     locvars: Vec<crate::chunk::LocVar>,
+    // The name a `let f = fn ...` binding gives the function expression
+    // compiled next (compile_value); taken before its body compiles.
+    next_decl: Option<FnDecl>,
 }
 
 impl FnComp {
@@ -279,12 +286,12 @@ impl FnComp {
         let mut proto = Proto::new();
         proto.source = source;
         Self {
-            proto, locals: Vec::new(), upvals: Vec::new(), outer_scope: outer,
+            proto, children: Vec::new(), locals: Vec::new(), upvals: Vec::new(), outer_scope: outer,
             free_reg: 0, loops: Vec::new(), line: 1,
             labels: std::collections::HashMap::new(), pending_gotos: Vec::new(),
             block_parent: vec![None], block_tail: vec![false], blocks: vec![0],
             tail_stmt: true, depth, is_vararg,
-            captured, locvars: Vec::new(),
+            captured, locvars: Vec::new(), next_decl: None,
         }
     }
 
@@ -464,6 +471,9 @@ impl FnComp {
             return Some((i as u8, self.upvals[i].boxed));
         }
         let outer_ptr = self.outer_scope?;
+        // SAFETY: the enclosing FnComp made this pointer from its own &mut
+        // self right before compiling us, and stays suspended in that call
+        // until we return, so this is the only access to it.
         let outer = unsafe { &mut *outer_ptr };
         if let Some((reg, boxed)) = outer.resolve_local(name) {
             let idx = self.upvals.len() as u8;
@@ -796,14 +806,14 @@ impl FnComp {
                                 self.emit(enc_abc(Op::Vararg, dst as u8, want as u8 + 1, 0));
                             }
                             _ => {
-                                let e = self.compile_expr(val)?;
+                                let e = self.compile_value(val, names.get(i))?;
                                 self.to_reg(e, Some(dst as u8))?;
                                 for j in 1..want { self.emit_load_nil((dst + j) as u8); }
                             }
                         }
                         if (self.free_reg as usize) < dst + want { self.free_reg = (dst + want) as u8; }
                     } else {
-                        let e = self.compile_expr(val)?;
+                        let e = self.compile_value(val, names.get(i))?;
                         self.to_reg(e, Some(dst as u8))?;
                         if self.free_reg as usize <= dst { self.free_reg = (dst + 1) as u8; }
                     }
@@ -1117,9 +1127,15 @@ impl FnComp {
             Stmt::FuncDef { name, body, line } => {
                 self.line = *line;
                 let outer = Some(self as *mut FnComp);
-                let proto = compile_fn(body, self.proto.source.clone(), outer, self.depth)?;
-                let pi = self.proto.protos.len();
-                self.proto.protos.push(proto);
+                // `fn A:m` is method 'm', like Lua names a method call;
+                // `fn a.b.f` is function 'a.b.f'.
+                let decl = match &name.method {
+                    Some(m) => ("method", m.clone()),
+                    None => ("function", name.parts.join(".")),
+                };
+                let child = compile_fn(body, self.proto.source.clone(), Some(decl), outer, self.depth)?;
+                let pi = self.children.len();
+                self.children.push(child);
                 let dst = self.alloc_reg()?;
                 self.emit(enc_abx(Op::Closure, dst, pi as u16));
 
@@ -1177,9 +1193,9 @@ impl FnComp {
                 let boxed = self.captured.contains(name);
                 if boxed { self.emit(enc_abc(Op::NewTable, r, 0, 0)); }
                 self.locals.push(Local { name: name.clone(), reg: r, mutable: true, close: false, boxed, start_pc: self.pc() });
-                let proto = compile_fn(body, self.proto.source.clone(), outer, self.depth)?;
-                let pi = self.proto.protos.len();
-                self.proto.protos.push(proto);
+                let child = compile_fn(body, self.proto.source.clone(), Some(("function", name.clone())), outer, self.depth)?;
+                let pi = self.children.len();
+                self.children.push(child);
                 if boxed {
                     let tmp = self.alloc_reg()?;
                     self.emit(enc_abx(Op::Closure, tmp, pi as u16));
@@ -1311,6 +1327,15 @@ impl FnComp {
         Ok(())
     }
 
+    // The value bound to `name` by let/var: a function expression is named
+    // after it, as `fn name()` would be.
+    fn compile_value(&mut self, val: &Expr, name: Option<&String>) -> CResult<Expr2> {
+        if let (Expr::Function(_), Some(name)) = (val, name) {
+            self.next_decl = Some(("function", name.clone()));
+        }
+        self.compile_expr(val)
+    }
+
     fn compile_expr(&mut self, expr: &Expr) -> CResult<Expr2> {
         if self.depth >= MAX_DEPTH {
             return Err(err("chunk too deeply nested", expr.line()));
@@ -1383,7 +1408,10 @@ impl FnComp {
                 Ok(Expr2::reg(dst, *line))
             }
             Expr::Binop { op, lhs, rhs, line } => self.compile_binop(*op, lhs, rhs, *line),
-            Expr::Concat { parts, line } => {
+            // Both evaluate their parts into consecutive registers for one
+            // instruction to join.
+            Expr::Concat { parts, line } | Expr::Interp { parts, line } => {
+                let op = if matches!(expr, Expr::Concat { .. }) { Op::Concat } else { Op::Interp };
                 self.line = *line;
                 let base = self.free_reg;
                 for (i, p) in parts.iter().enumerate() {
@@ -1399,15 +1427,19 @@ impl FnComp {
                 }
                 let top = base + parts.len() as u8 - 1;
                 let dst = base;
-                self.emit(enc_abc(Op::Concat, dst, base, top));
+                // The parts set their own lines; an error joining them (a
+                // failing __concat or __tostring) belongs to the whole.
+                self.line = *line;
+                self.emit(enc_abc(op, dst, base, top));
                 self.free_reg = base + 1;
                 Ok(Expr2::reg(dst, *line))
             }
             Expr::Function(body) => {
+                let decl = self.next_decl.take();
                 let outer = Some(self as *mut FnComp);
-                let proto = compile_fn(body, self.proto.source.clone(), outer, self.depth)?;
-                let pi = self.proto.protos.len();
-                self.proto.protos.push(proto);
+                let child = compile_fn(body, self.proto.source.clone(), decl, outer, self.depth)?;
+                let pi = self.children.len();
+                self.children.push(child);
                 let r = self.alloc_reg()?;
                 self.emit(enc_abx(Op::Closure, r, pi as u16));
                 Ok(Expr2::reg(r, line))
@@ -1854,9 +1886,10 @@ impl FnComp {
     }
 }
 
-fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp>, depth: u32) -> CResult<Proto> {
+fn compile_fn(body: &FuncBody, source: Option<String>, decl: Option<FnDecl>, outer: Option<*mut FnComp>, depth: u32) -> CResult<Compiled> {
     let captured = collect_captured_names(body)?;
     let mut fc = FnComp::new(source, outer, captured, depth, body.vararg);
+    fc.proto.decl = decl;
     if body.params.len() > MAX_REGS as usize {
         return Err(err("too many parameters", body.line));
     }
@@ -1944,7 +1977,7 @@ fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp
     if fc.proto.consts.len() > u16::MAX as usize + 1 {
         return Err(err("too many constants", body.line));
     }
-    if fc.proto.protos.len() > u16::MAX as usize + 1 {
+    if fc.children.len() > u16::MAX as usize + 1 {
         return Err(err("too many nested functions", body.line));
     }
     if fc.upvals.len() > u8::MAX as usize + 1 {
@@ -1962,11 +1995,96 @@ fn compile_fn(body: &FuncBody, source: Option<String>, outer: Option<*mut FnComp
     fc.pop_locals_to(0);
     fc.proto.locvars = std::mem::take(&mut fc.locvars);
     fc.proto.line_defined = body.line;
+    fc.proto.protos = fc.children.drain(..).map(Compiled::into_raw).collect();
 
-    Ok(fc.proto)
+    Ok(Compiled::new(fc.proto))
 }
 
-pub fn compile(block: Block, source: Option<String>) -> CResult<Proto> {
+/// A compiled chunk, ready for Vm::exec. Only compile makes one, and the
+/// VM takes it by value: the interpreter trusts bytecode (registers,
+/// constants and opcodes are read unchecked), so it must run nothing the
+/// compiler didn't emit, and it keeps what it runs for as long as any
+/// function made from it can still be called.
+///
+/// ```
+/// let (block, _) = umbra::parse("return 1");
+/// let chunk = umbra::compile(block, None).unwrap();
+/// let mut vm = umbra::vm::Vm::new();
+/// assert_eq!(vm.exec(chunk).unwrap()[0].as_int(), Some(1));
+/// ```
+///
+/// Stress-test findings 16 and 41: none of these compile.
+///
+/// ```compile_fail
+/// // exec takes the chunk, not a borrow the VM could outlive.
+/// let (block, _) = umbra::parse("return 1");
+/// let chunk = umbra::compile(block, None).unwrap();
+/// umbra::vm::Vm::new().exec(&chunk);
+/// ```
+///
+/// ```compile_fail
+/// // Hand-built bytecode: Proto has no public constructor.
+/// let p = umbra::chunk::Proto::new();
+/// ```
+///
+/// ```compile_fail
+/// // Nor public fields to edit a compiled one with.
+/// fn patch(p: &mut umbra::chunk::Proto) { p.code.clear(); }
+/// ```
+///
+/// ```compile_fail
+/// // And a Compiled can't be made from one.
+/// fn forge(p: umbra::chunk::Proto) -> umbra::compiler::Compiled { umbra::compiler::Compiled(p) }
+/// ```
+pub struct Compiled(*mut GcProto);
+
+// SAFETY: a Compiled owns its tree as uniquely as a Box would (one parent
+// per proto, no Vm has registered any of it), and nothing in the tree is
+// tied to a thread, so it may be compiled on one thread and run on another.
+unsafe impl Send for Compiled {}
+
+impl Compiled {
+    fn new(proto: Proto) -> Self {
+        let gc = crate::gc::GcHeader::new(crate::gc::GcKind::Proto);
+        Compiled(Box::into_raw(Box::new(GcProto { gc, proto })))
+    }
+
+    /// The root of the tree, for a Vm to register: from here on the
+    /// collector owns every proto in it.
+    pub(crate) fn into_raw(self) -> *mut GcProto {
+        let p = self.0;
+        std::mem::forget(self);
+        p
+    }
+
+    fn proto_mut(&mut self) -> &mut Proto {
+        // SAFETY: the tree is ours alone until into_raw.
+        unsafe { &mut (*self.0).proto }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proto(&self) -> &Proto {
+        // SAFETY: as proto_mut.
+        unsafe { &(*self.0).proto }
+    }
+}
+
+// A tree no Vm took (an unused compile, or one abandoned by a compile
+// error): free it, children by way of their parents.
+impl Drop for Compiled {
+    fn drop(&mut self) {
+        let mut pending = vec![self.0];
+        while let Some(p) = pending.pop() {
+            // SAFETY: every proto in an unregistered tree came from
+            // Box::into_raw in Compiled::new and has exactly one parent, so
+            // each is freed once.
+            let owned = unsafe { Box::from_raw(p) };
+            pending.extend_from_slice(&owned.proto.protos);
+        }
+    }
+}
+
+pub fn compile(block: Block, source: Option<String>) -> CResult<Compiled> {
     let line = block.line;
     let chunk_body = FuncBody {
         params: vec![],
@@ -1974,8 +2092,8 @@ pub fn compile(block: Block, source: Option<String>) -> CResult<Proto> {
         body: block,
         line,
     };
-    let mut proto = compile_fn(&chunk_body, source, None, 0)?;
-    proto.is_main = true;
-    Ok(proto)
+    let mut chunk = compile_fn(&chunk_body, source, None, None, 0)?;
+    chunk.proto_mut().is_main = true;
+    Ok(chunk)
 }
 

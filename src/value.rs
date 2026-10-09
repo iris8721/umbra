@@ -47,6 +47,26 @@ const MISC_NIL:   u64 = 0;
 const MISC_FALSE: u64 = 1;
 const MISC_TRUE:  u64 = 2;
 
+// Pointers into and out of the box. A boxed heap pointer is 48 bits of a
+// u64, turned back into a pointer when the value is used. Strict provenance
+// can't express that: an integer carries no provenance, and the box has no
+// room for the pointer beside its address. So the round trip uses Rust's
+// permissive model: boxing exposes the pointer's provenance, and unboxing
+// rebuilds the pointer from the provenance exposed at that address. These
+// two functions are the only places in the crate where a pointer becomes an
+// integer that is turned back into a pointer. Miri checks them under
+// -Zmiri-permissive-provenance; it can't check the VM under strict
+// provenance.
+#[inline(always)]
+fn box_ptr(ptr: *mut u8) -> u64 {
+    ptr.expose_provenance() as u64
+}
+
+#[inline(always)]
+fn unbox_ptr(addr: u64) -> *mut u8 {
+    std::ptr::with_exposed_provenance_mut(addr as usize)
+}
+
 impl Value {
     #[inline(always)]
     fn tagged(tag: u64, payload: u64) -> Self {
@@ -69,9 +89,13 @@ impl Value {
         Self::tagged(TAG_INT, n as u64)
     }
 
+    // The pointer constructors are crate-private: a Value with a heap tag is
+    // dereferenced by safe accessors (heap.rs), so only code that just
+    // allocated the object, or read the pointer out of another live Value,
+    // may make one. Hosts get pointer Values from Ctx, already rooted.
     #[inline(always)]
-    pub fn bigint(ptr: *mut u8) -> Self {
-        Self::tagged(TAG_BIGINT, ptr as u64)
+    pub(crate) fn bigint(ptr: *mut u8) -> Self {
+        Self::tagged(TAG_BIGINT, box_ptr(ptr))
     }
 
     #[inline(always)]
@@ -82,33 +106,41 @@ impl Value {
     }
 
     #[inline(always)]
-    pub fn table(ptr: *mut u8) -> Self {
-        Self::tagged(TAG_TABLE, ptr as u64)
+    pub(crate) fn table(ptr: *mut u8) -> Self {
+        Self::tagged(TAG_TABLE, box_ptr(ptr))
     }
 
     #[inline(always)]
-    pub fn string(ptr: *mut u8) -> Self {
-        Self::tagged(TAG_STRING, ptr as u64)
+    pub(crate) fn string(ptr: *mut u8) -> Self {
+        Self::tagged(TAG_STRING, box_ptr(ptr))
+    }
+
+    // An upvalue-less script function: a GcProto.
+    #[inline(always)]
+    pub(crate) fn userdata(ptr: *mut u8) -> Self {
+        Self::tagged(TAG_USERDATA, box_ptr(ptr))
+    }
+
+    // A native function (a NativeFn): userdata with heap::NATIVE_BIT set in
+    // the payload, a bit no user-space address has.
+    #[inline(always)]
+    pub(crate) fn native(ptr: *mut u8) -> Self {
+        Self::tagged(TAG_USERDATA, box_ptr(ptr) | crate::heap::NATIVE_BIT)
     }
 
     #[inline(always)]
-    pub fn userdata(ptr: *mut u8) -> Self {
-        Self::tagged(TAG_USERDATA, ptr as u64)
+    pub(crate) fn coroutine(ptr: *mut u8) -> Self {
+        Self::tagged(TAG_COROUTINE, box_ptr(ptr))
     }
 
     #[inline(always)]
-    pub fn coroutine(ptr: *mut u8) -> Self {
-        Self::tagged(TAG_COROUTINE, ptr as u64)
+    pub(crate) fn closure(ptr: *mut u8) -> Self {
+        Self::tagged(TAG_CLOSURE, box_ptr(ptr))
     }
 
     #[inline(always)]
-    pub fn closure(ptr: *mut u8) -> Self {
-        Self::tagged(TAG_CLOSURE, ptr as u64)
-    }
-
-    #[inline(always)]
-    pub fn bytes(ptr: *mut u8) -> Self {
-        Self(NAN_MASK | ((ptr as u64) & PAYLOAD_MASK))
+    pub(crate) fn bytes(ptr: *mut u8) -> Self {
+        Self(NAN_MASK | (box_ptr(ptr) & PAYLOAD_MASK))
     }
 
     #[inline(always)]
@@ -172,8 +204,7 @@ impl Value {
             return Some((raw << 16) >> 16);
         }
         if self.is_bigint() {
-            let ptr = (self.0 & PAYLOAD_MASK) as *const crate::vm::GcBigInt;
-            return Some(unsafe { (*ptr).n });
+            return Some(crate::heap::bigint(self));
         }
         None
     }
@@ -193,53 +224,88 @@ impl Value {
     #[inline(always)]
     pub fn as_bigint(self) -> Option<*mut u8> {
         if !self.is_bigint() { return None; }
-        Some((self.0 & PAYLOAD_MASK) as *mut u8)
+        Some(unbox_ptr(self.0 & PAYLOAD_MASK))
     }
 
     #[inline(always)]
     pub fn as_table(self) -> Option<*mut u8> {
         if !self.is_table() { return None; }
-        Some((self.0 & PAYLOAD_MASK) as *mut u8)
+        Some(unbox_ptr(self.0 & PAYLOAD_MASK))
     }
 
     #[inline(always)]
     pub fn as_string(self) -> Option<*mut u8> {
         if !self.is_string() { return None; }
-        Some((self.0 & PAYLOAD_MASK) as *mut u8)
+        Some(unbox_ptr(self.0 & PAYLOAD_MASK))
     }
 
+    /// The object behind a function value that isn't a closure: a native's
+    /// NativeFn or an upvalue-less function's GcProto.
     #[inline(always)]
     pub fn as_userdata(self) -> Option<*mut u8> {
         if !self.is_userdata() { return None; }
-        Some((self.0 & PAYLOAD_MASK) as *mut u8)
+        Some(unbox_ptr(self.0 & PAYLOAD_MASK & !crate::heap::NATIVE_BIT))
     }
 
     #[inline(always)]
     pub fn as_coroutine(self) -> Option<*mut u8> {
         if !self.is_coroutine() { return None; }
-        Some((self.0 & PAYLOAD_MASK) as *mut u8)
+        Some(unbox_ptr(self.0 & PAYLOAD_MASK))
     }
 
     #[inline(always)]
     pub fn as_closure(self) -> Option<*mut u8> {
         if !self.is_closure() { return None; }
-        Some((self.0 & PAYLOAD_MASK) as *mut u8)
+        Some(unbox_ptr(self.0 & PAYLOAD_MASK))
     }
 
     #[inline(always)]
     pub fn as_bytes_ptr(self) -> Option<*mut u8> {
         if !self.is_bytes() { return None; }
-        Some((self.0 & PAYLOAD_MASK) as *mut u8)
+        Some(unbox_ptr(self.0 & PAYLOAD_MASK))
+    }
+
+    // The address of the heap object a Value points at; None for the
+    // immediate kinds (floats, integers, nil, booleans). One tag dispatch:
+    // marking a table of numbers asks this of every element. A userdata
+    // payload is a native with bit 47 set (heap::NATIVE_BIT), which isn't
+    // part of the address, or else a proto.
+    #[inline(always)]
+    fn heap_addr(self) -> Option<u64> {
+        if !self.is_nan_boxed() { return None; }
+        match self.tag() {
+            TAG_INT | TAG_MISC => None,
+            TAG_USERDATA => Some(self.0 & PAYLOAD_MASK & !crate::heap::NATIVE_BIT),
+            _ => Some(self.0 & PAYLOAD_MASK),
+        }
+    }
+
+    // The heap object a Value points at, for the collector.
+    #[inline(always)]
+    pub(crate) fn gc_ptr(self) -> Option<*mut u8> {
+        self.heap_addr().map(unbox_ptr)
+    }
+
+    // The address a reference value is known by, as Lua's %p prints it:
+    // what tostring shows after the type name, and string.format's %p.
+    // Objects never move, so it is stable for the object's life. None for
+    // the immediate kinds and for integers, boxed or not.
+    pub(crate) fn identity(self) -> Option<usize> {
+        if self.is_bigint() { return None; }
+        self.heap_addr().map(|a| a as usize)
     }
 
     #[inline(always)]
     pub fn raw_bits(self) -> u64 { self.0 }
 
+    // Crate-private for the same reason as the pointer constructors.
     #[inline(always)]
-    pub fn from_raw(bits: u64) -> Self { Self(bits) }
+    pub(crate) fn from_raw(bits: u64) -> Self { Self(bits) }
 
+    // What scripts call the type: `none` for the nil value, as the
+    // keyword spells it (type(), tostring, error messages).
     pub fn type_name(self) -> &'static str {
-        if self.is_nil()       { "nil" }
+        if self.is_nil()       { "none" }
         else if self.is_bool() { "boolean" }
         else if self.is_int_like() { "integer" }
         else if self.is_float(){ "float" }
@@ -315,7 +381,7 @@ impl Eq for Value {}
 
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_nil()        { write!(f, "nil") }
+        if self.is_nil()        { write!(f, "none") }
         else if self.is_bool()  { write!(f, "{}", (self.0 & PAYLOAD_MASK) == MISC_TRUE) }
         else if self.is_int_like() { write!(f, "{}i", self.as_int().unwrap()) }
         else if self.is_float() { write!(f, "{}f", self.as_float().unwrap()) }
@@ -331,10 +397,15 @@ impl std::fmt::Debug for Value {
 
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_nil()        { write!(f, "nil") }
+        if self.is_nil()        { write!(f, "none") }
         else if self.is_bool()  { write!(f, "{}", (self.0 & PAYLOAD_MASK) == MISC_TRUE) }
         else if self.is_int_like() { write!(f, "{}", self.as_int().unwrap()) }
         else if self.is_float() { write!(f, "{}", lua_float_str(self.as_float().unwrap())) }
-        else { write!(f, "{}", self.type_name()) }
+        else {
+            match self.identity() {
+                Some(addr) => write!(f, "{}: {addr:#x}", self.type_name()),
+                None => write!(f, "{}", self.type_name()),
+            }
+        }
     }
 }

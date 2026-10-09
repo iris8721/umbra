@@ -3,6 +3,8 @@ pub mod ast;
 pub mod gc;
 pub mod chunk;
 pub mod compiler;
+pub mod embed;
+mod heap;
 pub mod lexer;
 pub mod pack;
 pub mod parser;
@@ -22,8 +24,8 @@ pub fn run_with_vm(src: &str, vm: &mut vm::Vm) -> Result<(), String> {
     if !parse_errs.is_empty() {
         return Err(parse_errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n"));
     }
-    let proto = compile(block, None).map_err(|e| e.to_string())?;
-    vm.exec_owned(proto).map(|_| ()).map_err(|e| e.to_string())
+    let chunk = compile(block, None).map_err(|e| e.to_string())?;
+    vm.exec(chunk).map(|_| ()).map_err(|e| e.to_string())
 }
 
 pub fn run_capture(src: &str) -> Result<Vec<String>, String> {
@@ -35,11 +37,11 @@ pub fn run_capture(src: &str) -> Result<Vec<String>, String> {
     if !parse_errs.is_empty() {
         return Err(parse_errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n"));
     }
-    let proto = compile(block, None).map_err(|e| e.to_string())?;
-    let mut vm = vm::Vm::new_with_print(move |line| {
-        cap2.lock().unwrap().push(line);
+    let chunk = compile(block, None).map_err(|e| e.to_string())?;
+    let mut vm = vm::Vm::new_with_print(move |line, _newline| {
+        cap2.lock().unwrap().push(line.to_owned());
     });
-    let result = vm.exec(&proto).map_err(|e| e.to_string());
+    let result = vm.exec(chunk).map(|_| ()).map_err(|e| e.to_string());
     drop(vm);
     result?;
     Ok(Arc::try_unwrap(captured).unwrap().into_inner().unwrap())
@@ -228,17 +230,18 @@ mod tests {
     #[test]
     fn value_ptr_roundtrip() {
         use value::Value;
-        let x: u64 = 0x0000_DEAD_BEEF_0010;
-        let ptr = x as *mut u8;
+        // Only the address goes through the box here; nothing dereferences it.
+        let x: usize = 0x0000_DEAD_BEEF_0010;
+        let ptr = std::ptr::without_provenance_mut::<u8>(x);
         let v = Value::table(ptr);
         assert!(v.is_table());
-        assert_eq!(v.as_table().unwrap() as u64, x);
+        assert_eq!(v.as_table().unwrap().addr(), x);
     }
 
     #[test]
     fn value_type_names() {
         use value::Value;
-        assert_eq!(Value::nil().type_name(),       "nil");
+        assert_eq!(Value::nil().type_name(),       "none");
         assert_eq!(Value::bool(true).type_name(),  "boolean");
         assert_eq!(Value::int(0).type_name(),       "integer");
         assert_eq!(Value::float(1.0).type_name(),   "float");
@@ -592,7 +595,7 @@ mod tests {
             "let a, b = string.find(\"abc\", \"^a\")\nprint(a)\nprint(b)",
             &["1", "1"],
         );
-        assert_output(r#"print(string.find("abc", "^b"))"#, &["nil"]);
+        assert_output(r#"print(string.find("abc", "^b"))"#, &["none"]);
         assert_output(
             "let a, b = string.find(\"abc\", \"c$\")\nprint(a)\nprint(b)",
             &["3", "3"],
@@ -760,6 +763,24 @@ mod tests {
         );
     }
 
+    // Stress-test finding 36: the print hook hears whether a newline
+    // follows, so io.write keeps its no-newline semantics through it.
+    #[test]
+    fn the_print_hook_gets_the_newline_flag() {
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<(String, bool)>>> = Arc::default();
+        let log2 = log.clone();
+        let mut vm = vm::Vm::new_with_print(move |text, newline| log2.lock().unwrap().push((text.to_owned(), newline)));
+        run_with_vm("io.write(\"a\", 1)\nio.write(\"b\\n\")\nprint(\"c\", 2)\nio.write()", &mut vm).unwrap();
+        let got = log.lock().unwrap().clone();
+        assert_eq!(got, [
+            ("a1".to_owned(), false),
+            ("b\n".to_owned(), false),
+            ("c\t2".to_owned(), true),
+            (String::new(), false),
+        ]);
+    }
+
     #[test]
     fn os_time_and_clock_return_sane_values() {
         assert_output(
@@ -773,7 +794,7 @@ mod tests {
     fn os_getenv_returns_nil_for_unset_var() {
         assert_output(
             "print(os.getenv(\"UMBRA_DEFINITELY_UNSET_VAR_XYZ\"))",
-            &["nil"],
+            &["none"],
         );
     }
 
@@ -872,7 +893,7 @@ print(type(load("let x = 1")))"#,
         assert_output(
             r#"let f, msg = load("syntax error here")
 print(f, type(msg))"#,
-            &["nil\tstring"],
+            &["none\tstring"],
         );
     }
 
@@ -900,7 +921,7 @@ print(pcall(f))"#,
             g:close()"
         ));
         std::fs::remove_file(path).ok();
-        assert_eq!(result.unwrap(), vec!["line one", "line two", "nil"]);
+        assert_eq!(result.unwrap(), vec!["line one", "line two", "none"]);
     }
 
     #[test]
@@ -924,7 +945,7 @@ print(pcall(f))"#,
             "let f, err = io.open(\"umbra_test_io_open_missing_xyz.txt\", \"r\")
             print(f)
             print(err != nil)",
-            &["nil", "true"],
+            &["none", "true"],
         );
     }
 
@@ -1368,8 +1389,8 @@ print(pcall(f))"#,
     fn vm_superinstructions_emitted() {
         let (block, errs) = parse("fn f(n) { if n < 2 { return n } return f(n - 1) }");
         assert!(errs.is_empty());
-        let proto = compile(block, None).unwrap();
-        let dump = disasm(&proto);
+        let chunk = compile(block, None).unwrap();
+        let dump = disasm(&chunk);
         assert!(dump.contains("LtI"), "{dump}");
         assert!(dump.contains("SubI"), "{dump}");
         assert!(dump.contains("TailCall"), "{dump}");
@@ -1692,7 +1713,7 @@ print(pcall(f))"#,
             let {x, y} = point
             print(x)
             print(y)",
-            &["1", "nil"],
+            &["1", "none"],
         );
     }
 
@@ -1822,7 +1843,7 @@ print(pcall(f))"#,
 
     #[test]
     fn gc_tracks_and_frees_stdlib_computed_strings() {
-        // Computed strings (alloc_string_val) must be GC-tracked and freed.
+        // Computed strings (Vm::alloc_str) must be GC-tracked and freed.
         use std::ffi::CString;
 
         let U = api::umbra_newstate();
@@ -2068,7 +2089,7 @@ print(getmetatable(t) == mt)
 setmetatable(t, none)
 print(getmetatable(t))
 "#,
-            &["true", "nil"],
+            &["true", "none"],
         );
     }
 
@@ -2081,7 +2102,7 @@ let obj = setmetatable({}, { __index = proto })
 print(obj.greet)
 print(obj.missing)
 "#,
-            &["hello", "nil"],
+            &["hello", "none"],
         );
     }
 
@@ -2283,7 +2304,7 @@ print(obj:greet())
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
 
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
 
         run_with_vm(
             r#"gcfired = false
@@ -2662,7 +2683,7 @@ print(co())
     fn stdlib_string_find() {
         assert_output(r#"let s, e = string.find("hello world", "world")
 print(s, e)"#, &["7\t11"]);
-        assert_output(r#"print(string.find("hello", "xyz"))"#, &["nil"]);
+        assert_output(r#"print(string.find("hello", "xyz"))"#, &["none"]);
     }
 
     #[test]
@@ -2710,7 +2731,7 @@ print(s:len())"#, &["5"]);
     fn stdlib_math_type() {
         assert_output(r#"print(math.type(1))"#, &["integer"]);
         assert_output(r#"print(math.type(1.0))"#, &["float"]);
-        assert_output(r#"print(math.type("x"))"#, &["nil"]);
+        assert_output(r#"print(math.type("x"))"#, &["none"]);
     }
 
     #[test]
@@ -2769,7 +2790,7 @@ coroutine.resume(co, 20)
 
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
 
         // __gc is a real closure (captures `tag`) and reads the dying table's
         // own fields: both must still be alive when the finalizer runs.
@@ -2792,7 +2813,7 @@ gcobj = setmetatable({ payload = {1, 2, 3} }, { __gc = fn(self) { seen = tag .. 
 
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
 
         run_with_vm(
             r#"count = 0
@@ -2815,7 +2836,7 @@ for i = 1, 5 { objs[i] = setmetatable({}, mt) }"#,
 
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
         vm.gc.threshold = 8;
 
         // Each finalizer allocates well past the threshold, so a collection
@@ -2937,7 +2958,7 @@ for i, v in step, 3, 0 { print(i, v) }"#,
         use std::sync::{Arc, Mutex};
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
         run_with_vm(
             r#"finalized = 0
 let mt = { __gc = fn(self) { finalized = finalized + 1 } }
@@ -2961,7 +2982,7 @@ print(finalized)"#,
         use std::sync::{Arc, Mutex};
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
         vm.gc.threshold = 1;
         run_with_vm(
             r#"finalized = 0
@@ -2986,7 +3007,7 @@ print(finalized)"#,
         use std::sync::{Arc, Mutex};
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
         run_with_vm(
             r#"wt = setmetatable({}, { __mode = "k" })
 var k = {}
@@ -3010,7 +3031,7 @@ print(n)",
         use std::sync::{Arc, Mutex};
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
         vm.gc.threshold = 4;
         // Each finalizer drops four more finalizable tables into a weak-key
         // table and allocates past the threshold, forcing nested collections
@@ -3050,7 +3071,7 @@ t = none"#,
         use std::sync::{Arc, Mutex};
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
         run_with_vm(
             r#"finalized = 0
 let mt = { __gc = fn(self) { finalized = finalized + 1 } }
@@ -3076,7 +3097,7 @@ print(finalized)"#,
         use std::sync::{Arc, Mutex};
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
         run_with_vm(
             r#"saved = none
 var t = setmetatable({ x = 42 }, { __gc = fn(self) { saved = self } })
@@ -3095,7 +3116,7 @@ t = none"#,
         use std::sync::{Arc, Mutex};
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
         run_with_vm(
             r#"finalized = 0
 let mt = { __gc = fn(self) { finalized = finalized + 1 } }
@@ -3194,7 +3215,7 @@ t[-9223372036854775809.0] = "d"
 t[0.0] = "z"
 print(t[9223372036854775807.0], t[9223372036854775808.0], t[-9223372036854775808.0], t[-9223372036854775809.0], t[0])
 print(t[2.5], t[-0.0])"#,
-            &["b\tb\td\td\tz", "nil\tz"],
+            &["b\tb\td\td\tz", "none\tz"],
         );
     }
 
@@ -3204,7 +3225,7 @@ print(t[2.5], t[-0.0])"#,
         use std::sync::{Arc, Mutex};
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let mut vm = Vm::new_with_print(move |l| log2.lock().unwrap().push(l));
+        let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
         vm.gc.threshold = 1;
         run_with_vm(
             r#"finalized = 0
@@ -3353,7 +3374,7 @@ error("toplevel")"#,
         assert!(err.contains("toplevel"), "{err}");
         let key = vm.intern_pub("seen");
         let seen = vm.globals.raw_get(key);
-        assert_eq!(unsafe { vm::string_ref(seen) }, "[string \"...\"]:2: toplevel");
+        assert_eq!(vm.gc.str(seen), "[string \"...\"]:2: toplevel");
     }
 
     #[test]
@@ -3451,13 +3472,13 @@ print(ok, #t, t[1] + t[2] + t[3])"#,
         // Lua: pos must satisfy 1 <= pos <= n+1 unless pos == n.
         assert!(run("let t = {1, 2, 3}\ntable.remove(t, 7)").is_err());
         assert!(run("let t = {1, 2, 3}\ntable.remove(t, 0)").is_err());
-        assert_output("let t = {1, 2, 3}\nprint(table.remove(t, 4), #t)", &["nil\t3"]);
-        assert_output("print(table.remove({}), table.remove({}, 0))", &["nil\tnil"]);
+        assert_output("let t = {1, 2, 3}\nprint(table.remove(t, 4), #t)", &["none\t3"]);
+        assert_output("print(table.remove({}), table.remove({}, 0))", &["none\tnone"]);
     }
 
     #[test]
     fn string_find_plain_inside_multibyte_text() {
-        assert_output(r#"print(string.find("héllo", "x", 3, true))"#, &["nil"]);
+        assert_output(r#"print(string.find("héllo", "x", 3, true))"#, &["none"]);
         assert_output(r#"print(string.find("héllo", "llo", 3, true))"#, &["4\t6"]);
     }
 
@@ -3482,7 +3503,7 @@ print(it("héllo", 3))"#, &["4\t108"]);
 
     #[test]
     fn tonumber_handles_hex_and_bases() {
-        assert_output(r#"print(tonumber("0x10"), tonumber("ff", 16), tonumber("z", 36), tonumber("12", 2))"#, &["16\t255\t35\tnil"]);
+        assert_output(r#"print(tonumber("0x10"), tonumber("ff", 16), tonumber("z", 36), tonumber("12", 2))"#, &["16\t255\t35\tnone"]);
     }
 
     #[test]
@@ -3820,9 +3841,9 @@ print(coroutine.isyieldable())"#,
     fn api_cross_state_reentry_keeps_allocations_on_their_own_vm() {
         use std::ffi::{CStr, CString};
 
-        // A registered fn that runs a script on a *second* state: without
-        // CURRENT_VM save/restore, the outer script's later allocations are
-        // registered on the inner VM's GC and dangle after it collects.
+        // A registered fn that runs a script on a *second* state: the outer
+        // script's later allocations must still land on the outer VM's GC,
+        // or they dangle after the inner one collects.
         static mut INNER: *mut api::UmbraState = std::ptr::null_mut();
         unsafe extern "C" fn cross(U: *mut api::UmbraState) -> std::ffi::c_int {
             let src = CString::new("q = 1").unwrap();
@@ -3993,10 +4014,10 @@ print("after")"#,
     fn vm_math_tointeger_rejects_out_of_range_floats() {
         // i64::MAX as f64 is exactly 2^63, so a bare `f as i64` round-trip
         // check would wrongly accept 2^63; the bounds check must run first.
-        assert_output("print(math.tointeger(2^63))", &["nil"]);
-        assert_output("print(math.tointeger(0.0 - 9223372036854777856.0))", &["nil"]);
+        assert_output("print(math.tointeger(2^63))", &["none"]);
+        assert_output("print(math.tointeger(0.0 - 9223372036854777856.0))", &["none"]);
         assert_output("print(math.tointeger(3.0))", &["3"]);
-        assert_output("print(math.tointeger(3.5))", &["nil"]);
+        assert_output("print(math.tointeger(3.5))", &["none"]);
     }
 
     #[test]
@@ -4032,7 +4053,7 @@ print("after")"#,
 }
 
 #[cfg(test)]
-pub fn disasm(p: &chunk::Proto) -> String {
+pub fn disasm(c: &compiler::Compiled) -> String {
     let mut out = String::new();
     fn dump(p: &chunk::Proto, depth: usize, out: &mut String) {
         use chunk::*;
@@ -4044,9 +4065,10 @@ pub fn disasm(p: &chunk::Proto) -> String {
             out.push_str(&format!("{pad}{i:4} {op:10} a={} b={} c={} bx={} sbx={}\n",
                 ia(ins), ib(ins), ic(ins), ibx(ins), isbx(ins)));
         }
-        for c in p.protos.iter() { dump(c, depth + 1, out); }
+        // SAFETY: the children of a Compiled's tree, which it owns.
+        for &c in p.protos.iter() { dump(unsafe { &(*c).proto }, depth + 1, out); }
     }
-    dump(p, 0, &mut out);
+    dump(c.proto(), 0, &mut out);
     out
 }
 
@@ -4061,11 +4083,11 @@ mod stdlib_second_pass_tests {
     #[test]
     fn string_find_init_past_end_finds_nothing() {
         // Lua: init > len+1 fails even for an empty pattern.
-        assert_output(r#"print(string.find("abc", "", 5))"#, &["nil"]);
+        assert_output(r#"print(string.find("abc", "", 5))"#, &["none"]);
         assert_output(r#"print(string.find("abc", "", 4))"#, &["4\t3"]);
-        assert_output(r#"print(string.find("abc", "", 10, true))"#, &["nil"]);
-        assert_output(r#"print(string.match("abc", "", 5))"#, &["nil"]);
-        assert_output(r#"print(string.find("abc", "b", 5))"#, &["nil"]);
+        assert_output(r#"print(string.find("abc", "", 10, true))"#, &["none"]);
+        assert_output(r#"print(string.match("abc", "", 5))"#, &["none"]);
+        assert_output(r#"print(string.find("abc", "b", 5))"#, &["none"]);
     }
 
     #[test]
@@ -4090,7 +4112,7 @@ mod stdlib_second_pass_tests {
     #[test]
     fn pattern_backreference_to_position_capture_fails_match() {
         // Lua: %1 against a () capture fails the match rather than erroring.
-        assert_output(r#"print(string.find("aa", "()a%1"))"#, &["nil"]);
+        assert_output(r#"print(string.find("aa", "()a%1"))"#, &["none"]);
         assert_output(r#"print(string.find("aa", "(a)%1"))"#, &["1\t2\ta"]);
     }
 
@@ -4120,7 +4142,7 @@ mod stdlib_second_pass_tests {
         // Lua quotes floats as %a hex so they re-read exactly.
         assert_output(r#"print(string.format("%q", 4.5))"#, &["0x1.2p+2"]);
         assert_output(r#"print(string.format("%q", "tab\there"))"#, &[r#""tab\9here""#]);
-        assert_output(r#"print(string.format("%q", true), string.format("%q", none))"#, &["true\tnil"]);
+        assert_output(r#"print(string.format("%q", true), string.format("%q", none))"#, &["true\tnone"]);
         assert!(run(r#"string.format("%q", {})"#).is_err());
         assert!(run(r#"string.format("%5q", "x")"#).is_err());
     }
@@ -4133,7 +4155,7 @@ mod stdlib_second_pass_tests {
         assert_output(r#"print(tonumber("0x.8"))"#, &["0.5"]);
         // With an explicit base Lua parses digits only: no 0x prefix, no
         // floats, no decimal points.
-        assert_output(r#"print(tonumber("0x10", 16), tonumber("1.5", 10))"#, &["nil\tnil"]);
+        assert_output(r#"print(tonumber("0x10", 16), tonumber("1.5", 10))"#, &["none\tnone"]);
         assert_output(r#"print(tonumber("ff ", 16))"#, &["255"]);
         assert!(run(r#"tonumber(10, 16)"#).is_err());
         assert!(run(r#"tonumber("ff", 1.5)"#).is_err());
@@ -4241,7 +4263,7 @@ mod stdlib_second_pass_tests {
             print(r:read("l"))
             print(r:read("l"))
             r:close()"#,
-            &["true", "3.5", "42", " rest", "last", "nil"],
+            &["true", "3.5", "42", " rest", "last", "none"],
         );
         assert_output(
             r#"let r = io.open("/tmp/umbra_test_handle.txt", "r")
@@ -4308,7 +4330,7 @@ mod bytes_and_pack_tests {
             b[4] = 255
             print(b[1], b[2], b[4])
             print(b[5], b[0])",
-            &["4\tbytes", "65\t0\t255", "nil\tnil"],
+            &["4\tbytes", "65\t0\t255", "none\tnone"],
         );
     }
 
@@ -4463,47 +4485,47 @@ mod error_naming_tests {
     #[test]
     fn index_error_names_local_global_field_upvalue() {
         let e = run("let x = none\nreturn x.f").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (local 'x')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a none value (local 'x')");
         let e = run("return foo.bar").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:1: attempt to index a nil value (global 'foo')");
+        assert_eq!(e, "[string \"...\"]:1: attempt to index a none value (global 'foo')");
         let e = run("let t = {}\nreturn t.a.b").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (field 'a')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a none value (field 'a')");
         let e = run("let x = none\nfn f() { return x.f }\nf()").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (upvalue 'x')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a none value (upvalue 'x')");
     }
 
     #[test]
     fn index_error_names_set_and_method_receiver() {
         let e = run("let x = none\nx.f = 1").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (local 'x')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a none value (local 'x')");
         let e = run("let t = none\nt:m()").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to index a nil value (local 't')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to index a none value (local 't')");
     }
 
     #[test]
     fn call_error_names_callee() {
         let e = run("let x = none\nx()").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to call a nil value (local 'x')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to call a none value (local 'x')");
         let e = run("foo()").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:1: attempt to call a nil value (global 'foo')");
+        assert_eq!(e, "[string \"...\"]:1: attempt to call a none value (global 'foo')");
         let e = run("let t = {}\nt.m()").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to call a nil value (field 'm')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to call a none value (field 'm')");
         let e = run("let t = {}\nt:m()").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to call a nil value (method 'm')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to call a none value (method 'm')");
     }
 
     #[test]
     fn arith_concat_compare_len_errors_name_operand() {
         let e = run("let x = none\nreturn x + 1").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to perform arithmetic on a nil value (local 'x')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to perform arithmetic on a none value (local 'x')");
         let e = run("return \"a\" + 1").unwrap_err();
         assert_eq!(e, "[string \"...\"]:1: attempt to perform arithmetic on a string value (constant 'a')");
         let e = run("let x = none\nreturn x .. \"a\"").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to concatenate a nil value (local 'x')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to concatenate a none value (local 'x')");
         let e = run("let x = none\nreturn x < {}").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to compare nil (local 'x') with table");
+        assert_eq!(e, "[string \"...\"]:2: attempt to compare none (local 'x') with table");
         let e = run("let x = none\nreturn #x").unwrap_err();
-        assert_eq!(e, "[string \"...\"]:2: attempt to get length of a nil value (local 'x')");
+        assert_eq!(e, "[string \"...\"]:2: attempt to get length of a none value (local 'x')");
     }
 
     #[test]
@@ -4524,7 +4546,7 @@ print(outer())"#,
 fn f() { return tail() }
 let ok, tb = xpcall(f, debug.traceback)
 print(tb)"#,
-            &["[string \"...\"]:1: boom\nstack traceback:\n\t[string \"...\"]:1: in function <[string \"...\"]:1>\n\t(...tail calls...)"],
+            &["[string \"...\"]:1: boom\nstack traceback:\n\t[string \"...\"]:1: in function 'tail'\n\t(...tail calls...)\n\t[string \"...\"]:3: in main chunk"],
         );
     }
 
@@ -4532,11 +4554,11 @@ print(tb)"#,
     fn type_is_number_and_math_type_splits() {
         assert_output(
             "print(type(1), type(1.5), type(\"s\"), type(none), type({}))",
-            &["number\tnumber\tstring\tnil\ttable"],
+            &["number\tnumber\tstring\tnone\ttable"],
         );
         assert_output(
             "print(math.type(1), math.type(1.5), math.type(\"s\"))",
-            &["integer\tfloat\tnil"],
+            &["integer\tfloat\tnone"],
         );
     }
 }
@@ -4639,7 +4661,7 @@ mod stdlib_format_coverage_tests {
             &["31\t42"]);
         assert_output(r#"print(string.format("%s", setmetatable({}, {__tostring = fn() { return "MT!" }})))"#,
             &["MT!"]);
-        assert_output(r#"print(string.format("%s", none), string.format("%s", true))"#, &["nil\ttrue"]);
+        assert_output(r#"print(string.format("%s", none), string.format("%s", true))"#, &["none\ttrue"]);
         assert_output(r#"print(string.format("%c", 0) == "\0")"#, &["true"]);
         assert_output(r#"print(string.format("%.3s", "héllo"))"#, &["hé"]);
         assert_output(r#"print(string.format("%p", none), string.format("%p", 5))"#, &["(null)\t(null)"]);
@@ -4739,7 +4761,7 @@ print(tt.wday, tt.yday, tt.isdst, tt.hour)"#,
         );
         assert_output(
             r#"print(tonumber("0x10"), tonumber("1e2"), tonumber(" 12 "), tonumber("12a"), tonumber("z", 36))"#,
-            &["16\t100.0\t12\tnil\t35"],
+            &["16\t100.0\t12\tnone\t35"],
         );
         assert_output(
             r#"print(tonumber("0x1.8p1"), tonumber("  0x10  "), tonumber("-0x10"), tonumber("10", 2), tonumber("-z", 36))"#,
@@ -4748,10 +4770,10 @@ print(tt.wday, tt.yday, tt.isdst, tt.hour)"#,
         assert_output(r#"print(tonumber("0x10000000000000000"), tonumber("0xFFFFFFFFFFFFFFFFF"))"#,
             &["0\t-1"]);
         assert_output(r#"print(tonumber("1e999"), tonumber("nan"), tonumber("inf"), tonumber("0x"), tonumber("."))"#,
-            &["inf\tnil\tnil\tnil\tnil"]);
+            &["inf\tnone\tnone\tnone\tnone"]);
         assert_output(r#"print(tonumber("1."), tonumber(".5"), tonumber("1e"), tonumber(""))"#,
-            &["1.0\t0.5\tnil\tnil"]);
-        assert_output(r#"print(tonumber(42), tonumber(4.5), tonumber(none))"#, &["42\t4.5\tnil"]);
+            &["1.0\t0.5\tnone\tnone"]);
+        assert_output(r#"print(tonumber(42), tonumber(4.5), tonumber(none))"#, &["42\t4.5\tnone"]);
         assert_output(r#"print(math.type(tonumber("0x10")), math.type(tonumber("1e2")), math.type(tonumber("10.0")))"#,
             &["integer\tfloat\tfloat"]);
         assert!(run("tonumber()").is_err());
@@ -4811,10 +4833,10 @@ print(table.concat(t, ","))"#,
         assert_output(r#"print(table.concat(table.move({1,2,3,4,5}, 2, 4, 1), ","))"#, &["2,3,4,4,5"]);
         assert_output(r#"print(table.concat(table.move({1,2,3,4,5}, 1, 3, 3), ","))"#, &["1,2,1,2,3"]);
         assert_output(r#"print(table.concat(table.move({1,2,3}, 1, 3, 2, {9,9,9,9,9}), ","))"#, &["9,1,2,3,9"]);
-        assert_output(r#"print(table.unpack({1,2,3}, 0, 2))"#, &["nil\t1\t2"]);
+        assert_output(r#"print(table.unpack({1,2,3}, 0, 2))"#, &["none\t1\t2"]);
         assert_output(r##"print(select("#", table.unpack({1,2,3}, 4, 5)))"##, &["2"]);
         assert_output(r#"let pk = table.pack(1, none, 3)
-print(pk.n, pk[1], pk[2], pk[3])"#, &["3\t1\tnil\t3"]);
+print(pk.n, pk[1], pk[2], pk[3])"#, &["3\t1\tnone\t3"]);
         assert_output(r#"print(table.pack().n)"#, &["0"]);
         assert!(run(r#"table.unpack({1,2,3}, 1, 1e18)"#).is_err());
         assert!(run(r#"table.move({1,2,3}, 1, 2, math.maxinteger)"#).is_err());
@@ -4843,7 +4865,7 @@ print(pcall(table.sort, t, fn(a,b) { return true }))"#, &["true"]);
         assert_output(r#"print(math.fmod(5.5, 2), math.fmod(-5.5, 2))"#, &["1.5\t-1.5"]);
         assert!(run("math.fmod(1, 0)").is_err());
         assert_output(r#"print(math.tointeger("8"), math.tointeger("8.0"), math.tointeger("0x10"), math.tointeger(8.5), math.tointeger(2^63))"#,
-            &["8\t8\t16\tnil\tnil"]);
+            &["8\t8\t16\tnone\tnone"]);
         assert_output(r#"print(math.max(1, 2.5), math.type(math.max(1, 2.5)), math.min(1, 2.5), math.type(math.min(1, 2.5)))"#,
             &["2.5\tfloat\t1\tinteger"]);
         assert_output(r#"print(math.max(3, 3.0), math.type(math.max(3, 3.0)), math.min(3, 3.0), math.type(math.min(3, 3.0)))"#,
@@ -4862,14 +4884,14 @@ print(pcall(table.sort, t, fn(a,b) { return true }))"#, &["true"]);
         assert_output(r#"print(math.modf(5), math.type(math.modf(5)))"#, &["5\tinteger"]);
         assert_output(r#"print(math.log(8, 2), math.log(100, 10), math.log(math.exp(1)))"#,
             &["3.0\t2.0\t1.0"]);
-        assert_output(r#"print(math.log(0), math.log(-1))"#, &["-inf\tnil"]);
+        assert_output(r#"print(math.log(0), math.log(-1))"#, &["-inf\tnone"]);
         // Numeric strings coerce like luaL_checknumber/luaL_checkinteger.
         assert_output(r#"print(math.floor("3.5"), math.floor("3"), math.abs("-5"))"#, &["3\t3\t5.0"]);
         assert!(run(r#"math.floor("x")"#).is_err());
         assert!(run(r#"math.abs("x")"#).is_err());
         assert!(run("math.tointeger()").is_err());
         assert_output(r#"print(math.type(1), math.type(1.0), math.type("x"), math.type(none))"#,
-            &["integer\tfloat\tnil\tnil"]);
+            &["integer\tfloat\tnone\tnone"]);
     }
 
     #[test]
@@ -4881,7 +4903,7 @@ print(pcall(table.sort, t, fn(a,b) { return true }))"#, &["true"]);
         assert_output(r#"print(utf8.len("héllo"), utf8.len(""), utf8.len("😀"))"#, &["5\t0\t1"]);
         // j may sit mid-character; i may not.
         assert_output(r#"print(utf8.len("héllo", 1, 2))"#, &["2"]);
-        assert_output(r#"print(utf8.len("héllo", 3))"#, &["nil\t3"]);
+        assert_output(r#"print(utf8.len("héllo", 3))"#, &["none\t3"]);
         assert_output(r#"print(utf8.len("abc", 2, 1), utf8.len("abc", 1, 3), utf8.len("abc", -1), utf8.len("abc", 4))"#,
             &["0\t3\t1\t0"]);
         assert!(run(r#"utf8.len("abc", 0)"#).is_err());
@@ -4892,11 +4914,11 @@ print(pcall(table.sort, t, fn(a,b) { return true }))"#, &["true"]);
             &["6\t5\t1"]);
         assert_output(r#"print(utf8.offset("héllo", 1, 2), utf8.offset("héllo", -1, 4))"#, &["2\t2"]);
         assert_output(r#"print(utf8.offset("abc", 4), utf8.offset("abc", 5), utf8.offset("abc", -4))"#,
-            &["4\tnil\tnil"]);
+            &["4\tnone\tnone"]);
         assert_output(r#"print(utf8.offset("abc", 1, 4), utf8.offset("abc", 2, 4), utf8.offset("abc", 0, 4))"#,
-            &["4\tnil\t4"]);
-        assert_output(r#"print(utf8.offset("abc", -1, 4), utf8.offset("abc", -4, 4))"#, &["3\tnil"]);
-        assert_output(r#"print(utf8.offset("", 1), utf8.offset("", -1), utf8.offset("", 0))"#, &["1\tnil\t1"]);
+            &["4\tnone\t4"]);
+        assert_output(r#"print(utf8.offset("abc", -1, 4), utf8.offset("abc", -4, 4))"#, &["3\tnone"]);
+        assert_output(r#"print(utf8.offset("", 1), utf8.offset("", -1), utf8.offset("", 0))"#, &["1\tnone\t1"]);
         assert_output(r#"print(utf8.offset("héllo", 2, -1), utf8.offset("héllo", -1, -1))"#, &["7\t5"]);
         assert_output(r#"print(utf8.offset("héllo", 1, 2), utf8.offset("héllo", 0, 2), utf8.offset("héllo", 0, 3), utf8.offset("héllo", 0, 4))"#,
             &["2\t2\t2\t4"]);
@@ -4928,5 +4950,1694 @@ table.sort(t)
 table.sort(t, fn(a, b) { return a < b })
 print(t[1], t[10000])"#).unwrap();
         assert!(start.elapsed().as_secs() < 10);
+    }
+}
+
+// Rust embedding API (embed.rs): natives with VM access, host context,
+// rooted refs, host-driven calls, module loading.
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod embed_tests {
+    use super::*;
+    use crate::embed::{Ctx, Module};
+    use crate::value::Value;
+    use crate::vm::{Vm, VmError};
+
+    // Compiles and runs `src`, panicking with the script error on failure.
+    fn exec(cx: &mut Ctx<'_>, src: &str) -> Vec<Value> {
+        let f = cx.load_chunk(src, "test.umbra").unwrap_or_else(|e| panic!("{e}"));
+        cx.call(f, &[]).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn native_builds_and_returns_a_table_and_a_string() {
+        let mut vm = Vm::new();
+        vm.set_global_cfn("make_point", |cx, args| {
+            let x = args.first().copied().unwrap_or(Value::nil());
+            let t = cx.new_table();
+            cx.set_field(t, "x", x)?;
+            let label = cx.new_string("point");
+            cx.set_field(t, "label", label)?;
+            let desc = cx.new_string(&format!("point at {x}"));
+            Ok(vec![t, desc])
+        });
+        // A threshold of 1 keeps the collector cycling through the churn
+        // below, so a result that wasn't handed back rooted would be swept.
+        vm.gc.threshold = 1;
+        run_with_vm(r#"let p, d = make_point(3)
+let junk = {}
+for i = 1, 2000 { junk[i % 10] = { i } }
+assert(p.x == 3 and p.label == "point")
+assert(d == "point at 3")"#, &mut vm).unwrap();
+    }
+
+    #[test]
+    fn native_calls_back_into_script() {
+        let mut vm = Vm::new();
+        vm.set_global_cfn("map_twice", |cx, args| {
+            let f = args[0];
+            // Held only by this local (and the Ctx's roots) while the
+            // callbacks churn the heap.
+            let out = cx.new_table();
+            for i in 1..=2 {
+                let r = cx.call(f, &[Value::int(i)])?;
+                cx.raw_set(out, Value::int(i), r[0])?;
+            }
+            Ok(vec![out])
+        });
+        vm.gc.threshold = 1;
+        run_with_vm(r#"let t = map_twice(fn(x) {
+    var junk = {}
+    for i = 1, 500 { junk = { i, tostring(i) } }
+    return "v" .. x
+})
+assert(t[1] == "v1" and t[2] == "v2")
+let ok, err = pcall(map_twice, fn(x) { error("boom") })
+assert(not ok)
+assert(err == "[string \"...\"]:7: boom", err)"#, &mut vm).unwrap();
+    }
+
+    struct Score { points: i64 }
+    struct Other;
+
+    #[test]
+    fn natives_reach_the_host_only_inside_with_host() {
+        let mut vm = Vm::new();
+        vm.set_global_cfn("add_points", |cx, args| {
+            let n = args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            match cx.host::<Score>() {
+                Some(score) => {
+                    score.points += n;
+                    Ok(vec![Value::int(score.points)])
+                }
+                None => Err(VmError::RuntimeError("no score host".into())),
+            }
+        });
+        let mut score = Score { points: 0 };
+        let mut cx = vm.ctx();
+        let f = cx.load_chunk("return add_points(5) + add_points(2)", "host.umbra").unwrap();
+        let r = cx.with_host(&mut score, |cx| {
+            // A loan of another type doesn't hide Score.
+            cx.with_host(&mut Other, |cx| cx.call(f, &[]))
+        }).unwrap();
+        assert_eq!(r[0].as_int(), Some(12));
+
+        // The loan ended with with_host: the same native finds nothing.
+        let err = cx.call(f, &[]).unwrap_err();
+        assert_eq!(err.message, "host.umbra:1: no score host");
+        assert!(cx.host::<Score>().is_none());
+
+        // A panic out of the closure ends the loan too.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cx.with_host(&mut score, |_cx| panic!("host code failed"));
+        }));
+        assert!(unwound.is_err());
+        assert!(cx.host::<Score>().is_none());
+        drop(cx);
+        assert_eq!(score.points, 7);
+    }
+
+    #[test]
+    fn values_a_ctx_returns_survive_collections_until_it_drops() {
+        let mut vm = Vm::new();
+        vm.gc.threshold = 1;
+        let mut cx = vm.ctx();
+        let t = cx.new_table();
+        let s = cx.new_string("kept");
+        cx.raw_set(t, Value::int(1), s).unwrap();
+        let churn = cx.load_chunk("for i = 1, 5000 { let x = { tostring(i) } }", "churn.umbra").unwrap();
+        cx.call(churn, &[]).unwrap();
+        cx.call(churn, &[]).unwrap();
+        let v = cx.raw_get(t, Value::int(1)).unwrap();
+        assert_eq!(cx.to_str(v), Some("kept"));
+    }
+
+    #[test]
+    fn ref_keeps_a_table_alive_until_released() {
+        let mut vm = Vm::new();
+        run_with_vm("collected = false", &mut vm).unwrap();
+        let r = {
+            let mut cx = vm.ctx();
+            let t = exec(&mut cx, "return setmetatable({ hp = 42 }, { __gc = fn(self) { collected = true } })")[0];
+            cx.make_ref(t)
+        };
+        // Only the Ref reaches the table now; collect and churn so a missed
+        // root would be swept and its memory reused.
+        for _ in 0..3 {
+            vm.gc_collect();
+            run_with_vm("for i = 1, 5000 { let t = { hp = i } }", &mut vm).unwrap();
+        }
+        {
+            let mut cx = vm.ctx();
+            let t = cx.get_ref(&r);
+            assert_eq!(cx.get_field(t, "hp").unwrap().as_int(), Some(42));
+            assert_eq!(cx.get_global("collected").as_bool(), Some(false));
+            cx.release_ref(r);
+        }
+        vm.gc_collect();
+        assert_eq!(vm.ctx().get_global("collected").as_bool(), Some(true));
+    }
+
+    #[test]
+    fn ref_from_another_vm_is_refused_and_one_outliving_its_vm_is_inert() {
+        let mut a = Vm::new();
+        let mut b = Vm::new();
+        let r = {
+            let mut cx = a.ctx();
+            let t = cx.new_table();
+            cx.make_ref(t)
+        };
+        let wrong_vm = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            b.ctx().get_ref(&r);
+        }));
+        assert!(wrong_vm.is_err());
+        drop(a);
+        // r outlives `a` here and goes out of scope after it. It holds an
+        // index and a VM id, no pointer, so there is nothing to dangle.
+        assert!(format!("{r:?}").contains("slot"));
+    }
+
+    #[test]
+    fn host_drives_metatable_class_objects() {
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let class = exec(&mut cx, r#"let Spinner = {}
+Spinner.__index = Spinner
+fn Spinner.new(speed) { return setmetatable({ angle = 0, speed = speed }, Spinner) }
+fn Spinner:update(dt) { self.angle = self.angle + self.speed * dt
+    return self.angle }
+fn Spinner:fail() { error("spinner jammed") }
+return Spinner"#)[0];
+
+        // One instance built by script...
+        let new = cx.get_field(class, "new").unwrap();
+        let a = cx.call(new, &[Value::float(2.0)]).unwrap()[0];
+        // ...and one built by the host, the way setmetatable would.
+        let b = cx.new_table();
+        cx.set_field(b, "angle", Value::float(10.0)).unwrap();
+        cx.set_field(b, "speed", Value::float(-1.0)).unwrap();
+        cx.set_metatable(b, Some(class)).unwrap();
+        assert_eq!(cx.metatable(b).map(|m| m.raw_bits()), Some(class.raw_bits()));
+
+        for _ in 0..3 {
+            cx.call_method(a, "update", &[Value::float(0.5)]).unwrap();
+            cx.call_method(b, "update", &[Value::float(0.5)]).unwrap();
+        }
+        assert_eq!(cx.get_field(a, "angle").unwrap().as_float(), Some(3.0));
+        assert_eq!(cx.get_field(b, "angle").unwrap().as_float(), Some(8.5));
+        // Script treats the host-built object as an ordinary instance.
+        cx.set_global("b", b);
+        exec(&mut cx, "assert(b:update(1) == 7.5)");
+
+        let err = cx.call_method(a, "explode", &[]).unwrap_err();
+        assert_eq!(err.message, "attempt to call a none value (method 'explode')");
+        let err = cx.call_method(a, "fail", &[]).unwrap_err();
+        assert_eq!(err.message, "test.umbra:6: spinner jammed");
+        assert!(err.traceback.contains("test.umbra:6: in method 'fail'"), "{}", err.traceback);
+        assert!(err.to_string().contains("\nstack traceback:\n"));
+
+        // Strings resolve methods through the string library.
+        let s = cx.new_string("spin");
+        let up = cx.call_method(s, "upper", &[]).unwrap()[0];
+        assert_eq!(cx.to_str(up), Some("SPIN"));
+    }
+
+    #[test]
+    fn host_iterates_tables_and_bypasses_metamethods_with_raw_access() {
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let t = exec(&mut cx, r#"return setmetatable({ 10, 20, 30, name = "x" }, {
+    __index = fn(t, k) { return "default" },
+    __newindex = fn(t, k, v) { rawset(t, k, v * 2) } })"#)[0];
+        assert_eq!(cx.raw_len(t).unwrap(), 3);
+
+        let mut sum = 0;
+        let mut names = Vec::new();
+        let mut k = Value::nil();
+        while let Some((nk, v)) = cx.next(t, k).unwrap() {
+            match nk.as_int() {
+                Some(_) => sum += v.as_int().unwrap(),
+                None => names.push(cx.to_str(nk).unwrap().to_owned()),
+            }
+            k = nk;
+        }
+        assert_eq!((sum, names), (60, vec!["name".to_owned()]));
+        // Same walk from script: a hash key used to restart the array part,
+        // so pairs over a mixed table never ended.
+        exec(&mut cx, r#"var n = 0
+for k, v in pairs({ 10, 20, name = "x", [100] = 1 }) { n = n + 1
+    assert(n <= 4, "pairs revisited a key") }
+assert(n == 4)"#);
+
+        let missing = cx.get_field(t, "missing").unwrap();
+        assert_eq!(cx.to_str(missing), Some("default"));
+        let key = cx.new_string("missing");
+        assert!(cx.raw_get(t, key).unwrap().is_nil());
+
+        cx.set_field(t, "a", Value::int(5)).unwrap();
+        let a = cx.new_string("a");
+        assert_eq!(cx.raw_get(t, a).unwrap().as_int(), Some(10));
+        cx.raw_set(t, a, Value::int(5)).unwrap();
+        assert_eq!(cx.get(t, a).unwrap().as_int(), Some(5));
+
+        cx.set_metatable(t, None).unwrap();
+        assert!(cx.metatable(t).is_none());
+        assert!(cx.get_field(t, "missing").unwrap().is_nil());
+
+        // Wrong types are errors, not panics.
+        assert!(cx.raw_get(Value::int(1), a).is_err());
+        assert!(cx.next(Value::nil(), Value::nil()).is_err());
+        assert!(cx.set_metatable(t, Some(Value::int(1))).is_err());
+        assert!(cx.get(Value::bool(true), a).is_err());
+    }
+
+    struct Assets(std::collections::HashMap<String, String>);
+
+    #[test]
+    fn require_goes_through_the_host_loader_and_errors_name_the_asset() {
+        let mut vm = Vm::new();
+        vm.set_module_loader(|cx, name| {
+            let path = format!("scripts/{}.umbra", name.replace('.', "/"));
+            let assets = cx.host::<Assets>().ok_or("no asset store")?;
+            match assets.0.get(&path) {
+                Some(src) => Ok(Module { source: src.clone(), chunk_name: path }),
+                None => Err(format!("module '{name}' not found in assets")),
+            }
+        });
+        let mut assets = Assets([
+            ("scripts/util/math.umbra", "return { double = fn(x) { return x * 2 } }"),
+            ("scripts/broken.umbra", "let x = 1\nlet y = none\nreturn y.z"),
+            ("scripts/bad_syntax.umbra", "let = 1"),
+        ].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect());
+
+        let mut cx = vm.ctx();
+        cx.with_host(&mut assets, |cx| {
+            let r = exec(cx, "let m = require(\"util.math\")\nassert(require(\"util.math\") == m)\nreturn m.double(21)");
+            assert_eq!(r[0].as_int(), Some(42));
+
+            let main = cx.load_chunk("return require(\"broken\")", "main.umbra").unwrap();
+            let err = cx.call(main, &[]).unwrap_err();
+            assert_eq!(err.message, "scripts/broken.umbra:3: attempt to index a none value (local 'y')");
+
+            let main = cx.load_chunk("require(\"bad_syntax\")", "main.umbra").unwrap();
+            let err = cx.call(main, &[]).unwrap_err();
+            assert!(err.message.starts_with("main.umbra:1: require: scripts/bad_syntax.umbra: line 1:"), "{}", err.message);
+
+            let main = cx.load_chunk("require(\"nope\")", "main.umbra").unwrap();
+            let err = cx.call(main, &[]).unwrap_err();
+            assert_eq!(err.message, "main.umbra:1: require: module 'nope' not found in assets");
+        });
+        // Without the asset store lent, the loader has nothing to read from.
+        let main = cx.load_chunk("require(\"other\")", "main.umbra").unwrap();
+        let err = cx.call(main, &[]).unwrap_err();
+        assert_eq!(err.message, "main.umbra:1: require: no asset store");
+    }
+
+    #[test]
+    fn load_chunk_errors_name_the_chunk() {
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let src = format!("{}fn spin(t) {{ error(\"spin failed\") }}\nspin(1)", "\n".repeat(11));
+        let f = cx.load_chunk(&src, "scripts/spin.umbra").unwrap();
+        let err = cx.call(f, &[]).unwrap_err();
+        assert_eq!(err.message, "scripts/spin.umbra:12: spin failed");
+        assert!(err.traceback.contains("scripts/spin.umbra:12: in function 'spin'"), "{}", err.traceback);
+        assert!(err.traceback.contains("scripts/spin.umbra:13: in main chunk"), "{}", err.traceback);
+
+        let err = cx.load_chunk("let = 1", "scripts/spin.umbra").unwrap_err();
+        assert!(err.message.starts_with("scripts/spin.umbra: line 1:"), "{}", err.message);
+    }
+
+    #[test]
+    fn host_calls_keep_the_step_limit_object_cap_and_panic_containment() {
+        let mut vm = Vm::new();
+        vm.set_step_limit(10_000);
+        {
+            let mut cx = vm.ctx();
+            let f = cx.load_chunk("while true { }", "spin.umbra").unwrap();
+            let err = cx.call(f, &[]).unwrap_err();
+            assert!(err.message.ends_with("instruction budget exceeded"), "{err}");
+        }
+        vm.set_step_limit(0);
+        vm.set_max_objects(vm.gc.live_count() + 50);
+        {
+            let mut cx = vm.ctx();
+            let f = cx.load_chunk("let t = {}\nfor i = 1, 1000 { t[i] = {} }", "hog.umbra").unwrap();
+            let err = cx.call(f, &[]).unwrap_err();
+            assert!(err.message.ends_with("memory limit exceeded"), "{err}");
+        }
+        vm.set_max_objects(0);
+
+        // A panicking native is contained, then the VM refuses further work.
+        vm.set_global_cfn("boom", |_cx, _args| panic!("native bug"));
+        let mut cx = vm.ctx();
+        let boom = cx.get_global("boom");
+        let err = cx.call(boom, &[]).unwrap_err();
+        assert_eq!(err.message, "internal error (panic): native bug");
+        let err = cx.call(boom, &[]).unwrap_err();
+        assert!(err.message.contains("poisoned"), "{err}");
+    }
+
+    // umbra_register used to capture the state pointer at registration and
+    // hand that to the C function while the interpreter was still holding
+    // &mut Vm, so every umbra_* call inside the callback aliased a live
+    // mutable borrow. The pointer is now made from the &mut Vm the
+    // interpreter lends the native: the callback's accesses are reborrows
+    // nested inside it, finished before the interpreter touches the VM
+    // again. This drives the heaviest state use from inside a callback:
+    // allocation, a nested pcall into script, and a full collection.
+    #[test]
+    fn api_callback_state_is_derived_from_the_natives_borrow() {
+        use std::ffi::{CStr, CString};
+        use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+        static STATE: AtomicPtr<api::UmbraState> = AtomicPtr::new(std::ptr::null_mut());
+        static SAME_STATE: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn churn(U: *mut api::UmbraState) -> std::ffi::c_int {
+            // Same address the host created, so C hosts that key data by
+            // state pointer keep working.
+            SAME_STATE.store(U == STATE.load(Ordering::Relaxed), Ordering::Relaxed);
+            let x = unsafe { api::umbra_tointeger(U, 1) };
+            let helper = CString::new("helper").unwrap();
+            unsafe { api::umbra_getglobal(U, helper.as_ptr()) };
+            unsafe { api::umbra_pushinteger(U, x) };
+            if unsafe { api::umbra_pcall(U, 1, 1) } != 0 { return -1; }
+            unsafe { api::umbra_gc_collect(U) };
+            let done = CString::new("done").unwrap();
+            unsafe { api::umbra_pushstring(U, done.as_ptr()) };
+            2
+        }
+
+        let U = api::umbra_newstate();
+        STATE.store(U, Ordering::Relaxed);
+        let name = CString::new("churn").unwrap();
+        unsafe { api::umbra_register(U, name.as_ptr(), Some(churn)) };
+        let src = CString::new(r#"fn helper(n) {
+    let t = {}
+    for i = 1, 100 { t[i] = tostring(i) }
+    return #t + n
+}
+let a, b = churn(5)
+result = tostring(a) .. " " .. b"#).unwrap();
+        assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
+        assert!(SAME_STATE.load(Ordering::Relaxed));
+        let g = CString::new("result").unwrap();
+        unsafe { api::umbra_getglobal(U, g.as_ptr()) };
+        let s = unsafe { CStr::from_ptr(api::umbra_tostring(U, -1)) };
+        assert_eq!(s.to_str().unwrap(), "105 done");
+        unsafe { api::umbra_close(U) };
+    }
+}
+
+// Natives as collected objects, and values that must stay reachable across
+// a collection. Small enough to run under Miri, which is what catches a
+// use-after-free here; a native run may read freed memory that still holds
+// the old bytes.
+#[cfg(test)]
+mod heap_safety_tests {
+    use super::*;
+    use crate::value::Value;
+    use crate::vm::Vm;
+
+    #[test]
+    fn per_call_natives_are_collected() {
+        let mut vm = Vm::new();
+        run_with_vm("x = 1", &mut vm).unwrap();
+        vm.gc_collect();
+        let baseline = vm.gc.live_count();
+        run_with_vm(r#"keep = {}
+for i = 1, 200 { keep[i] = string.gmatch("a b", "%a") }"#, &mut vm).unwrap();
+        vm.gc_collect();
+        let held = vm.gc.live_count();
+        assert!(held >= baseline + 200, "iterators aren't heap objects: baseline {baseline} held {held}");
+        run_with_vm("keep = none", &mut vm).unwrap();
+        vm.gc_collect();
+        vm.gc_collect();
+        let after = vm.gc.live_count();
+        assert!(after <= baseline + 4, "iterators leaked: baseline {baseline} after {after}");
+    }
+
+    #[test]
+    fn native_upvalues_keep_their_values_alive() {
+        let mut vm = Vm::new();
+        let t = {
+            let mut cx = vm.ctx();
+            let t = cx.new_table();
+            cx.set_field(t, "x", Value::int(7)).unwrap();
+            t
+        };
+        // Past this point only the native's upvalue reaches the table.
+        let f = vm.make_cfn_closure(&[t], |cx, _args, up| Ok(vec![cx.get_field(up[0], "x")?]));
+        vm.set_global("get_x", f);
+        vm.gc_collect();
+        vm.gc_collect();
+        run_with_vm("for i = 1, 100 { let junk = { i } }\nassert(get_x() == 7)", &mut vm).unwrap();
+    }
+
+    #[test]
+    fn file_write_returns_its_handle_after_the_handle_is_dropped() {
+        // Relative to the crate root (the test's working directory), so the
+        // test also runs under Miri on an emulated target.
+        let path = std::path::PathBuf::from(format!("target/umbra-write-{}.txt", std::process::id()));
+        let mut vm = Vm::new();
+        let src = format!("w = io.open({:?}, \"w\").write", path.to_str().unwrap());
+        run_with_vm(&src, &mut vm).unwrap();
+        vm.gc_collect();
+        vm.gc_collect();
+        run_with_vm(r#"for i = 1, 100 { let junk = { i } }
+let h = w(none, "abc")
+assert(type(h) == "table" and h.write == w)
+h:close()"#, &mut vm).unwrap();
+        drop(vm);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "abc");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pairs_and_ipairs_keep_their_iterators() {
+        let mut vm = Vm::new();
+        run_with_vm("next = none", &mut vm).unwrap();
+        vm.gc_collect();
+        vm.gc_collect();
+        run_with_vm(r#"for i = 1, 100 { let junk = { i } }
+var n = 0
+for k, v in pairs({1, 2, x = 3}) { n = n + v }
+for i, v in ipairs({4, 5}) { n = n + v }
+assert(n == 15)"#, &mut vm).unwrap();
+    }
+
+    // A VM where a collector step is due right after any of its natives
+    // return: each allocates 256KB, past the 4KB byte trigger set here and
+    // past the step granule, whatever phase the collector is in. `fresh`
+    // returns a new table {n = 2}, `fresh_fn` a new native returning 2,
+    // `fresh_str` the string "fresh", `yes` true, and `collect` runs a full
+    // collection.
+    fn vm_with_due_steps() -> Vm {
+        fn pad(cx: &mut crate::embed::Ctx<'_>) {
+            cx.vm.alloc_str(&"x".repeat(256 * 1024));
+        }
+        let mut vm = Vm::new();
+        vm.gc.byte_threshold = 4096;
+        vm.set_global_cfn("fresh", |cx, _args| {
+            pad(cx);
+            let t = cx.new_table();
+            cx.set_field(t, "n", Value::int(2))?;
+            Ok(vec![t])
+        });
+        vm.set_global_cfn("fresh_fn", |cx, _args| {
+            pad(cx);
+            Ok(vec![cx.vm.make_cfn_val(|_cx, _args| Ok(vec![Value::int(2)]))])
+        });
+        vm.set_global_cfn("fresh_str", |cx, _args| {
+            pad(cx);
+            Ok(vec![cx.vm.alloc_str("fresh")])
+        });
+        vm.set_global_cfn("yes", |cx, _args| {
+            pad(cx);
+            Ok(vec![Value::bool(true)])
+        });
+        vm.set_global_cfn("collect", |cx, _args| {
+            cx.vm.gc_collect();
+            Ok(vec![])
+        });
+        vm
+    }
+
+    // Stress-test finding 27: GetField's __index result was dropped when a
+    // step was due on return, leaving the register's old value in place.
+    #[test]
+    fn index_function_result_survives_a_due_step() {
+        let mut vm = vm_with_due_steps();
+        run_with_vm(r#"let mt = {__index = fresh}
+for i = 1, 3 {
+    let p = setmetatable({}, mt).transform
+    assert(rawget(p, "n") == 2, "iteration ${tostring(i)}: p is not the __index result")
+    let q = setmetatable({}, {__index = fresh_fn})
+    assert(q:method() == 2)
+    let r = setmetatable({}, mt)["k"]
+    assert(rawget(r, "n") == 2)
+}"#, &mut vm).unwrap();
+    }
+
+    // The same pattern in the compares: a checkpoint before the fused Jmp
+    // was consumed ran that Jmp unconditionally.
+    #[test]
+    fn compare_metamethod_results_survive_a_due_step() {
+        let mut vm = vm_with_due_steps();
+        run_with_vm(r#"let mt = {__lt = yes, __le = yes, __eq = yes}
+let a = setmetatable({}, mt)
+let b = setmetatable({}, mt)
+var hits = 0
+for i = 1, 3 {
+    if a < b { hits = hits + 1 }
+    if a <= b { hits = hits + 1 }
+    if a == b { hits = hits + 1 }
+    if a < 5 { hits = hits + 1 }
+    if a <= 5 { hits = hits + 1 }
+    if a > 5 { hits = hits + 1 }
+    if a >= 5 { hits = hits + 1 }
+}
+assert(hits == 21, "hits ${tostring(hits)}")"#, &mut vm).unwrap();
+    }
+
+    #[test]
+    fn other_metamethod_results_survive_a_due_step() {
+        let mut vm = vm_with_due_steps();
+        run_with_vm(r#"let mt = {__len = fresh, __concat = fresh, __unm = fresh, __add = fresh,
+    __div = fresh, __call = fresh, __tostring = fresh_str}
+let o = setmetatable({}, mt)
+for i = 1, 3 {
+    assert(rawget(#o, "n") == 2)
+    assert(rawget(o .. "x", "n") == 2)
+    assert(rawget("x" .. o, "n") == 2)
+    assert(rawget(-o, "n") == 2)
+    assert(rawget(o + 1, "n") == 2)
+    assert(rawget(o / 2, "n") == 2)
+    assert(rawget(o(), "n") == 2)
+    assert(tostring(o) == "fresh")
+}"#, &mut vm).unwrap();
+    }
+
+    // A __call handler that drops its own metatable was reachable from
+    // nothing while it ran: the isolated-call path recursed without
+    // rooting it, and its frame reads upvalues out of the closure.
+    #[test]
+    fn call_handler_stays_alive_after_dropping_its_metatable() {
+        let mut vm = vm_with_due_steps();
+        run_with_vm(r#"let t = {}
+setmetatable(t, {__call = (fn() {
+    let tag = { "up" }
+    return fn(self) {
+        setmetatable(self, none)
+        collect()
+        for i = 1, 50 { let junk = { i } }
+        return tag[1]
+    }
+})()})
+let ok, v = pcall(t)
+assert(ok and v == "up", tostring(v))"#, &mut vm).unwrap();
+    }
+
+    // Stress-test finding 18: table.sort's working copy was unrooted while
+    // the comparator ran script.
+    #[test]
+    fn sort_keeps_elements_the_comparator_removed() {
+        let mut vm = vm_with_due_steps();
+        run_with_vm(r#"let t = { {v = 3}, {v = 1}, {v = 2} }
+var emptied = false
+table.sort(t, fn(a, b) {
+    if not emptied {
+        emptied = true
+        t[1] = none  t[2] = none  t[3] = none
+        collect()
+        for i = 1, 50 { let junk = { i } }
+    }
+    return a.v < b.v
+})
+assert(t[1].v == 1 and t[2].v == 2 and t[3].v == 3)"#, &mut vm).unwrap();
+    }
+}
+
+// Stress-test finding 10: recursion through isolated calls (pcall,
+// metamethods, natives, require, resume) overflowed the Rust stack and
+// aborted the process. The nesting limit turns it into a script error.
+#[cfg(test)]
+mod nesting_tests {
+    use super::*;
+    use crate::embed::Module;
+    use crate::value::Value;
+    use crate::vm::{MAX_NESTING, Vm};
+
+    // A debug build spends about 88 KB of Rust stack per nesting level
+    // (vm.rs, MAX_NESTING), past the 2 MB a test thread gets.
+    fn on_big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(f).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn pcall_recursion_stops_at_the_limit() {
+        on_big_stack(|| {
+            let mut vm = Vm::new();
+            for _ in 0..2 {
+                run_with_vm(r#"fn f(n) { return pcall(f, n + 1) }
+let r = table.pack(f(0))
+assert(r[r.n] == "stack overflow" and r[r.n - 1] == false, tostring(r[r.n]))
+depth = r.n - 2"#, &mut vm).unwrap();
+                assert_eq!(vm.nesting, 0);
+                // The chunk runs one level deep and each pcall that got in
+                // added one. The same depth both times: the count came
+                // back down after the caught error.
+                let depth = vm.ctx().get_global("depth").as_int();
+                assert_eq!(depth, Some(MAX_NESTING as i64 - 1));
+            }
+        });
+    }
+
+    #[test]
+    fn index_metamethod_recursion_is_an_error() {
+        on_big_stack(|| {
+            let mut vm = Vm::new();
+            let err = run_with_vm("let t = setmetatable({}, {__index = fn(t, k) { return t[k] }})\nprint(t.x)", &mut vm)
+                .unwrap_err();
+            assert_eq!(err, "[string \"...\"]:1: stack overflow");
+            assert_eq!(vm.nesting, 0);
+            run_with_vm("let ok, e = pcall(fn() { return setmetatable({}, {__index = fn(t, k) { return t[k] }}).x })\nassert(not ok and e == \"[string \\\"...\\\"]:1: stack overflow\", e)", &mut vm).unwrap();
+            assert_eq!(vm.nesting, 0);
+        });
+    }
+
+    #[test]
+    fn circular_require_is_an_error() {
+        on_big_stack(|| {
+            let mut vm = Vm::new();
+            vm.set_module_loader(|_cx, name| {
+                let other = if name == "a" { "b" } else { "a" };
+                Ok(Module { source: format!("return require(\"{other}\")"), chunk_name: format!("{name}.umbra") })
+            });
+            let mut cx = vm.ctx();
+            let main = cx.load_chunk("return require(\"a\")", "main.umbra").unwrap();
+            let err = cx.call(main, &[]).unwrap_err();
+            // The loading sentinel (finding 47) stops it before the limit.
+            assert_eq!(err.message, "b.umbra:1: loop or previous error loading module 'a'");
+            drop(cx);
+            assert_eq!(vm.nesting, 0);
+        });
+    }
+
+    #[test]
+    fn host_native_script_recursion_is_an_error() {
+        on_big_stack(|| {
+            let mut vm = Vm::new();
+            vm.set_global_cfn("call", |cx, args| Ok(cx.call(args[0], &args[1..])?));
+            let mut cx = vm.ctx();
+            let f = cx.load_chunk("fn f(n) { return call(f, n + 1) }\nreturn f", "rec.umbra").unwrap();
+            let f = cx.call(f, &[]).unwrap()[0];
+            // The innermost Ctx::call fails before any script runs, so it
+            // takes the position of the script that called the native, and
+            // each native passes the error on as is.
+            let err = cx.call(f, &[Value::int(0)]).unwrap_err();
+            assert_eq!(err.message, "rec.umbra:1: stack overflow");
+            // Unwound and balanced: the host can call again right away.
+            let ok = cx.load_chunk("return 1", "ok.umbra").unwrap();
+            assert_eq!(cx.call(ok, &[]).unwrap()[0].as_int(), Some(1));
+            drop(cx);
+            assert_eq!(vm.nesting, 0);
+        });
+    }
+
+    #[test]
+    fn coroutine_resume_recursion_is_an_error() {
+        on_big_stack(|| {
+            let mut vm = Vm::new();
+            let err = run_with_vm("fn f(n) { return coroutine.wrap(f)(n + 1) }\nf(0)", &mut vm).unwrap_err();
+            assert!(err.ends_with("stack overflow"), "{err}");
+            assert_eq!(vm.nesting, 0);
+            // Sort comparators and __tostring count too.
+            run_with_vm(r#"fn s(n) { table.sort({2, 1}, fn(a, b) { s(n + 1) return a < b }) }
+let ok, e = pcall(s, 0)
+assert(not ok and e:sub(-14) == "stack overflow", e)
+fn ts(n) { return tostring(setmetatable({}, {__tostring = fn() { return ts(n + 1) }})) }
+let ok2, e2 = pcall(ts, 0)
+assert(not ok2 and e2:sub(-14) == "stack overflow", e2)"#, &mut vm).unwrap();
+            assert_eq!(vm.nesting, 0);
+        });
+    }
+
+    // A panic unwinds past the decrements between it and the catch; the
+    // catch puts the count back.
+    #[test]
+    fn caught_panic_restores_the_count() {
+        let mut vm = Vm::new();
+        vm.set_global_cfn("panic_nested", |cx, _args| {
+            cx.vm.nested(|_| -> crate::vm::VmResult<Vec<Value>> { panic!("deep") })
+        });
+        let err = run_with_vm("panic_nested()", &mut vm).unwrap_err();
+        assert!(err.contains("internal error (panic): deep"), "{err}");
+        assert_eq!(vm.nesting, 0);
+        assert!(vm.poisoned);
+    }
+}
+
+// Who owns compiled code, and the caches kept in it.
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::value::Value;
+    use crate::vm::Vm;
+
+    // Stress-test finding 16: Vm::exec(&Proto) left function values
+    // pointing into a Proto the caller could drop. exec now takes the
+    // chunk; its functions outlive the source, the AST and the call.
+    #[test]
+    fn functions_outlive_the_exec_that_defined_them() {
+        let mut vm = Vm::new();
+        let r = {
+            let src = String::from("let k = \"twice\"\nreturn fn(x) { return k .. x * 2 }, fn(x) { return x + 1 }");
+            let (block, errs) = parse(&src);
+            assert!(errs.is_empty());
+            let results = vm.exec(compile(block, None).unwrap()).unwrap();
+            let mut cx = vm.ctx();
+            for &v in &results { cx.root(v); }
+            let t = cx.new_table();
+            cx.raw_set(t, Value::int(1), results[0]).unwrap();
+            cx.raw_set(t, Value::int(2), results[1]).unwrap();
+            cx.make_ref(t)
+        };
+        for _ in 0..3 {
+            vm.gc_collect();
+            run_with_vm("for i = 1, 2000 { let junk = { tostring(i) } }", &mut vm).unwrap();
+        }
+        let mut cx = vm.ctx();
+        let t = cx.get_ref(&r);
+        let f = cx.raw_get(t, Value::int(1)).unwrap();
+        let g = cx.raw_get(t, Value::int(2)).unwrap();
+        let out = cx.call(f, &[Value::int(21)]).unwrap()[0];
+        assert_eq!(cx.to_str(out), Some("twice42"));
+        assert_eq!(cx.call(g, &[Value::int(1)]).unwrap()[0].as_int(), Some(2));
+    }
+
+    // The filled cache entries of function `f`'s proto: (owner, bits) for
+    // each string constant and each GetGlobal site.
+    fn caches(vm: &mut Vm, f: Value) -> Vec<(u64, u64)> {
+        let p = vm.gc.closure_proto(f).unwrap();
+        // SAFETY: the proto of a function value the caller keeps rooted.
+        let p = unsafe { crate::heap::proto(p) };
+        let mut out: Vec<(u64, u64)> = p.consts.iter().filter_map(|c| match c {
+            chunk::Const::Str(sc) => Some(sc.cached()),
+            _ => None,
+        }).collect();
+        out.extend(p.global_cache.iter().map(|c| { let (owner, _, bits) = c.get(); (owner, bits) }));
+        out.retain(|&(_, bits)| bits != 0);
+        out
+    }
+
+    fn call_greet(vm: &mut Vm) -> (String, Vec<(u64, u64)>) {
+        let mut cx = vm.ctx();
+        let f = cx.get_global("greet");
+        let r = cx.call(f, &[]).unwrap()[0];
+        let s = cx.to_str(r).unwrap().to_owned();
+        drop(cx);
+        let f = vm.get_global("greet");
+        (s, caches(vm, f))
+    }
+
+    // Stress-test finding 32: the caches were keyed on the Vm's address,
+    // so a Vm that moved refilled them all.
+    #[test]
+    fn a_moved_vm_keeps_its_caches() {
+        let mut vm = Vm::new();
+        run_with_vm("who = \"world\"\nfn greet() { return \"hello \" .. who }", &mut vm).unwrap();
+        let (s, before) = call_greet(&mut vm);
+        assert_eq!(s, "hello world");
+        assert!(before.len() >= 2 && before.iter().all(|&(owner, _)| owner == vm.id), "{before:?}");
+        let mut moved = Box::new(vm);
+        let (s, after) = call_greet(&mut moved);
+        assert_eq!(s, "hello world");
+        assert_eq!(before, after);
+    }
+
+    // Stress-test finding 15: a Vm made at a dropped Vm's address passed
+    // the address check on the dropped one's cache entries.
+    #[test]
+    fn a_vm_at_a_dropped_vms_address_has_its_own_caches() {
+        let mut vm = Vm::new();
+        let (addr_a, id_a) = ((&vm as *const Vm).addr(), vm.id);
+        run_with_vm("who = \"a\"\nfn greet() { return \"hello \" .. who }", &mut vm).unwrap();
+        let (s, a) = call_greet(&mut vm);
+        assert_eq!(s, "hello a");
+        assert!(a.iter().all(|&(owner, _)| owner == id_a));
+        // Drops the first VM and builds the second in the same place.
+        vm = Vm::new();
+        assert_eq!((&vm as *const Vm).addr(), addr_a);
+        assert_ne!(vm.id, id_a);
+        run_with_vm("who = \"b\"\nfn greet() { return \"hello \" .. who }", &mut vm).unwrap();
+        let (s, b) = call_greet(&mut vm);
+        assert_eq!(s, "hello b");
+        assert!(b.iter().all(|&(owner, _)| owner == vm.id), "{b:?}");
+    }
+}
+
+// Stress-test finding 13: coroutines lived until the Vm dropped. They are
+// collected objects now. Sized to run under Miri.
+#[cfg(test)]
+mod coroutine_gc_tests {
+    use super::*;
+    use crate::vm::Vm;
+
+    // `collect()` runs a full collection; `live()` is the live object count.
+    fn vm_with_collect() -> Vm {
+        let mut vm = Vm::new();
+        vm.set_global_cfn("collect", |cx, _args| {
+            cx.vm.gc_collect();
+            Ok(vec![])
+        });
+        vm.set_global_cfn("live", |cx, _args| Ok(vec![value::Value::int(cx.vm.gc.live_count() as i64)]));
+        vm
+    }
+
+    #[test]
+    fn short_lived_coroutines_are_collected() {
+        let n: i64 = if cfg!(miri) { 300 } else { 100_000 };
+        let mut vm = vm_with_collect();
+        run_with_vm("x = 1", &mut vm).unwrap();
+        vm.gc_collect();
+        let baseline = vm.gc.live_count();
+        // They are heap objects: held ones count.
+        run_with_vm("keep = {}\nfor i = 1, 100 { keep[i] = coroutine.create(fn() { yield(1) }) }", &mut vm).unwrap();
+        vm.gc_collect();
+        assert!(vm.gc.live_count() >= baseline + 100);
+        run_with_vm("keep = none", &mut vm).unwrap();
+        // Suspended, finished and wrapped ones, all dropped at once.
+        let src = format!(r#"var peak = 0
+for i = 1, {n} {{
+    let co = coroutine.create(fn(a) {{ let t = {{ a }} yield(t) return a }})
+    coroutine.resume(co, i)
+    if i % 2 == 0 {{ coroutine.resume(co) }}
+    let w = coroutine.wrap(fn() {{ yield(i) }})
+    w()
+    if i % 100 == 0 {{ let l = live() if l > peak {{ peak = l }} }}
+}}
+return peak"#);
+        let mut cx = vm.ctx();
+        let f = cx.load_chunk(&src, "churn.umbra").unwrap();
+        let peak = cx.call(f, &[]).unwrap()[0].as_int().unwrap() as usize;
+        drop(cx);
+        // Before, each iteration left two coroutines that only a Vm drop freed.
+        assert!(peak < baseline + 20_000, "live count grew with the churn: peak {peak}, baseline {baseline}");
+        vm.gc_collect();
+        vm.gc_collect();
+        let after = vm.gc.live_count();
+        assert!(after <= baseline + 8, "coroutines leaked: baseline {baseline} after {after}");
+    }
+
+    #[test]
+    fn suspended_coroutine_held_by_a_table_survives_and_resumes() {
+        let mut vm = vm_with_collect();
+        run_with_vm(r#"holder = { co = coroutine.create(fn(a) {
+    let t = { "x", "y" }
+    let s = "str" .. a
+    let b = yield(1)
+    assert(t[1] == "x" and t[2] == "y" and s == "str5" and b == 7)
+    let c = yield(2)
+    return t[2] .. s .. c
+}) }
+let ok, v = coroutine.resume(holder.co, 5)
+assert(ok and v == 1)"#, &mut vm).unwrap();
+        let churn = "for i = 1, 200 { let junk = { tostring(i) } }";
+        for step in ["let ok, v = coroutine.resume(holder.co, 7)\nassert(ok and v == 2, v)",
+                     "let ok, v = coroutine.resume(holder.co, \"!\")\nassert(ok and v == \"ystr5!\", v)\nassert(coroutine.status(holder.co) == \"dead\")"] {
+            vm.gc_collect();
+            run_with_vm(churn, &mut vm).unwrap();
+            vm.gc_collect();
+            run_with_vm(step, &mut vm).unwrap();
+        }
+        run_with_vm(r#"let ok, e = coroutine.resume(holder.co)
+assert(not ok and e == "cannot resume dead coroutine")
+weak = setmetatable({ holder.co }, { __mode = "v" })
+holder = none"#, &mut vm).unwrap();
+        vm.gc_collect();
+        run_with_vm("assert(weak[1] == none)", &mut vm).unwrap();
+    }
+
+    // While a coroutine runs, its object holds its resumer's stack. A full
+    // collection two coroutines deep must keep all three stacks.
+    #[test]
+    fn the_resume_chain_and_its_parked_stacks_survive_a_collection() {
+        let mut vm = vm_with_collect();
+        run_with_vm(r#"let main_data = { "main" }
+let r = coroutine.wrap(fn() {
+    let outer_data = { "outer" }
+    var inner = none
+    inner = coroutine.create(fn() {
+        let inner_data = { "inner" }
+        collect()
+        for i = 1, 200 { let junk = { i } }
+        collect()
+        assert(coroutine.status(inner) == "running")
+        yield(inner_data[1])
+    })
+    let ok, v = coroutine.resume(inner)
+    collect()
+    assert(coroutine.status(inner) == "suspended")
+    return v .. " " .. outer_data[1]
+})()
+assert(r == "inner outer" and main_data[1] == "main", r)"#, &mut vm).unwrap();
+    }
+
+    // A coroutine scanned early in an incremental cycle runs again before
+    // the cycle ends and stores new objects only in its own registers. Only
+    // the atomic re-scan finds them.
+    #[test]
+    fn incremental_cycles_rescan_coroutine_stacks() {
+        let n: i64 = if cfg!(miri) { 200 } else { 3000 };
+        let mut vm = Vm::new();
+        vm.gc.threshold = 1;
+        vm.gc.byte_threshold = 1024;
+        run_with_vm(&format!(r#"let gen = coroutine.wrap(fn() {{
+    var keep = none
+    for i = 1, {n} {{ keep = {{ i, tostring(i), keep }} yield(i) }}
+    var k = {n}
+    while keep != none {{
+        assert(keep[1] == k and keep[2] == tostring(k), "lost link " .. tostring(k))
+        keep = keep[3]
+        k = k - 1
+    }}
+    return "ok"
+}})
+for i = 1, {n} {{ assert(gen() == i) let junk = {{ {{}}, {{}} }} }}
+assert(gen() == "ok")"#), &mut vm).unwrap();
+    }
+}
+
+// Stress-test finding 14: compiled code was never freed, so every load,
+// require and load_chunk (hot reload) leaked. Protos are collected objects
+// now. Sized to run under Miri.
+#[cfg(test)]
+mod proto_gc_tests {
+    use super::*;
+    use crate::value::Value;
+    use crate::vm::Vm;
+
+    fn vm_with_collect() -> Vm {
+        let mut vm = Vm::new();
+        vm.set_global_cfn("collect", |cx, _args| {
+            cx.vm.gc_collect();
+            Ok(vec![])
+        });
+        vm.set_global_cfn("live", |cx, _args| Ok(vec![Value::int(cx.vm.gc.live_count() as i64)]));
+        vm
+    }
+
+    #[test]
+    fn dropped_chunks_are_collected() {
+        let n: i64 = if cfg!(miri) { 100 } else { 10_000 };
+        let mut vm = vm_with_collect();
+        run_with_vm("x = 1", &mut vm).unwrap();
+        vm.gc_collect();
+        let baseline = vm.gc.live_count();
+        // Each chunk has a nested function, an upvalue-less one and a
+        // string constant of its own, which its proto caches once run.
+        let src = format!(r#"var peak = 0
+for i = 1, {n} {{
+    let f = load("let s = \"s" .. i .. "\"\nreturn fn() {{ return s }}, fn() {{ return " .. i .. " }}")
+    let a, b = f()
+    assert(a() == "s" .. i and b() == i)
+    if i % 100 == 0 {{ let l = live() if l > peak {{ peak = l }} }}
+}}
+return peak"#);
+        let mut cx = vm.ctx();
+        let f = cx.load_chunk(&src, "loads.umbra").unwrap();
+        let peak = cx.call(f, &[]).unwrap()[0].as_int().unwrap() as usize;
+        drop(cx);
+        assert!(peak < baseline + 20_000, "live count grew with the loads: peak {peak}, baseline {baseline}");
+        vm.gc_collect();
+        vm.gc_collect();
+        let after = vm.gc.live_count();
+        assert!(after <= baseline + 8, "chunks leaked: baseline {baseline} after {after}");
+    }
+
+    // Hot reload from the host: a fresh chunk per reload, the old one
+    // dropped with its Ref.
+    #[test]
+    fn reloaded_chunks_are_collected() {
+        let n = if cfg!(miri) { 50 } else { 2000 };
+        let mut vm = Vm::new();
+        vm.gc_collect();
+        let baseline = vm.gc.live_count();
+        let mut current = None;
+        for i in 0..n {
+            let mut cx = vm.ctx();
+            let f = cx.load_chunk(&format!("return {{ update = fn(self, dt) {{ return dt * {i} }}, name = \"v{i}\" }}"), "spin.umbra").unwrap();
+            let module = cx.call(f, &[]).unwrap()[0];
+            let r = cx.call_method(module, "update", &[Value::int(2)]).unwrap()[0];
+            assert_eq!(r.as_int(), Some(2 * i));
+            if let Some(old) = current.replace(cx.make_ref(module)) { cx.release_ref(old); }
+        }
+        vm.gc_collect();
+        vm.gc_collect();
+        let after = vm.gc.live_count();
+        assert!(after <= baseline + 12, "reloads leaked: baseline {baseline} after {after}");
+    }
+
+    // The chunk and its source are gone; the functions it made, and the
+    // functions those make, still run.
+    #[test]
+    fn functions_from_a_dropped_chunk_keep_working() {
+        let n = if cfg!(miri) { 5 } else { 50 };
+        let mut vm = vm_with_collect();
+        run_with_vm(&format!(r#"keep = {{}}
+for i = 1, {n} {{
+    let a, b, c = load("let k = \"c" .. i .. "\"\nreturn fn(x) {{ return k .. x }}, fn() {{ return \"plain" .. i .. "\" }}, fn() {{ return fn() {{ return \"deep" .. i .. "\" }} }}")()
+    keep[i] = {{ a, b, c }}
+}}"#), &mut vm).unwrap();
+        for _ in 0..2 {
+            vm.gc_collect();
+            run_with_vm("for i = 1, 300 { let junk = { tostring(i) } }", &mut vm).unwrap();
+        }
+        run_with_vm(&format!(r#"for i = 1, {n} {{
+    let f = keep[i]
+    assert(f[1]("x") == "c" .. i .. "x")
+    assert(f[2]() == "plain" .. i)
+    let inner = f[3]()
+    collect()
+    assert(inner() == "deep" .. i)
+}}"#), &mut vm).unwrap();
+    }
+
+    #[test]
+    fn required_module_functions_keep_working() {
+        let mut vm = vm_with_collect();
+        vm.set_module_loader(|_cx, name| Ok(crate::embed::Module {
+            source: "let tag = \"mod\"\nreturn { f = fn() { return tag }, g = fn() { return \"g\" } }".into(),
+            chunk_name: format!("{name}.umbra"),
+        }));
+        run_with_vm("m = require(\"m\")", &mut vm).unwrap();
+        vm.gc_collect();
+        run_with_vm("for i = 1, 300 { let junk = { tostring(i) } }\ncollect()\nassert(m.f() == \"mod\" and m.g() == \"g\" and require(\"m\") == m)", &mut vm).unwrap();
+    }
+
+    // A proto scanned early in an incremental cycle caches a string
+    // constant on first use. Only the barrier in intern_const_str keeps the
+    // string from being swept while the cache still points at it.
+    #[test]
+    fn constants_cached_mid_cycle_survive() {
+        let n = if cfg!(miri) { 30 } else { 200 };
+        let mut vm = Vm::new();
+        vm.gc.threshold = 1;
+        vm.gc.byte_threshold = 1024;
+        let body: String = (1..=n).map(|j| format!("if i == {j} {{ return \"const_{j}\" }}\n")).collect();
+        run_with_vm(&format!(r#"let f = load("return fn(i) {{\n{body}}}")()
+for round = 1, 3 {{
+    for i = 1, {n} {{
+        assert(f(i) == "const_" .. i, "round " .. round .. ": constant " .. i)
+        let junk = {{ {{}}, {{}}, tostring(i) }}
+    }}
+}}"#, body = body.replace('"', "\\\"").replace('\n', "\\n")), &mut vm).unwrap();
+    }
+}
+
+// Stress-test finding 31: natives couldn't make natives through a Ctx.
+#[cfg(test)]
+mod ctx_function_tests {
+    use super::*;
+    use crate::value::Value;
+    use crate::vm::Vm;
+
+    #[test]
+    fn a_native_returns_a_bound_method() {
+        let mut vm = Vm::new();
+        vm.gc.threshold = 1;
+        vm.set_global_cfn("bind", |cx, args| {
+            let (obj, name) = (args[0], args[1]);
+            let method = cx.get(obj, name)?;
+            let bound = cx.new_closure(|cx, args, up| {
+                let mut full = vec![up[0]];
+                full.extend_from_slice(args);
+                Ok(cx.call(up[1], &full)?)
+            }, &[obj, method]);
+            Ok(vec![bound])
+        });
+        vm.set_global_cfn("collect", |cx, _args| {
+            cx.vm.gc_collect();
+            Ok(vec![])
+        });
+        // Only the bound closure's upvalues reach the object and its method
+        // once `make` returns.
+        run_with_vm(r#"fn make(n) {
+    let o = { n = n, add = fn(self, x) { return self.n + x } }
+    return bind(o, "add")
+}
+let f = make(5)
+collect()
+for i = 1, 300 { let junk = { tostring(i) } }
+collect()
+assert(f(3) == 8)
+assert(f(10) == 15)"#, &mut vm).unwrap();
+    }
+
+    // A host builds a module table entirely through one Ctx, with the
+    // collector running script in between.
+    #[test]
+    fn host_builds_natives_through_a_ctx() {
+        let mut vm = Vm::new();
+        vm.gc.threshold = 1;
+        let mut cx = vm.ctx();
+        let module = cx.new_table();
+        let answer = cx.new_function(|_cx, _args| Ok(vec![Value::int(42)]));
+        let label = cx.new_string("count");
+        let counter = cx.new_table();
+        cx.set_field(counter, "n", Value::int(0)).unwrap();
+        let next = cx.new_closure(|cx, _args, up| {
+            let n = cx.get_field(up[0], "n")?.as_int().unwrap_or(0) + 1;
+            cx.set_field(up[0], "n", Value::int(n))?;
+            let s = cx.to_str(up[1]).unwrap_or("?").to_owned();
+            Ok(vec![cx.new_string(&format!("{s} {n}"))])
+        }, &[counter, label]);
+        let churn = cx.load_chunk("for i = 1, 500 { let junk = { tostring(i) } }", "churn.umbra").unwrap();
+        cx.call(churn, &[]).unwrap();
+        cx.set_field(module, "answer", answer).unwrap();
+        cx.set_field(module, "next", next).unwrap();
+        cx.set_global("m", module);
+        drop(cx);
+        vm.gc_collect();
+        run_with_vm(r#"for i = 1, 300 { let junk = { tostring(i) } }
+assert(m.answer() == 42)
+assert(m.next() == "count 1")
+assert(m.next() == "count 2")"#, &mut vm).unwrap();
+    }
+}
+
+// Stress-test findings 28 and 29: string interpolation.
+#[cfg(test)]
+mod interp_tests {
+    use super::*;
+    use crate::vm::Vm;
+
+    fn out(src: &str) -> Vec<String> {
+        run_capture(src).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    // Each part is what tostring() makes of it, as in print.
+    #[test]
+    fn parts_use_tostring() {
+        assert_eq!(out(r#"let v = setmetatable({}, {__tostring = fn(v) { return "V" }})
+print("a ${v}")
+print("${v}")
+print("${v}${v} and ${v}!")"#), ["a V", "V", "VV and V!"]);
+        assert_eq!(out(r#"print("${true} ${false} ${none}")"#), ["true false none"]);
+        assert_eq!(out(r#"print("${1} ${2.5} ${3.0} ${-0.0} ${1 // 0.0}")"#), ["1 2.5 3.0 -0.0 inf"]);
+        assert_eq!(out(r#"let t = {}
+print("${t} ${print} ${"s"}" == tostring(t) .. " " .. tostring(print) .. " s")"#), ["true"]);
+        // __tostring may return a number, like tostring() allows.
+        assert_eq!(out(r#"let n = setmetatable({}, {__tostring = fn() { return 7 }})
+print("n=${n}")"#), ["n=7"]);
+        // __concat is not consulted: interpolation isn't `..`.
+        assert_eq!(out(r#"let c = setmetatable({}, {__concat = fn() { return "cat" }, __tostring = fn() { return "str" }})
+print("${c}")"#), ["str"]);
+    }
+
+    #[test]
+    fn a_script_tostring_does_not_change_it() {
+        assert_eq!(out(r#"tostring = fn(x) { return "global" }
+print("${1} ${true}")
+let tostring = fn(x) { return "local" }
+print("${2} ${none}")"#), ["1 true", "2 none"]);
+    }
+
+    #[test]
+    fn tostring_errors_propagate() {
+        let err = run("let t = setmetatable({}, {__tostring = fn() { return {} }})\n\nprint(\"${t}\")").unwrap_err();
+        assert_eq!(err, "[string \"...\"]:3: '__tostring' must return a string");
+        let err = run("let t = setmetatable({}, {__tostring = fn() { error(\"boom\") }})\nprint(\"x ${t}\")").unwrap_err();
+        assert_eq!(err, "[string \"...\"]:1: boom");
+    }
+
+    // The ${...} parser starts at the line the expression is on.
+    #[test]
+    fn syntax_errors_cite_the_line() {
+        let err = run("let x = 1\nlet y = 2\nprint(\"a ${x +}\")").unwrap_err();
+        assert!(err.starts_with("line 3:"), "{err}");
+        // After an escaped newline the expression is a line further down.
+        let err = run("let x = 1\nprint(\"a\\\n${x +}\")").unwrap_err();
+        assert!(err.starts_with("line 3:"), "{err}");
+        let err = run("\n\nprint(\"${a b}\")").unwrap_err();
+        assert!(err.starts_with("line 3:"), "{err}");
+        // A function body records its errors instead of returning them;
+        // they were dropped and the broken function ran anyway.
+        let err = run("\nprint(\"${(fn() { let = 1 return 2 })()}\")").unwrap_err();
+        assert!(err.starts_with("line 2:"), "{err}");
+    }
+
+    #[test]
+    fn runtime_errors_cite_the_line() {
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let f = cx.load_chunk("let t = none\n\n\nprint(\"x ${t.field}\")", "interp.umbra").unwrap();
+        let err = cx.call(f, &[]).unwrap_err();
+        assert_eq!(err.message, "interp.umbra:4: attempt to index a none value (local 't')");
+        let f = cx.load_chunk("fn g() { error(\"in g\") }\nlet s = \"a\\\n${g()}\"", "interp.umbra").unwrap();
+        let err = cx.call(f, &[]).unwrap_err();
+        assert_eq!(err.message, "interp.umbra:1: in g");
+        assert!(err.traceback.contains("interp.umbra:3: in main chunk"), "{}", err.traceback);
+    }
+}
+
+// Stress-test findings 19 and 46: tracebacks run across isolated calls.
+#[cfg(test)]
+mod traceback_tests {
+    use super::*;
+    use crate::embed::{Ctx, Module, ScriptError};
+    use crate::value::Value;
+    use crate::vm::Vm;
+
+    fn fail(cx: &mut Ctx<'_>, src: &str, name: &str) -> ScriptError {
+        let f = cx.load_chunk(src, name).unwrap_or_else(|e| panic!("{e}"));
+        cx.call(f, &[]).unwrap_err()
+    }
+
+    // The module's frames, then the frames of the script that required it.
+    #[test]
+    fn a_required_module_error_shows_the_whole_chain() {
+        let mut vm = Vm::new();
+        vm.set_module_loader(|_cx, name| Ok(Module {
+            source: "fn boom() { error(\"deep\") }\nboom()".to_owned(),
+            chunk_name: format!("{name}.umbra"),
+        }));
+        let mut cx = vm.ctx();
+        let err = fail(&mut cx, "fn get() { let m = require(\"mod\") return m }\nget()", "main.umbra");
+        assert_eq!(err.message, "mod.umbra:1: deep");
+        assert_eq!(err.traceback, "\tmod.umbra:1: in function 'boom'\n\tmod.umbra:2: in main chunk\n\
+            \tmain.umbra:1: in function 'get'\n\tmain.umbra:2: in main chunk");
+    }
+
+    #[test]
+    fn an_index_metamethod_error_shows_the_whole_chain() {
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let err = fail(&mut cx, r#"let t = setmetatable({}, {__index = fn(t, k) { error("no field " .. k) }})
+fn read() { let v = t.missing return v }
+read()"#, "idx.umbra");
+        assert_eq!(err.message, "idx.umbra:1: no field missing");
+        assert_eq!(err.traceback, "\tidx.umbra:1: in function <idx.umbra:1>\n\
+            \tidx.umbra:2: in function 'read'\n\tidx.umbra:3: in main chunk");
+    }
+
+    // A native that passes on a failed Ctx::call: the callback's frames,
+    // then the script that called the native.
+    #[test]
+    fn an_error_through_a_hosts_call_shows_the_whole_chain() {
+        let mut vm = Vm::new();
+        vm.set_global_cfn("call", |cx, args| Ok(cx.call(args[0], &args[1..])?));
+        let mut cx = vm.ctx();
+        let err = fail(&mut cx, "fn inner() { error(\"in callback\") }\nfn outer() { call(inner) }\nouter()", "cb.umbra");
+        assert_eq!(err.message, "cb.umbra:1: in callback");
+        assert_eq!(err.traceback, "\tcb.umbra:1: in function 'inner'\n\
+            \tcb.umbra:2: in function 'outer'\n\tcb.umbra:3: in main chunk");
+    }
+
+    // Finding 46: an error raised before any script ran in a Ctx::call
+    // takes the position of the script that called the native.
+    #[test]
+    fn an_error_before_any_script_ran_keeps_a_position() {
+        let mut vm = Vm::new();
+        vm.set_global_cfn("call", |cx, args| Ok(cx.call(args[0], &args[1..])?));
+        let mut cx = vm.ctx();
+        let err = fail(&mut cx, "let x = 1\ncall(none)", "n.umbra");
+        assert_eq!(err.message, "n.umbra:2: attempt to call a none value");
+        assert_eq!(err.traceback, "\tn.umbra:2: in main chunk");
+        let f = cx.load_chunk("let ok, e = pcall(call, none)\nreturn e", "n.umbra").unwrap();
+        let e = cx.call(f, &[]).unwrap()[0];
+        assert_eq!(cx.to_str(e), Some("n.umbra:1: attempt to call a none value"));
+        // The host itself has no script position to give.
+        let err = cx.call(Value::nil(), &[]).unwrap_err();
+        assert_eq!(err.message, "attempt to call a none value");
+        assert_eq!(err.traceback, "");
+    }
+
+    #[test]
+    fn a_wrapped_coroutine_error_shows_the_resumers_stack_too() {
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let err = fail(&mut cx, "let gen = coroutine.wrap(fn() { error(\"in co\") })\nfn drive() { gen() }\ndrive()", "co.umbra");
+        assert_eq!(err.message, "co.umbra:1: in co");
+        assert_eq!(err.traceback, "\tco.umbra:1: in function <co.umbra:1>\n\
+            \tco.umbra:2: in function 'drive'\n\tco.umbra:3: in main chunk");
+    }
+
+    // An xpcall handler sees its own frames, then the stack the error was
+    // raised on, even after a pcall of its own failed.
+    #[test]
+    fn debug_traceback_in_a_handler_shows_the_error_stack() {
+        let out = run_capture(r#"fn fail() { error("x") }
+fn handler(e) { pcall(fn() { error("inner") }) return debug.traceback(e) }
+fn run() { let ok, tb = xpcall(fail, handler) return tb }
+print(run())"#).unwrap();
+        assert_eq!(out, ["[string \"...\"]:1: x\nstack traceback:\n\
+            \t[string \"...\"]:2: in function 'handler'\n\
+            \t[string \"...\"]:1: in function 'fail'\n\
+            \t[string \"...\"]:3: in function 'run'\n\
+            \t[string \"...\"]:4: in main chunk"]);
+    }
+
+    // Only the first enrichment records: an error that was handled leaves
+    // nothing behind for debug.traceback or for the next error.
+    #[test]
+    fn a_handled_error_leaves_no_traceback_behind() {
+        let out = run_capture("fn fail() { error(\"first\") }\npcall(fail)\nprint(debug.traceback(\"now\"))").unwrap();
+        assert_eq!(out, ["now\nstack traceback:\n\t[string \"...\"]:3: in main chunk"]);
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let err = fail(&mut cx, "fn fail() { error(\"first\") }\nfn again() { pcall(fail) error(\"second\") }\nagain()", "t.umbra");
+        assert_eq!(err.message, "t.umbra:2: second");
+        assert_eq!(err.traceback, "\tt.umbra:2: in function 'again'\n\tt.umbra:3: in main chunk");
+    }
+
+    // Stress-test finding 37: frames the call site can't name (here, host
+    // calls) are named after their declaration.
+    #[test]
+    fn frames_are_named_after_their_declaration() {
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let f = cx.load_chunk(r#"let A = {}
+fn A:update() { error("e") }
+fn A.make() { error("e") }
+fn top() { error("e") }
+let lf = fn() { error("e") }
+var vf = fn() { error("e") }
+let fn lfn() { error("e") }
+let anon = { f = fn() { error("e") } }
+let p, q = fn() { error("e") }, fn() { error("e") }
+return A, top, lf, vf, lfn, anon.f, p, q"#, "n.umbra").unwrap();
+        let r = cx.call(f, &[]).unwrap();
+        let err = cx.call_method(r[0], "update", &[]).unwrap_err();
+        assert_eq!(err.traceback, "\tn.umbra:2: in method 'update'");
+        let make = cx.get_field(r[0], "make").unwrap();
+        let mut tracebacks = vec![cx.call(make, &[]).unwrap_err().traceback];
+        for &f in &r[1..] {
+            tracebacks.push(cx.call(f, &[]).unwrap_err().traceback);
+        }
+        assert_eq!(tracebacks, [
+            "\tn.umbra:3: in function 'A.make'",
+            "\tn.umbra:4: in function 'top'",
+            "\tn.umbra:5: in function 'lf'",
+            "\tn.umbra:6: in function 'vf'",
+            "\tn.umbra:7: in function 'lfn'",
+            "\tn.umbra:8: in function <n.umbra:8>",
+            "\tn.umbra:9: in function 'p'",
+            "\tn.umbra:9: in function 'q'",
+        ]);
+        // Where the call site names the function, that name wins, as in Lua.
+        let err = fail(&mut cx, "fn top() { error(\"e\") }\nlet g = top\nfn run() { g() }\nrun()", "c.umbra");
+        assert_eq!(err.traceback, "\tc.umbra:1: in upvalue 'g'\n\tc.umbra:3: in function 'run'\n\tc.umbra:4: in main chunk");
+    }
+
+    // Stress-test finding 20: load's syntax errors name the chunk.
+    #[test]
+    fn load_syntax_errors_name_the_chunk() {
+        let out = run_capture(r#"let f, e = load("let x = 1\nlet = 2", "cfg.umbra")
+print(f, e)
+let g, e2 = load("let = 1")
+print(g, e2)"#).unwrap();
+        assert_eq!(out, ["none\tcfg.umbra: line 2: expected identifier", "none\t[string \"...\"]: line 1: expected identifier"]);
+    }
+
+    // Nor does a finalizer's, though it runs in the middle of script.
+    #[test]
+    fn a_finalizer_error_leaves_no_traceback_behind() {
+        let mut vm = Vm::new();
+        vm.gc.threshold = 1;
+        let mut cx = vm.ctx();
+        let err = fail(&mut cx, r#"fn gc_fail() { ran = true error("in gc") }
+setmetatable({}, {__gc = gc_fail})
+for i = 1, 5000 { let junk = { i } }
+if not ran { error("no finalizer ran") }
+error("after")"#, "g.umbra");
+        assert_eq!(err.message, "g.umbra:5: after");
+        assert_eq!(err.traceback, "\tg.umbra:5: in main chunk");
+    }
+}
+
+// Stress-test finding 24: collectgarbage, and tostring identities.
+#[cfg(test)]
+mod collectgarbage_tests {
+    use super::*;
+
+    fn out(src: &str) -> Vec<String> {
+        run_capture(src).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn collect_frees_and_count_reports_kilobytes() {
+        assert_eq!(out(r#"let weak = setmetatable({}, {__mode = "v"})
+weak[1] = {}
+print(collectgarbage("collect"), weak[1])
+weak[1] = {}
+print(collectgarbage(), weak[1])
+let before = collectgarbage("count")
+print(math.type(before), before > 0)
+var big = {}
+for i = 1, 100000 { big[i] = i }
+let grown = collectgarbage("count")
+print(grown - before > 100000 * 8 / 1024)
+big = none
+collectgarbage()
+print(collectgarbage("count") < grown)"#),
+            ["0\tnone", "0\tnone", "float\ttrue", "true", "true"]);
+    }
+
+    #[test]
+    fn step_reports_a_finished_cycle() {
+        assert_eq!(out(r#"var steps = 0
+while not collectgarbage("step") { steps = steps + 1 }
+print(steps > 0, type(collectgarbage("step")))"#), ["true\tboolean"]);
+    }
+
+    #[test]
+    fn other_options_are_errors() {
+        let err = run("collectgarbage(\"stop\")").unwrap_err();
+        assert_eq!(err, "[string \"...\"]:1: collectgarbage: invalid option 'stop'");
+        let err = run("collectgarbage(1)").unwrap_err();
+        assert_eq!(err, "[string \"...\"]:1: collectgarbage: string expected");
+    }
+
+    #[test]
+    fn tostring_prints_a_stable_identity() {
+        assert_eq!(out(r#"let t = {}
+let co = coroutine.create(fn() {})
+let b = bytes.new(4)
+let up = 1
+for _, v in ipairs({t, print, fn() {}, fn() { return up }, co, b}) {
+    let s = tostring(v)
+    print(string.match(s, "^(%a+): 0x%x+$"), s == tostring(v), string.format("%p", v) == string.sub(s, #type(v) + 3))
+}
+print(tostring({}) != tostring(t))
+let named = setmetatable({}, {__tostring = fn() { return "named" }})
+print(named, "${named}")"#), [
+            "table\ttrue\ttrue", "function\ttrue\ttrue", "function\ttrue\ttrue", "function\ttrue\ttrue",
+            "coroutine\ttrue\ttrue", "bytes\ttrue\ttrue", "true", "named\tnamed",
+        ]);
+        // print and interpolation show the same identity.
+        assert_eq!(out("let t = {}\nprint(t == t, tostring(t) == \"${t}\")"), ["true\ttrue"]);
+        let printed = out("let t = {}\nprint(t)\nprint(tostring(t))");
+        assert_eq!(printed[0], printed[1]);
+    }
+}
+
+// Stress-test findings 35 and 23: the nil value is spelled `none`
+// everywhere a script or host sees it, and can't be a key to store under.
+#[cfg(test)]
+mod none_tests {
+    use super::*;
+    use crate::value::Value;
+    use crate::vm::Vm;
+
+    fn out(src: &str) -> Vec<String> {
+        run_capture(src).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn none_is_spelled_none() {
+        assert_eq!(out(r#"print(none, type(none), tostring(none), "${none}", math.type("x"))
+print(string.format("%s %q", none, none))
+print(load("return " .. string.format("%q", none))() == none)
+let t = {}
+let ok, e = pcall(fn() { return t.a.b })
+print(e)"#), ["none\tnone\tnone\tnone\tnone", "none none", "true", "[string \"...\"]:5: attempt to index a none value (field 'a')"]);
+        assert_eq!(Value::nil().to_string(), "none");
+        assert_eq!(format!("{:?}", Value::nil()), "none");
+        let err = run("let f = none\nf()").unwrap_err();
+        assert_eq!(err, "[string \"...\"]:2: attempt to call a none value (local 'f')");
+    }
+
+    #[test]
+    fn storing_under_a_none_key_is_an_error() {
+        for src in ["let t = {}\nt[none] = 1", "let t = {}\nt[0/0] = 1", "let t = {}\nt[none] = none",
+                    "let k = none\nlet t = {[k] = 1}", "let t = {}\nrawset(t, none, 1)",
+                    // A __newindex table passes the key on to the store.
+                    "let t = setmetatable({}, {__newindex = {}})\nt[none] = 1"] {
+            assert_eq!(run(src).unwrap_err(), "[string \"...\"]:2: index is none", "{src}");
+        }
+        // Reading one is fine, as in Lua; and a __newindex function sees the
+        // none key like any other.
+        assert_eq!(out(r#"let t = {1}
+print(t[none], rawget(t, none))
+var seen = false
+let p = setmetatable({}, {__newindex = fn(t, k, v) { seen = k == none and v == 2 }})
+p[none] = 2
+print(seen)"#), ["none\tnone", "true"]);
+    }
+
+    #[test]
+    fn the_host_cant_store_under_a_none_key_either() {
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let t = cx.new_table();
+        assert_eq!(cx.raw_set(t, Value::nil(), Value::int(1)).unwrap_err().message, "index is none");
+        assert_eq!(cx.set(t, Value::float(f64::NAN), Value::int(1)).unwrap_err().message, "index is none");
+        assert!(cx.raw_get(t, Value::nil()).unwrap().is_nil());
+        assert!(cx.next(t, Value::nil()).unwrap().is_none());
+        // From a native the error carries the calling script's position.
+        drop(cx);
+        vm.set_global_cfn("store", |cx, args| { cx.raw_set(args[0], args[1], args[2])?; Ok(vec![]) });
+        let err = run_with_vm("let t = {}\nstore(t, none, 1)", &mut vm).unwrap_err();
+        assert_eq!(err, "[string \"...\"]:2: index is none");
+    }
+}
+
+// Stress-test finding 47: require's loading sentinel.
+#[cfg(test)]
+mod require_tests {
+    use crate::embed::Module;
+    use crate::vm::Vm;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    // A Vm whose loader serves `modules` and counts the loads.
+    fn vm_with(modules: Rc<RefCell<Vec<(&'static str, String)>>>, loads: Rc<Cell<u32>>) -> Vm {
+        let mut vm = Vm::new();
+        vm.set_module_loader(move |_cx, name| {
+            loads.set(loads.get() + 1);
+            let src = modules.borrow().iter().find(|(n, _)| *n == name).map(|(_, s)| s.clone());
+            let source = src.ok_or_else(|| format!("no module '{name}'"))?;
+            Ok(Module { source, chunk_name: format!("{name}.umbra") })
+        });
+        vm
+    }
+
+    #[test]
+    fn requiring_a_module_that_is_still_loading_is_an_error() {
+        let modules = Rc::new(RefCell::new(vec![
+            ("a", "return require(\"b\")".to_owned()),
+            ("b", "return require(\"a\")".to_owned()),
+            ("me", "let x = 1\nreturn require(\"me\")".to_owned()),
+        ]));
+        let loads = Rc::new(Cell::new(0));
+        let mut vm = vm_with(modules, loads.clone());
+        let mut cx = vm.ctx();
+        let main = cx.load_chunk("return require(\"a\")", "main.umbra").unwrap();
+        let err = cx.call(main, &[]).unwrap_err();
+        assert_eq!(err.message, "b.umbra:1: loop or previous error loading module 'a'");
+        // Each module loaded once, not once per nesting level.
+        assert_eq!(loads.get(), 2);
+        let main = cx.load_chunk("return require(\"me\")", "main.umbra").unwrap();
+        let err = cx.call(main, &[]).unwrap_err();
+        assert_eq!(err.message, "me.umbra:2: loop or previous error loading module 'me'");
+        // Caught, the cycle leaves nothing marked as loading.
+        let main = cx.load_chunk("let ok, e = pcall(require, \"a\")\nreturn ok", "main.umbra").unwrap();
+        assert_eq!(cx.call(main, &[]).unwrap()[0].as_bool(), Some(false));
+        let main = cx.load_chunk("let ok, e = pcall(require, \"a\")\nreturn e", "main.umbra").unwrap();
+        let e = cx.call(main, &[]).unwrap()[0];
+        assert_eq!(cx.to_str(e), Some("b.umbra:1: loop or previous error loading module 'a'"));
+    }
+
+    #[test]
+    fn a_module_whose_load_failed_is_not_cached() {
+        let modules = Rc::new(RefCell::new(vec![
+            ("m", "error(\"not yet\")".to_owned()),
+        ]));
+        let loads = Rc::new(Cell::new(0));
+        let mut vm = vm_with(modules.clone(), loads.clone());
+        let mut cx = vm.ctx();
+        let main = cx.load_chunk("return require(\"m\")", "main.umbra").unwrap();
+        assert_eq!(cx.call(main, &[]).unwrap_err().message, "m.umbra:1: not yet");
+        // Neither cached nor left marked as loading: the next require loads
+        // it again, and once it loads, it is cached.
+        modules.borrow_mut()[0].1 = "return 42".to_owned();
+        assert_eq!(cx.call(main, &[]).unwrap()[0].as_int(), Some(42));
+        assert_eq!(cx.call(main, &[]).unwrap()[0].as_int(), Some(42));
+        assert_eq!(loads.get(), 2);
+        // A loader error caches nothing either.
+        let main = cx.load_chunk("return require(\"gone\")", "main.umbra").unwrap();
+        assert_eq!(cx.call(main, &[]).unwrap_err().message, "main.umbra:1: require: no module 'gone'");
+        modules.borrow_mut().push(("gone", "return 7".to_owned()));
+        assert_eq!(cx.call(main, &[]).unwrap()[0].as_int(), Some(7));
+    }
+}
+
+// Stress-test finding 9: every pointer goes into the NaN box with its
+// provenance exposed and comes back out with it (value.rs box_ptr and
+// unbox_ptr). Each kind is unboxed and dereferenced here, which Miri checks.
+#[cfg(test)]
+mod provenance_tests {
+    use crate::value::Value;
+    use crate::vm::Vm;
+
+    #[test]
+    fn every_kind_of_boxed_pointer_comes_back_usable() {
+        let mut vm = Vm::new();
+        let mut cx = vm.ctx();
+        let t = cx.new_table();
+        let s = cx.new_string("abc");
+        let big = cx.new_int(i64::MAX);
+        let f = cx.new_function(|_cx, args| Ok(vec![args[0]]));
+        cx.set_field(t, "s", s).unwrap();
+        cx.set_field(t, "big", big).unwrap();
+        let got = cx.get_field(t, "s").unwrap();
+        assert_eq!(cx.to_str(got), Some("abc"));
+        assert_eq!(cx.get_field(t, "big").unwrap().as_int(), Some(i64::MAX));
+        assert_eq!(cx.call(f, &[Value::int(5)]).unwrap()[0].as_int(), Some(5));
+        // The native's tag bit stays out of the pointer the collector and
+        // the call path use.
+        assert!(crate::heap::is_native(f));
+        assert_eq!(f.as_userdata().unwrap().addr() as u64 & crate::heap::NATIVE_BIT, 0);
+        assert_eq!(f.gc_ptr(), f.as_userdata());
+        // Closures, upvalue-less functions, coroutines and bytes, from script.
+        let chunk = cx.load_chunk(r#"let up = 2
+let add = fn(x) { return x + up }
+let plain = fn(x) { return x * 3 }
+let co = coroutine.wrap(fn(a) { let b = yield(a + 1) return b * 2 })
+let b = bytes.new(2)
+b[1] = 9
+return add(1), plain(2), co(1), co(5), b[1], #b"#, "p.umbra").unwrap();
+        let r: Vec<i64> = cx.call(chunk, &[]).unwrap().iter().map(|v| v.as_int().unwrap()).collect();
+        assert_eq!(r, [3, 6, 2, 10, 9, 2]);
+        drop(cx);
+        vm.gc_collect();
+    }
+}
+
+// Stress-test findings 22 and 33: build.rs writes umbra.h only when its
+// bytes change, with the LF line endings .gitattributes tells git to
+// expect, so a build leaves the tracked header as git checked it out.
+#[cfg(test)]
+mod header_tests {
+    #[test]
+    fn the_header_has_the_line_endings_git_expects() {
+        assert!(!include_bytes!("../umbra.h").contains(&b'\r'));
+        assert!(include_str!("../.gitattributes").lines().any(|l| l.trim() == "umbra.h text eol=lf"));
+    }
+}
+
+// Stress-test finding 21: math.random's state belongs to its VM.
+#[cfg(test)]
+mod random_tests {
+    use super::*;
+    use crate::vm::Vm;
+
+    fn draws(vm: &mut Vm, n: usize) -> Vec<i64> {
+        let mut cx = vm.ctx();
+        let f = cx.load_chunk("return math.random(1, 1000000)", "r.umbra").unwrap();
+        (0..n).map(|_| cx.call(f, &[]).unwrap()[0].as_int().unwrap()).collect()
+    }
+
+    #[test]
+    fn vms_on_one_thread_have_their_own_sequences() {
+        let mut a = Vm::new();
+        let mut b = Vm::new();
+        // Interleaved, each VM still draws the sequence it would alone.
+        let (mut seq_a, mut seq_b) = (Vec::new(), Vec::new());
+        for _ in 0..5 {
+            seq_a.extend(draws(&mut a, 1));
+            seq_b.extend(draws(&mut b, 1));
+        }
+        assert_eq!(seq_a, draws(&mut Vm::new(), 5));
+        assert_eq!(seq_a, seq_b);
+        // randomseed reseeds its own VM and no other.
+        run_with_vm("math.randomseed(42)", &mut a).unwrap();
+        let seeded = draws(&mut a, 3);
+        assert_eq!(draws(&mut b, 3), draws(&mut Vm::new(), 8)[5..]);
+        let mut c = Vm::new();
+        run_with_vm("math.randomseed(42)", &mut c).unwrap();
+        assert_eq!(seeded, draws(&mut c, 3));
     }
 }

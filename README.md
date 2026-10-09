@@ -19,12 +19,16 @@ If you know Lua you know most of this. The syntax leans C:
 - Coroutines (`coroutine.create/resume/status/wrap/isyieldable`, `yield()`)
 - `switch`/`case`, ternary `cond ? a : b`, `++`/`--`, compound assignment
   (`+=`, `-=`, ...). `!=` is not-equal. `~=` is xor-assign.
-- String interpolation: `"balance: ${account.balance}"`
+- String interpolation: `"balance: ${account.balance}"`. Each `${...}` goes
+  through `tostring`, so `__tostring`, booleans and `none` work. A script
+  that redefines `tostring` doesn't change it.
 - `<close>` variable attribute. `close()` runs when the scope exits, whether
   by fall-through, `break`, `continue`, `return`, or an error unwinding
   through it. The error is passed as close's second argument.
-- `none` instead of `nil`. `not`/`and`/`or`. `@` line comments and
-  `/* */` block comments.
+- `none` instead of `nil`, everywhere: `type(none)` and `tostring(none)` are
+  `"none"`, and errors say "attempt to index a none value". `t[none] = v`
+  is an error, as Lua's `t[nil] = v` is. `not`/`and`/`or`. `@` line
+  comments and `/* */` block comments.
 - Integers and floats are distinct types. Integers are a full 64 bits (values
   past the NaN-box's 48-bit payload get heap-boxed, you never see it) and wrap
   on overflow like Lua's.
@@ -53,7 +57,8 @@ If you know Lua you know most of this. The syntax leans C:
   randomseed` and the constants
 - `debug.traceback`, and the base functions: `print tostring tonumber type
   assert error pcall xpcall ipairs pairs unpack select setmetatable
-  getmetatable rawget rawset rawequal require load`
+  getmetatable rawget rawset rawequal require load collectgarbage`.
+  `collectgarbage` takes `"collect"`, `"count"` and `"step"`.
 
 ## Architecture
 
@@ -70,8 +75,13 @@ source → lexer → parser (AST) → compiler → bytecode chunk → register V
 - `src/vm.rs` holds the interpreter loop, metatables, coroutines, and the
   stdlib
 - `src/gc.rs` is an incremental tri-color mark-and-sweep over strings, bytes,
-  tables, closures, and bigints. Write barrier on stores, byte-paced steps,
-  a host-settable cap on live objects.
+  tables, closures, natives, bigints, coroutines, and compiled functions.
+  Code from `load`, `require` and a host's reloads is freed once nothing
+  can call it. Write barrier on stores, byte-paced steps, a host-settable
+  cap on live objects.
+- `src/heap.rs` is where everything outside the collector dereferences a
+  heap object. References borrow the collector, so the borrow checker keeps
+  them from overlapping an allocation, a barrier or running script.
 - `src/value.rs` is the NaN-boxed value representation
 - `src/api.rs` plus `umbra.h` is the C surface
 
@@ -133,6 +143,60 @@ cargo build --release  # produces target/release/libumbra.so
 cd example && make run-word-count
 ```
 
+## Embedding from Rust
+
+Natives get a `Ctx`, the same handle host code gets from `vm.ctx()`:
+
+```rust
+vm.set_global_cfn("spawn", |cx, args| {
+    let world = cx.host::<World>().ok_or(VmError::RuntimeError("no world".into()))?;
+    let id = world.spawn();
+    let t = cx.new_table();
+    cx.set_field(t, "id", Value::int(id))?;
+    Ok(vec![t])
+});
+
+let mut cx = vm.ctx();
+let f = cx.load_chunk(&src, "scripts/spin.umbra")?;   // errors cite scripts/spin.umbra:12:
+let obj = cx.call(f, &[])?[0];
+let obj_ref = cx.make_ref(obj);                         // survives past this Ctx
+cx.with_host(&mut world, |cx| cx.call_method(obj, "update", &[Value::float(dt)]))?;
+```
+
+`Ctx` also has `get`/`set` (with metamethods), `raw_get`/`raw_set`,
+`get_field`/`set_field`, `set_metatable`/`metatable`, `next`, `raw_len`,
+`get_global`/`set_global`, and `get_ref`/`release_ref`.
+
+Natives can make natives. `cx.new_function(f)` wraps a Rust closure as a
+function value, and `cx.new_closure(f, &[upvals])` does the same with
+values the collector traces for the native's lifetime, which is how a native
+hands back a bound method:
+
+```rust
+vm.set_global_cfn("bind", |cx, args| {
+    let (obj, name) = (args[0], args[1]);
+    let method = cx.get(obj, name)?;
+    let bound = cx.new_closure(|cx, args, up| {
+        let mut full = vec![up[0]];
+        full.extend_from_slice(args);
+        Ok(cx.call(up[1], &full)?)
+    }, &[obj, method]);
+    Ok(vec![bound])
+});
+```
+`vm.set_module_loader` makes `require` read from your asset store instead
+of the filesystem.
+
+The rooting rule: every `Value` a `Ctx` hands you, and every argument a
+native receives, stays alive until that `Ctx` drops (for a native, until it
+returns). Anything you need longer goes in a `Ref`. A `Value` used after its
+`Ctx` dropped, without a `Ref`, may point at freed memory. See `src/embed.rs`.
+
+Natives are collected like tables once nothing reaches them. A `Value` a
+native's Rust closure captures is invisible to the collector, so pass it as
+an upvalue to `cx.new_closure` (or `vm.make_cfn_closure` outside a `Ctx`)
+instead: the collector traces the upvalues for as long as the native lives.
+
 ## Example scripts
 
 Runnable programs in `example/`. Try `umbra example/nqueens.umbra`.
@@ -189,8 +253,10 @@ These are on purpose and won't change.
   `string.unpack` takes bytes or strings, `io.open(path, "rb")` reads bytes
   and `f:write` accepts them.
 - **NaN is `none`.** The value representation is NaN-boxed, so every NaN bit
-  pattern is already spoken for. `0/0` gives `none`.
-- **`none` instead of `nil`. `!=` is not-equal. `~=` is xor-assign.**
+  pattern is already spoken for. `0/0` gives `none`, and a NaN key is a
+  `none` key.
+- **`none` instead of `nil`**, in the keyword, `type`, `tostring` and every
+  message. **`!=` is not-equal. `~=` is xor-assign.**
 - **No `dofile`.** `load` compiles strings and `require` loads files. That is
   the entire filesystem surface for code.
 
