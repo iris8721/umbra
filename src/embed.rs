@@ -63,11 +63,7 @@ pub struct ScriptError {
 
 impl std::fmt::Display for ScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.traceback.is_empty() {
-            write!(f, "{}", self.message)
-        } else {
-            write!(f, "{}\nstack traceback:\n{}", self.message, self.traceback)
-        }
+        if self.traceback.is_empty() { write!(f, "{}", self.message) } else { write!(f, "{}\nstack traceback:\n{}", self.message, self.traceback) }
     }
 }
 
@@ -76,7 +72,9 @@ impl std::error::Error for ScriptError {}
 // Lets a native `?` a failed call: the error object propagates unchanged,
 // like an error passing through a Lua C function.
 impl From<ScriptError> for VmError {
-    fn from(e: ScriptError) -> Self { VmError::Thrown(e.value) }
+    fn from(e: ScriptError) -> Self {
+        VmError::Thrown(e.value)
+    }
 }
 
 /// A value kept alive until released, like a slot in Lua's registry. Not
@@ -230,11 +228,7 @@ impl<'a> Ctx<'a> {
     /// call gets them as its third argument, and the collector traces them
     /// for as long as the native lives. They are fixed at creation; mutable
     /// state goes in a table upvalue. Rooted like new_function.
-    pub fn new_closure(
-        &mut self,
-        f: impl Fn(&mut Ctx<'_>, &[Value], &[Value]) -> VmResult<Vec<Value>> + 'static,
-        upvals: &[Value],
-    ) -> Value {
+    pub fn new_closure(&mut self, f: impl Fn(&mut Ctx<'_>, &[Value], &[Value]) -> VmResult<Vec<Value>> + 'static, upvals: &[Value]) -> Value {
         let v = self.vm.make_cfn_closure(upvals, f);
         self.root(v)
     }
@@ -289,7 +283,9 @@ impl<'a> Ctx<'a> {
 
     /// rawget: no metamethods.
     pub fn raw_get(&mut self, t: Value, key: Value) -> Result<Value, ScriptError> {
-        if !t.is_table() { return Err(self.type_error("raw_get", "table", t)); }
+        if !t.is_table() {
+            return Err(self.type_error("raw_get", "table", t));
+        }
         let v = self.vm.gc.table(t).raw_get(key);
         Ok(self.root(v))
     }
@@ -297,16 +293,22 @@ impl<'a> Ctx<'a> {
     /// rawset: no metamethods. A none key is an error (`index is none`),
     /// as in script.
     pub fn raw_set(&mut self, t: Value, key: Value, val: Value) -> Result<(), ScriptError> {
-        if !t.is_table() { return Err(self.type_error("raw_set", "table", t)); }
+        if !t.is_table() {
+            return Err(self.type_error("raw_set", "table", t));
+        }
         self.vm.raw_store(t, key, val).map_err(|e| self.error(e, String::new()))
     }
 
     /// setmetatable(t, mt); None clears it. Attaching a metatable with __gc
     /// makes `t` finalizable, as in script.
     pub fn set_metatable(&mut self, t: Value, mt: Option<Value>) -> Result<(), ScriptError> {
-        if !t.is_table() { return Err(self.type_error("set_metatable", "table", t)); }
+        if !t.is_table() {
+            return Err(self.type_error("set_metatable", "table", t));
+        }
         let mt = mt.unwrap_or(Value::nil());
-        if !mt.is_table() && !mt.is_nil() { return Err(self.type_error("set_metatable", "table", mt)); }
+        if !mt.is_table() && !mt.is_nil() {
+            return Err(self.type_error("set_metatable", "table", mt));
+        }
         self.vm.set_metatable(t, mt);
         Ok(())
     }
@@ -314,7 +316,9 @@ impl<'a> Ctx<'a> {
     /// The raw metatable of a table (ignores __metatable); None for
     /// non-tables and tables without one.
     pub fn metatable(&mut self, t: Value) -> Option<Value> {
-        if !t.is_table() { return None; }
+        if !t.is_table() {
+            return None;
+        }
         let mt = self.vm.gc.table(t).metatable?;
         Some(self.root(Value::table(mt as *mut u8)))
     }
@@ -323,15 +327,23 @@ impl<'a> Ctx<'a> {
     /// script `next`. Iterating while assigning to existing keys is fine;
     /// adding keys mid-iteration may skip or repeat entries.
     pub fn next(&mut self, t: Value, key: Value) -> Result<Option<(Value, Value)>, ScriptError> {
-        if !t.is_table() { return Err(self.type_error("next", "table", t)); }
+        if !t.is_table() {
+            return Err(self.type_error("next", "table", t));
+        }
         Ok(self.vm.table_next(t, key).map(|(k, v)| (self.root(k), self.root(v))))
     }
 
     /// `#v` without __len: a table's border, or a string's or bytes' length.
     pub fn raw_len(&mut self, v: Value) -> Result<i64, ScriptError> {
-        if v.is_table() { return Ok(self.vm.gc.table(v).length()); }
-        if v.is_string() { return Ok(self.vm.gc.str(v).len() as i64); }
-        if v.is_bytes() { return Ok(self.vm.gc.bytes(v).len as i64); }
+        if v.is_table() {
+            return Ok(self.vm.gc.table(v).length());
+        }
+        if v.is_string() {
+            return Ok(self.vm.gc.str(v).len() as i64);
+        }
+        if v.is_bytes() {
+            return Ok(self.vm.gc.bytes(v).len as i64);
+        }
         Err(self.type_error("raw_len", "table, string or bytes", v))
     }
 
@@ -368,9 +380,7 @@ impl<'a> Ctx<'a> {
         // nesting count, so a compiler panic is contained without poisoning
         // the VM once that count is put back.
         let nesting = self.vm.nesting;
-        let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.vm.load_proto(source, Some(chunk_name.to_owned()))
-        }));
+        let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.vm.load_proto(source, Some(chunk_name.to_owned()))));
         let e = match compiled {
             Ok(Ok(f)) => return Ok(self.root(f)),
             Ok(Err(msg)) => VmError::RuntimeError(format!("{chunk_name}: {msg}")),

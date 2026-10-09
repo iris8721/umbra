@@ -10,16 +10,37 @@ use crate::vm::FxMap;
 // survivors to cur_white, so objects allocated mid-sweep are born the
 // right white and are never mistaken for garbage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GcColor { WhiteA, WhiteB, Gray, Black }
+pub enum GcColor {
+    WhiteA,
+    WhiteB,
+    Gray,
+    Black,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum GcKind { Str, Bytes, Table, Closure, BigInt, Native, Coroutine, Proto }
+pub enum GcKind {
+    Str,
+    Bytes,
+    Table,
+    Closure,
+    BigInt,
+    Native,
+    Coroutine,
+    Proto,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GcPhase { Pause, Propagate, Atomic, Sweep }
+pub enum GcPhase {
+    Pause,
+    Propagate,
+    Atomic,
+    Sweep,
+}
 
 #[inline(always)]
-fn is_white(c: GcColor) -> bool { matches!(c, GcColor::WhiteA | GcColor::WhiteB) }
+fn is_white(c: GcColor) -> bool {
+    matches!(c, GcColor::WhiteA | GcColor::WhiteB)
+}
 
 // Every heap object starts with this header (the structs in vm.rs are
 // repr(C) with `gc` first, so the object pointer IS the header pointer).
@@ -53,12 +74,12 @@ impl GcHeader {
 const STEP_GRANULE: usize = 4096;
 
 pub struct Gc {
-    head:        *mut GcHeader,
-    count:       usize,
+    head: *mut GcHeader,
+    count: usize,
     // Object lists hold pointers, never addresses: an address turned back
     // into a pointer would need exposed provenance, which only the NaN box
     // (value.rs) relies on.
-    gray_list:   Vec<*mut u8>,
+    gray_list: Vec<*mut u8>,
     // Allocations since the last cycle started; a cycle is due once this
     // reaches threshold or 1.5x the live count at the end of the previous
     // cycle. Tighter than the old stop-the-world 2x: an incremental cycle
@@ -80,16 +101,16 @@ pub struct Gc {
     // bounded; each step is still only ~granule*32 of work against cycles
     // that run to megabytes.
     pub stepmul: u32,
-    phase:       GcPhase,
-    cur_white:   GcColor,
-    dead_white:  GcColor,
+    phase: GcPhase,
+    cur_white: GcColor,
+    dead_white: GcColor,
     // Incremental sweep cursor: the last object kept so far (null = the next
     // candidate is head). Newborns prepend at head and are simply visited
     // like any other survivor — no self-pointer into `head` to maintain.
-    sweep_prev:  *mut GcHeader,
+    sweep_prev: *mut GcHeader,
     // Live bytes accumulated by the in-progress sweep; becomes
     // live_bytes_after_collect when the sweep finishes.
-    live_bytes:  usize,
+    live_bytes: usize,
     // Weak tables marked this cycle; their entry cleanup is deferred to the
     // atomic step (Lua's grayagain) since liveness isn't final until then.
     weak_tables: Vec<*mut u8>,
@@ -101,7 +122,7 @@ pub struct Gc {
     // Tables that had a __gc metatable attached; the atomic step resurrects
     // whichever are still white. Entries are removed by the sweep via
     // header.fin_idx, so the list never holds a dangling pointer.
-    fin_cands:   Vec<*mut u8>,
+    fin_cands: Vec<*mut u8>,
     pub threshold: usize,
     // Byte-side pacing floor; twice the live-byte count at the end of the
     // previous cycle raises it the same way live_after_collect raises
@@ -126,24 +147,24 @@ pub struct Gc {
 impl Gc {
     pub fn new() -> Self {
         Gc {
-            head:        std::ptr::null_mut(),
-            count:       0,
-            gray_list:   Vec::new(),
+            head: std::ptr::null_mut(),
+            count: 0,
+            gray_list: Vec::new(),
             alloc_count: 0,
             live_after_collect: 0,
             alloc_bytes: 0,
             live_bytes_after_collect: 0,
             bytes_since_step: 0,
-            stepmul:     3200,
-            phase:       GcPhase::Pause,
-            cur_white:   GcColor::WhiteA,
-            dead_white:  GcColor::WhiteB,
-            sweep_prev:  std::ptr::null_mut(),
-            live_bytes:  0,
+            stepmul: 3200,
+            phase: GcPhase::Pause,
+            cur_white: GcColor::WhiteA,
+            dead_white: GcColor::WhiteB,
+            sweep_prev: std::ptr::null_mut(),
+            live_bytes: 0,
             weak_tables: Vec::new(),
-            coroutines:  Vec::new(),
-            fin_cands:   Vec::new(),
-            threshold:   1024,
+            coroutines: Vec::new(),
+            fin_cands: Vec::new(),
+            threshold: 1024,
             byte_threshold: 1 << 20,
             max_objects: 0,
             pending_finalizers: Vec::new(),
@@ -189,11 +210,7 @@ impl Gc {
     // another step.
     #[inline(always)]
     pub fn should_step(&self) -> bool {
-        if self.phase == GcPhase::Pause {
-            self.should_collect()
-        } else {
-            self.bytes_since_step >= STEP_GRANULE
-        }
+        if self.phase == GcPhase::Pause { self.should_collect() } else { self.bytes_since_step >= STEP_GRANULE }
     }
 
     // Cycle start and the atomic step both need the root set; the VM gathers
@@ -203,10 +220,18 @@ impl Gc {
         self.phase == GcPhase::Pause || self.phase == GcPhase::Atomic
     }
 
-    pub fn phase(&self) -> GcPhase { self.phase }
-    pub fn live_count(&self) -> usize { self.count }
-    pub fn max_step_work(&self) -> usize { self.max_step_work }
-    pub fn last_cycle_work(&self) -> usize { self.last_cycle_work }
+    pub fn phase(&self) -> GcPhase {
+        self.phase
+    }
+    pub fn live_count(&self) -> usize {
+        self.count
+    }
+    pub fn max_step_work(&self) -> usize {
+        self.max_step_work
+    }
+    pub fn last_cycle_work(&self) -> usize {
+        self.last_cycle_work
+    }
 
     // Bytes held by every object on the heap, garbage not yet swept
     // included: collectgarbage("count"). A walk, since sizes change after
@@ -235,17 +260,8 @@ impl Gc {
     // worth of work. `forced` marks steps from an explicit full collect:
     // they run with an unbounded budget and stay out of max_step_work.
     // Returns the work done, in charged bytes.
-    pub(crate) fn step(
-        &mut self,
-        roots: Option<Vec<Value>>,
-        string_cache: &mut FxMap<String, Value>,
-        forced: bool,
-    ) -> usize {
-        let work = if forced {
-            usize::MAX / 4
-        } else {
-            (self.bytes_since_step * self.stepmul as usize / 100).max(1)
-        };
+    pub(crate) fn step(&mut self, roots: Option<Vec<Value>>, string_cache: &mut FxMap<String, Value>, forced: bool) -> usize {
+        let work = if forced { usize::MAX / 4 } else { (self.bytes_since_step * self.stepmul as usize / 100).max(1) };
         self.bytes_since_step = 0;
         let mut done = 0usize;
         match self.phase {
@@ -255,7 +271,9 @@ impl Gc {
             }
             GcPhase::Propagate => {
                 done += self.propagate_step(work);
-                if self.gray_list.is_empty() { self.phase = GcPhase::Atomic; }
+                if self.gray_list.is_empty() {
+                    self.phase = GcPhase::Atomic;
+                }
             }
             GcPhase::Atomic => {
                 done += self.atomic(roots.expect("atomic step needs roots"), string_cache);
@@ -265,7 +283,9 @@ impl Gc {
             }
         }
         self.cycle_work += done;
-        if !forced { self.max_step_work = self.max_step_work.max(done); }
+        if !forced {
+            self.max_step_work = self.max_step_work.max(done);
+        }
         done
     }
 
@@ -284,7 +304,9 @@ impl Gc {
         // a full gap on top of whatever the in-flight cycle already spanned.
         self.alloc_count = 0;
         self.alloc_bytes = 0;
-        for v in roots { self.mark_value(v); }
+        for v in roots {
+            self.mark_value(v);
+        }
     }
 
     // Pop gray objects and mark their children until the budget is spent.
@@ -295,7 +317,9 @@ impl Gc {
             let kind = blacken(ptr);
             done += object_bytes(ptr, kind).max(1);
             self.propagate_object(ptr, kind);
-            if done >= budget { break; }
+            if done >= budget {
+                break;
+            }
         }
         done
     }
@@ -304,9 +328,9 @@ impl Gc {
     fn propagate_object(&mut self, ptr: *mut u8, kind: GcKind) {
         match kind {
             GcKind::Str | GcKind::Bytes | GcKind::BigInt => {}
-            GcKind::Table   => self.propagate_table(ptr),
+            GcKind::Table => self.propagate_table(ptr),
             GcKind::Closure => self.propagate_closure(ptr),
-            GcKind::Native  => self.propagate_native(ptr),
+            GcKind::Native => self.propagate_native(ptr),
             GcKind::Coroutine => {
                 self.coroutines.push(ptr);
                 self.mark_coroutine(ptr);
@@ -323,7 +347,9 @@ impl Gc {
     fn atomic(&mut self, roots: Vec<Value>, string_cache: &mut FxMap<String, Value>) -> usize {
         debug_assert_eq!(self.phase, GcPhase::Atomic);
         let mut done = 0usize;
-        for v in roots { done += self.mark_value(v); }
+        for v in roots {
+            done += self.mark_value(v);
+        }
         // The coroutines scanned so far may have run, yielded or been
         // resumed since; their stacks are final now.
         for i in 0..self.coroutines.len() {
@@ -349,13 +375,17 @@ impl Gc {
                 // a candidate as it frees it). Raw places, no references: the
                 // metatable may be the table itself.
                 let gc_fn = unsafe {
-                    if !is_white((*h).color) || (*h).finalized { continue; }
+                    if !is_white((*h).color) || (*h).finalized {
+                        continue;
+                    }
                     let Some(mt) = (*t).metatable else { continue };
                     (*mt).get_str("__gc")
                 };
                 if let Some(gc_fn) = gc_fn {
                     // SAFETY: as above.
-                    unsafe { (*h).finalized = true; }
+                    unsafe {
+                        (*h).finalized = true;
+                    }
                     done += self.mark_value(Value::table(ptr));
                     self.pending_finalizers.push((ptr, gc_fn));
                     resurrected = true;
@@ -381,17 +411,25 @@ impl Gc {
                 let (weak_keys, weak_values) = table_weak_mode(mt);
                 if weak_values {
                     for slot in array.iter_mut() {
-                        if self.is_white_value(*slot) { *slot = Value::nil(); }
+                        if self.is_white_value(*slot) {
+                            *slot = Value::nil();
+                        }
                     }
                 }
                 hash.retain(|k, v| {
-                    if weak_values && self.is_white_value(*v) { return false; }
+                    if weak_values && self.is_white_value(*v) {
+                        return false;
+                    }
                     if weak_keys {
                         if let TableKey::Ptr(bits) = k {
-                            if self.is_white_value(Value::from_raw(*bits)) { return false; }
+                            if self.is_white_value(Value::from_raw(*bits)) {
+                                return false;
+                            }
                         }
                         if let TableKey::Str(p) = k {
-                            if self.is_white_value(Value::string(*p)) { return false; }
+                            if self.is_white_value(Value::string(*p)) {
+                                return false;
+                            }
                         }
                     }
                     true
@@ -423,9 +461,7 @@ impl Gc {
         let mut done = 0usize;
         loop {
             // SAFETY: sweep_prev is null or a live object the sweep kept.
-            let cur = unsafe {
-                if self.sweep_prev.is_null() { self.head } else { (*self.sweep_prev).next }
-            };
+            let cur = unsafe { if self.sweep_prev.is_null() { self.head } else { (*self.sweep_prev).next } };
             if cur.is_null() {
                 self.finish_cycle();
                 break;
@@ -467,7 +503,9 @@ impl Gc {
                     self.sweep_prev = cur;
                 }
             }
-            if done >= budget { break; }
+            if done >= budget {
+                break;
+            }
         }
         done
     }
@@ -514,7 +552,6 @@ impl Gc {
         self.phase = GcPhase::Pause;
     }
 
-
     // A GC-tracked value still White (either shade) hasn't been marked
     // reachable this cycle.
     #[inline(always)]
@@ -535,7 +572,9 @@ impl Gc {
         // SAFETY: live, as in is_white_value. Raw places, no reference: the
         // caller may be scanning this very object through field borrows.
         let kind = unsafe {
-            if !is_white((*h).color) { return 0; }
+            if !is_white((*h).color) {
+                return 0;
+            }
             match (*h).kind {
                 // Leaf kinds have no outgoing edges: straight to black, no
                 // gray round-trip through propagate().
@@ -568,9 +607,15 @@ impl Gc {
     // the sweep just like a white value would.
     #[inline(never)]
     pub(crate) fn barrier_store(&mut self, key: Value, val: Value) {
-        if self.phase == GcPhase::Pause { return; }
-        if self.is_white_value(key) { self.mark_value(key); }
-        if self.is_white_value(val) { self.mark_value(val); }
+        if self.phase == GcPhase::Pause {
+            return;
+        }
+        if self.is_white_value(key) {
+            self.mark_value(key);
+        }
+        if self.is_white_value(val) {
+            self.mark_value(val);
+        }
     }
 
     // A table that just got a metatable with __gc becomes a finalizer
@@ -596,7 +641,9 @@ impl Gc {
         let c = ptr as *const LuaClosure;
         // SAFETY: gray-list entries are live objects of their header's kind.
         let (upvals, proto) = unsafe { (&(*c).upvals, (*c).proto) };
-        for &v in upvals.iter() { self.mark_value(v); }
+        for &v in upvals.iter() {
+            self.mark_value(v);
+        }
         self.mark_value(Value::userdata(proto as *mut u8));
     }
 
@@ -608,11 +655,15 @@ impl Gc {
         // SAFETY: as propagate_closure; the field borrow leaves the header
         // uncovered.
         let p = unsafe { &(*(ptr as *const GcProto)).proto };
-        for &child in p.protos.iter() { self.mark_value(Value::userdata(child as *mut u8)); }
+        for &child in p.protos.iter() {
+            self.mark_value(Value::userdata(child as *mut u8));
+        }
         for c in p.consts.iter() {
             if let Const::Str(sc) = c {
                 let (_, bits) = sc.cached();
-                if bits != 0 { self.mark_value(Value::from_raw(bits)); }
+                if bits != 0 {
+                    self.mark_value(Value::from_raw(bits));
+                }
             }
         }
     }
@@ -621,7 +672,9 @@ impl Gc {
         use crate::vm::NativeFn;
         // SAFETY: as propagate_closure.
         let upvals = unsafe { &(*(ptr as *const NativeFn)).upvals };
-        for &v in upvals.iter() { self.mark_value(v); }
+        for &v in upvals.iter() {
+            self.mark_value(v);
+        }
     }
 
     // Marks the stack parked in a coroutine: its own while it is suspended,
@@ -635,16 +688,21 @@ impl Gc {
         let co = ptr as *const Coroutine;
         // SAFETY: as propagate_closure; coroutine-list entries were marked
         // this cycle, so they are live too.
-        let (regs, frames, fn_val, dead) =
-            unsafe { (&(*co).regs, &(*co).frames, (*co).fn_val, (*co).status == CoStatus::Dead) };
+        let (regs, frames, fn_val, dead) = unsafe { (&(*co).regs, &(*co).frames, (*co).fn_val, (*co).status == CoStatus::Dead) };
         let mut done = 0;
-        for &v in regs.iter() { done += self.mark_value(v); }
+        for &v in regs.iter() {
+            done += self.mark_value(v);
+        }
         for f in frames.iter() {
-            for &v in f.varargs.iter() { done += self.mark_value(v); }
+            for &v in f.varargs.iter() {
+                done += self.mark_value(v);
+            }
             done += self.mark_value(f.callable);
             done += self.mark_value(Value::userdata(f.proto as *mut u8));
         }
-        if !dead { done += self.mark_value(fn_val); }
+        if !dead {
+            done += self.mark_value(fn_val);
+        }
         done + regs.len()
     }
 
@@ -661,16 +719,24 @@ impl Gc {
             self.weak_tables.push(ptr);
         }
         if !weak_values {
-            for &v in array.iter() { self.mark_value(v); }
+            for &v in array.iter() {
+                self.mark_value(v);
+            }
         }
         if !weak_keys {
             for (k, v) in hash.iter() {
                 match k {
-                    TableKey::Ptr(bits) => { self.mark_value(Value::from_raw(*bits)); }
-                    TableKey::Str(p)    => { self.mark_value(Value::string(*p)); }
+                    TableKey::Ptr(bits) => {
+                        self.mark_value(Value::from_raw(*bits));
+                    }
+                    TableKey::Str(p) => {
+                        self.mark_value(Value::string(*p));
+                    }
                     _ => {}
                 }
-                if !weak_values { self.mark_value(*v); }
+                if !weak_values {
+                    self.mark_value(*v);
+                }
             }
         }
         if let Some(mt) = mt {
@@ -692,12 +758,15 @@ impl Gc {
                 // SAFETY: as in atomic's weak-table cleanup.
                 let (hash, mt) = unsafe { (&(*t).hash, (*t).metatable) };
                 let (weak_keys, weak_values) = table_weak_mode(mt);
-                if !weak_keys || weak_values { continue; }
-                let pending: Vec<Value> = hash.iter()
+                if !weak_keys || weak_values {
+                    continue;
+                }
+                let pending: Vec<Value> = hash
+                    .iter()
                     .filter(|(k, v)| {
                         let key_live = match k {
                             TableKey::Ptr(bits) => !self.is_white_value(Value::from_raw(*bits)),
-                            TableKey::Str(p)    => !self.is_white_value(Value::string(*p)),
+                            TableKey::Str(p) => !self.is_white_value(Value::string(*p)),
                             _ => true,
                         };
                         key_live && self.is_white_value(**v)
@@ -709,7 +778,9 @@ impl Gc {
                     marked_any = true;
                 }
             }
-            if !marked_any { break; }
+            if !marked_any {
+                break;
+            }
             self.propagate();
         }
     }
@@ -733,15 +804,15 @@ unsafe fn free_object(ptr: *mut u8, kind: GcKind) {
     // SAFETY: per the caller.
     unsafe {
         match kind {
-            GcKind::Str     => drop(Box::from_raw(ptr as *mut RtString)),
-            GcKind::Bytes   => drop(Box::from_raw(ptr as *mut RtBytes)),
-            GcKind::Table   => drop(Box::from_raw(ptr as *mut Table)),
+            GcKind::Str => drop(Box::from_raw(ptr as *mut RtString)),
+            GcKind::Bytes => drop(Box::from_raw(ptr as *mut RtBytes)),
+            GcKind::Table => drop(Box::from_raw(ptr as *mut Table)),
             GcKind::Closure => drop(Box::from_raw(ptr as *mut LuaClosure)),
-            GcKind::BigInt  => drop(Box::from_raw(ptr as *mut GcBigInt)),
-            GcKind::Native  => drop(Box::from_raw(ptr as *mut NativeFn)),
+            GcKind::BigInt => drop(Box::from_raw(ptr as *mut GcBigInt)),
+            GcKind::Native => drop(Box::from_raw(ptr as *mut NativeFn)),
             GcKind::Coroutine => drop(Box::from_raw(ptr as *mut Coroutine)),
             // Its nested protos are separate objects, freed on their own.
-            GcKind::Proto   => drop(Box::from_raw(ptr as *mut crate::chunk::GcProto)),
+            GcKind::Proto => drop(Box::from_raw(ptr as *mut crate::chunk::GcProto)),
         }
     }
 }
@@ -771,15 +842,17 @@ fn object_bytes(ptr: *mut u8, kind: GcKind) -> usize {
             GcKind::BigInt => std::mem::size_of::<GcBigInt>(),
             GcKind::Coroutine => {
                 let co = ptr as *const Coroutine;
-                std::mem::size_of::<Coroutine>() + (*co).regs.capacity() * v
-                    + (*co).frames.capacity() * std::mem::size_of::<Frame>()
+                std::mem::size_of::<Coroutine>() + (*co).regs.capacity() * v + (*co).frames.capacity() * std::mem::size_of::<Frame>()
             }
             GcKind::Proto => {
                 use crate::chunk::{Const, GcProto};
                 let p = &(*(ptr as *const GcProto)).proto;
-                std::mem::size_of::<GcProto>() + p.code.capacity() * 4 + p.lines.capacity() * 4
+                std::mem::size_of::<GcProto>()
+                    + p.code.capacity() * 4
+                    + p.lines.capacity() * 4
                     + p.consts.capacity() * std::mem::size_of::<Const>()
-                    + p.global_cache.capacity() * 24 + p.protos.capacity() * 8
+                    + p.global_cache.capacity() * 24
+                    + p.protos.capacity() * 8
             }
         }
     }

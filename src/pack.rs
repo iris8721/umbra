@@ -20,8 +20,7 @@ pub enum PackValue {
 fn as_int(v: &PackValue) -> Result<i64, String> {
     match v {
         PackValue::Int(n) => Ok(*n),
-        PackValue::Float(f) if f.fract() == 0.0
-            && *f >= -9223372036854775808.0 && *f < 9223372036854775808.0 => Ok(*f as i64),
+        PackValue::Float(f) if f.fract() == 0.0 && *f >= -9223372036854775808.0 && *f < 9223372036854775808.0 => Ok(*f as i64),
         PackValue::Float(_) => Err("number has no integer representation".to_string()),
         PackValue::Str(_) => Err("number expected".to_string()),
     }
@@ -112,10 +111,22 @@ fn getoption(h: &mut Header, fmt: &[u8], i: &mut usize, who: &str) -> Result<(Op
         b'x' => (Opt::Pad, 1),
         b'X' => (Opt::PadAlign, 0),
         b' ' => (Opt::Nop, 0),
-        b'<' => { h.little = true; (Opt::Nop, 0) }
-        b'>' => { h.little = false; (Opt::Nop, 0) }
-        b'=' => { h.little = NATIVE_LITTLE; (Opt::Nop, 0) }
-        b'!' => { h.maxalign = read_num_limit(fmt, i, NATIVE_ALIGN, who)?; (Opt::Nop, 0) }
+        b'<' => {
+            h.little = true;
+            (Opt::Nop, 0)
+        }
+        b'>' => {
+            h.little = false;
+            (Opt::Nop, 0)
+        }
+        b'=' => {
+            h.little = NATIVE_LITTLE;
+            (Opt::Nop, 0)
+        }
+        b'!' => {
+            h.maxalign = read_num_limit(fmt, i, NATIVE_ALIGN, who)?;
+            (Opt::Nop, 0)
+        }
         _ => return Err(format!("{who}: invalid format option '{}'", c as char)),
     };
     Ok((opt, size))
@@ -124,9 +135,7 @@ fn getoption(h: &mut Header, fmt: &[u8], i: &mut usize, who: &str) -> Result<(Op
 // getdetails: the option, its size, and the padding needed to align it.
 // Alignment follows size, capped at maxalign; 'X' takes its alignment from
 // the option that follows it (which is consumed but packs/skips nothing).
-fn getdetails(h: &mut Header, fmt: &[u8], i: &mut usize, totalsize: usize, who: &str)
-    -> Result<(Opt, usize, usize), String>
-{
+fn getdetails(h: &mut Header, fmt: &[u8], i: &mut usize, totalsize: usize, who: &str) -> Result<(Opt, usize, usize), String> {
     let (opt, size) = getoption(h, fmt, i, who)?;
     let mut align = size;
     if opt == Opt::PadAlign {
@@ -142,7 +151,9 @@ fn getdetails(h: &mut Header, fmt: &[u8], i: &mut usize, totalsize: usize, who: 
     let ntoalign = if align <= 1 || opt == Opt::Chars {
         0
     } else {
-        if align > h.maxalign { align = h.maxalign; }
+        if align > h.maxalign {
+            align = h.maxalign;
+        }
         if align & (align - 1) != 0 {
             return Err(format!("{who}: format asks for alignment not power of 2"));
         }
@@ -155,11 +166,23 @@ fn getdetails(h: &mut Header, fmt: &[u8], i: &mut usize, totalsize: usize, who: 
 // sign extension for negative signed values, zero otherwise.
 fn push_int(out: &mut Vec<u8>, n: i64, size: usize, little: bool, neg: bool) {
     let b = n.to_le_bytes();
-    let at = |k: usize| if k < 8 { b[k] } else if neg { 0xFF } else { 0 };
+    let at = |k: usize| {
+        if k < 8 {
+            b[k]
+        } else if neg {
+            0xFF
+        } else {
+            0
+        }
+    };
     if little {
-        for k in 0..size { out.push(at(k)); }
+        for k in 0..size {
+            out.push(at(k));
+        }
     } else {
-        for k in (0..size).rev() { out.push(at(k)); }
+        for k in (0..size).rev() {
+            out.push(at(k));
+        }
     }
 }
 
@@ -270,9 +293,13 @@ fn read_int(data: &[u8], pos: usize, size: usize, signed: bool, little: bool) ->
 
 // posrelatI: 1-based position; 0 and positions before the start clip to 1.
 fn pos_relat(init: i64, len: usize) -> i64 {
-    if init > 0 { init }
-    else if init == 0 || -init > len as i64 { 1 }
-    else { len as i64 + init + 1 }
+    if init > 0 {
+        init
+    } else if init == 0 || -init > len as i64 {
+        1
+    } else {
+        len as i64 + init + 1
+    }
 }
 
 /// Returns the unpacked values and the byte position just past the last one
@@ -318,9 +345,7 @@ pub fn unpack(fmt: &str, data: &[u8], start: i64) -> Result<(Vec<PackValue>, usi
                 pos += len;
             }
             Opt::ZStr => {
-                let end = data[pos..].iter().position(|&b| b == 0)
-                    .map(|p| pos + p)
-                    .ok_or_else(|| format!("{WHO}: unfinished string for format 'z'"))?;
+                let end = data[pos..].iter().position(|&b| b == 0).map(|p| pos + p).ok_or_else(|| format!("{WHO}: unfinished string for format 'z'"))?;
                 results.push(PackValue::Str(data[pos..end].to_vec()));
                 pos += end - pos + 1;
             }
@@ -344,8 +369,7 @@ pub fn packsize(fmt: &str) -> Result<usize, String> {
         if opt == Opt::LenStr || opt == Opt::ZStr {
             return Err(format!("{WHO}: variable-length format"));
         }
-        total = total.checked_add(ntoalign + size)
-            .ok_or_else(|| format!("{WHO}: format result too large"))?;
+        total = total.checked_add(ntoalign + size).ok_or_else(|| format!("{WHO}: format result too large"))?;
     }
     Ok(total)
 }

@@ -30,7 +30,9 @@ fn api_docs(api_rs: &str) -> HashMap<String, Vec<String>> {
 
 fn emit_doc(out: &mut String, docs: &HashMap<String, Vec<String>>, name: &str) {
     let Some(lines) = docs.get(name) else { return };
-    if lines.is_empty() { return; }
+    if lines.is_empty() {
+        return;
+    }
     if lines.len() == 1 {
         out.push_str(&format!("/** {} */\n", lines[0]));
     } else {
@@ -45,8 +47,7 @@ fn emit_doc(out: &mut String, docs: &HashMap<String, Vec<String>>, name: &str) {
 fn main() {
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let out = std::path::PathBuf::from(&crate_dir).join("umbra.h");
-    let api_rs = std::fs::read_to_string(std::path::Path::new(&crate_dir).join("src/api.rs"))
-        .expect("failed to read src/api.rs");
+    let api_rs = std::fs::read_to_string(std::path::Path::new(&crate_dir).join("src/api.rs")).expect("failed to read src/api.rs");
     let docs = api_docs(&api_rs);
 
     let mut header = String::from(
@@ -110,10 +111,8 @@ typedef enum {
     ];
 
     // Blank lines group the decls the way the old hand-written header did.
-    const BREAK_BEFORE: &[&str] = &[
-        "umbra_gettop", "umbra_pushnil", "umbra_type", "umbra_tonumber",
-        "umbra_getglobal", "umbra_dostring", "umbra_register", "umbra_gc_collect",
-    ];
+    const BREAK_BEFORE: &[&str] =
+        &["umbra_gettop", "umbra_pushnil", "umbra_type", "umbra_tonumber", "umbra_getglobal", "umbra_dostring", "umbra_register", "umbra_gc_collect"];
 
     for (name, decl) in DECLS {
         if BREAK_BEFORE.contains(name) {

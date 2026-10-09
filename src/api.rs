@@ -1,8 +1,8 @@
 #![allow(non_snake_case)] // U is the Lua-style state pointer convention throughout this file
 
-use std::ffi::{c_char, c_double, c_int, CStr};
-use crate::vm::{Vm, VmError, VmResult};
 use crate::value::Value;
+use crate::vm::{Vm, VmError, VmResult};
+use std::ffi::{CStr, c_char, c_double, c_int};
 
 // The host's value stack (vm.host_stack) and the current C-call frame base
 // (vm.api_base) both live on the Vm, so the state is nothing but a Vm. That
@@ -29,8 +29,12 @@ impl UmbraState {
         UmbraState { vm: Vm::new() }
     }
 
-    fn stack(&self) -> &Vec<Value> { &self.vm.host_stack }
-    fn stack_mut(&mut self) -> &mut Vec<Value> { &mut self.vm.host_stack }
+    fn stack(&self) -> &Vec<Value> {
+        &self.vm.host_stack
+    }
+    fn stack_mut(&mut self) -> &mut Vec<Value> {
+        &mut self.vm.host_stack
+    }
 
     fn abs_idx(&self, idx: c_int) -> Option<usize> {
         let len = self.stack().len();
@@ -99,7 +103,11 @@ pub extern "C" fn umbra_newstate() -> *mut UmbraState {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_close(U: *mut UmbraState) {
     // SAFETY: the U contract; U came from Box::into_raw in umbra_newstate.
-    if !U.is_null() { unsafe { drop(Box::from_raw(U)); } }
+    if !U.is_null() {
+        unsafe {
+            drop(Box::from_raw(U));
+        }
+    }
 }
 
 /// Number of values on the stack in the current C-call frame.
@@ -129,23 +137,31 @@ pub unsafe extern "C" fn umbra_settop(U: *mut UmbraState, idx: c_int) {
 /// Pop n values from the stack.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pop(U: *mut UmbraState, n: c_int) {
-    if n <= 0 { return; }
+    if n <= 0 {
+        return;
+    }
     // SAFETY: the U contract.
-    unsafe { umbra_settop(U, -n); }
+    unsafe {
+        umbra_settop(U, -n);
+    }
 }
 
 /// Push nil (the `none` value). Stack: +1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pushnil(U: *mut UmbraState) {
     // SAFETY: the U contract.
-    unsafe { (*U).stack_mut().push(Value::nil()); }
+    unsafe {
+        (*U).stack_mut().push(Value::nil());
+    }
 }
 
 /// Push a float. Stack: +1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pushnumber(U: *mut UmbraState, n: c_double) {
     // SAFETY: the U contract.
-    unsafe { (*U).stack_mut().push(Value::float(n)); }
+    unsafe {
+        (*U).stack_mut().push(Value::float(n));
+    }
 }
 
 /// Push an integer (heap-boxed if outside the 48-bit inline range). Stack: +1.
@@ -161,7 +177,9 @@ pub unsafe extern "C" fn umbra_pushinteger(U: *mut UmbraState, n: i64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_pushboolean(U: *mut UmbraState, b: c_int) {
     // SAFETY: the U contract.
-    unsafe { (*U).stack_mut().push(Value::bool(b != 0)); }
+    unsafe {
+        (*U).stack_mut().push(Value::bool(b != 0));
+    }
 }
 
 /// Push a NUL-terminated string (interned); NULL pushes nil. Stack: +1.
@@ -183,13 +201,27 @@ pub unsafe extern "C" fn umbra_pushstring(U: *mut UmbraState, s: *const c_char) 
 pub unsafe extern "C" fn umbra_type(U: *const UmbraState, idx: c_int) -> c_int {
     // SAFETY: the U contract.
     let v = unsafe { (*U).get(idx) };
-    if v.is_nil()    { return 0; }
-    if v.is_bool()   { return 1; }
-    if v.is_int_like() { return 2; }
-    if v.is_float()  { return 3; }
-    if v.is_string() { return 4; }
-    if v.is_table()  { return 5; }
-    if v.is_coroutine() { return 7; }
+    if v.is_nil() {
+        return 0;
+    }
+    if v.is_bool() {
+        return 1;
+    }
+    if v.is_int_like() {
+        return 2;
+    }
+    if v.is_float() {
+        return 3;
+    }
+    if v.is_string() {
+        return 4;
+    }
+    if v.is_table() {
+        return 5;
+    }
+    if v.is_coroutine() {
+        return 7;
+    }
     6
 }
 
@@ -228,9 +260,13 @@ pub unsafe extern "C" fn umbra_isfunction(U: *const UmbraState, idx: c_int) -> c
 pub unsafe extern "C" fn umbra_tonumber(U: *const UmbraState, idx: c_int) -> c_double {
     // SAFETY: the U contract.
     let v = unsafe { (*U).get(idx) };
-    if v.is_float() { v.as_float().unwrap() }
-    else if v.is_int_like() { v.as_int().unwrap() as c_double }
-    else { 0.0 }
+    if v.is_float() {
+        v.as_float().unwrap()
+    } else if v.is_int_like() {
+        v.as_int().unwrap() as c_double
+    } else {
+        0.0
+    }
 }
 
 /// Value at idx as an i64 (floats truncate); 0 for non-numbers.
@@ -238,9 +274,13 @@ pub unsafe extern "C" fn umbra_tonumber(U: *const UmbraState, idx: c_int) -> c_d
 pub unsafe extern "C" fn umbra_tointeger(U: *const UmbraState, idx: c_int) -> i64 {
     // SAFETY: the U contract.
     let v = unsafe { (*U).get(idx) };
-    if v.is_int_like() { v.as_int().unwrap() }
-    else if v.is_float() { v.as_float().unwrap() as i64 }
-    else { 0 }
+    if v.is_int_like() {
+        v.as_int().unwrap()
+    } else if v.is_float() {
+        v.as_float().unwrap() as i64
+    } else {
+        0
+    }
 }
 
 /// Value at idx as a boolean under umbra truthiness (nil and false are false).
@@ -260,11 +300,7 @@ pub unsafe extern "C" fn umbra_tostring(U: *const UmbraState, idx: c_int) -> *co
     // SAFETY: the U contract.
     let s = unsafe { &*U };
     let v = s.get(idx);
-    if v.is_string() {
-        s.vm.gc.str_c_ptr(v) as *const c_char
-    } else {
-        std::ptr::null()
-    }
+    if v.is_string() { s.vm.gc.str_c_ptr(v) as *const c_char } else { std::ptr::null() }
 }
 
 /// Push the global named `name` (nil if unset or name is NULL). Stack: +1.
@@ -287,11 +323,7 @@ pub unsafe extern "C" fn umbra_setglobal(U: *mut UmbraState, name: *const c_char
     let state = unsafe { &mut *U };
     // Clamp to the current C frame like settop does: with an empty frame the
     // pop must not steal a slot belonging to the caller's stack.
-    let v = if state.stack().len() > state.vm.api_base {
-        state.stack_mut().pop().unwrap_or(Value::nil())
-    } else {
-        Value::nil()
-    };
+    let v = if state.stack().len() > state.vm.api_base { state.stack_mut().pop().unwrap_or(Value::nil()) } else { Value::nil() };
     // SAFETY: the string contract.
     if let Some(rs) = unsafe { cstr(name) } {
         state.vm.set_global(rs.as_ref(), v);
@@ -316,20 +348,17 @@ pub unsafe extern "C" fn umbra_dostring(U: *mut UmbraState, src: *const c_char) 
     // Inlined run_with_vm so parse/compile failures can report
     // UMBRA_ERR_SYNTAX instead of collapsing into a runtime error.
     let nesting = state.vm.nesting;
-    let outcome: Result<Result<(), (UmbraStatus, VmError)>, _> =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (block, parse_errs) = crate::parse(rs.as_ref());
-            if !parse_errs.is_empty() {
-                let msg = parse_errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
-                return Err((UmbraStatus::SyntaxError, VmError::RuntimeError(msg)));
-            }
-            match crate::compile(block, None) {
-                Err(e) => Err((UmbraStatus::SyntaxError, VmError::RuntimeError(e.to_string()))),
-                Ok(chunk) => state.vm.exec(chunk)
-                    .map(|_| ())
-                    .map_err(|e| (UmbraStatus::RuntimeError, e)),
-            }
-        }));
+    let outcome: Result<Result<(), (UmbraStatus, VmError)>, _> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (block, parse_errs) = crate::parse(rs.as_ref());
+        if !parse_errs.is_empty() {
+            let msg = parse_errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+            return Err((UmbraStatus::SyntaxError, VmError::RuntimeError(msg)));
+        }
+        match crate::compile(block, None) {
+            Err(e) => Err((UmbraStatus::SyntaxError, VmError::RuntimeError(e.to_string()))),
+            Ok(chunk) => state.vm.exec(chunk).map(|_| ()).map_err(|e| (UmbraStatus::RuntimeError, e)),
+        }
+    }));
     match outcome {
         Ok(Ok(())) => UmbraStatus::Ok as c_int,
         Ok(Err((status, e))) => match e {
@@ -369,9 +398,7 @@ pub unsafe extern "C" fn umbra_pcall(U: *mut UmbraState, nargs: c_int, nres: c_i
 
     // An unwind must never reach this extern "C" boundary uncaught.
     let nesting = state.vm.nesting;
-    let result: VmResult<Vec<Value>> = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        state.vm.call_value_isolated(fn_val, &args)
-    })) {
+    let result: VmResult<Vec<Value>> = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.vm.call_value_isolated(fn_val, &args))) {
         Ok(r) => r,
         Err(payload) => {
             state.vm.poison(nesting);
@@ -394,14 +421,18 @@ pub unsafe extern "C" fn umbra_pcall(U: *mut UmbraState, nargs: c_int, nres: c_i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_gc_collect(U: *mut UmbraState) {
     // SAFETY: the U contract.
-    unsafe { (*U).vm.gc_collect(); }
+    unsafe {
+        (*U).vm.gc_collect();
+    }
 }
 
 /// Set the object-count threshold that triggers automatic collection.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_gc_setstep(U: *mut UmbraState, threshold: usize) {
     // SAFETY: the U contract.
-    unsafe { (*U).vm.gc.threshold = threshold; }
+    unsafe {
+        (*U).vm.gc.threshold = threshold;
+    }
 }
 
 /// Bounds how many bytecode instructions a script may run before erroring
@@ -410,7 +441,9 @@ pub unsafe extern "C" fn umbra_gc_setstep(U: *mut UmbraState, threshold: usize) 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_set_step_limit(U: *mut UmbraState, limit: u64) {
     // SAFETY: the U contract.
-    unsafe { (*U).vm.set_step_limit(limit); }
+    unsafe {
+        (*U).vm.set_step_limit(limit);
+    }
 }
 
 /// Host-only hard ceiling on live GC-tracked objects (0 = unlimited); exceeding
@@ -419,7 +452,9 @@ pub unsafe extern "C" fn umbra_set_step_limit(U: *mut UmbraState, limit: u64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umbra_set_max_objects(U: *mut UmbraState, limit: usize) {
     // SAFETY: the U contract.
-    unsafe { (*U).vm.set_max_objects(limit); }
+    unsafe {
+        (*U).vm.set_max_objects(limit);
+    }
 }
 
 /// Number of live GC-tracked objects.
@@ -435,11 +470,7 @@ pub unsafe extern "C" fn umbra_gc_livecount(U: *const UmbraState) -> usize {
 // whatever f leaves on the stack beyond its declared results is discarded.
 // A returned count larger than what f actually pushed is clamped to the frame.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn umbra_register(
-    U: *mut UmbraState,
-    name: *const c_char,
-    f: UmbraCFunction,
-) {
+pub unsafe extern "C" fn umbra_register(U: *mut UmbraState, name: *const c_char, f: UmbraCFunction) {
     // SAFETY: the U contract.
     let state = unsafe { &mut *U };
     // Option<fn> is ABI-identical to a raw pointer: a C host passing NULL
@@ -474,10 +505,6 @@ pub unsafe extern "C" fn umbra_register(
         let api_base = s.vm.api_base;
         s.stack_mut().truncate(api_base);
         s.vm.api_base = old_base;
-        if nret < 0 {
-            Err(VmError::RuntimeError("C function signalled error".into()))
-        } else {
-            Ok(results)
-        }
+        if nret < 0 { Err(VmError::RuntimeError("C function signalled error".into())) } else { Ok(results) }
     });
 }

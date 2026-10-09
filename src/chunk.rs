@@ -6,13 +6,34 @@ use std::cell::Cell;
 
 pub const BIAS: i32 = 32767;
 
-#[inline(always)] pub fn iop(i: u32)   -> u8    { (i & 0xFF) as u8 }
-#[inline(always)] pub fn ia(i: u32)    -> usize { ((i >> 8)  & 0xFF) as usize }
-#[inline(always)] pub fn ib(i: u32)    -> usize { ((i >> 16) & 0xFF) as usize }
-#[inline(always)] pub fn ic(i: u32)    -> usize { ((i >> 24) & 0xFF) as usize }
-#[inline(always)] pub fn ibx(i: u32)   -> usize { ((i >> 16) & 0xFFFF) as usize }
-#[inline(always)] pub fn isbx(i: u32)  -> i32   { ((i >> 16) as u16 as i32) - BIAS }
-#[inline(always)] pub fn ici(i: u32)   -> i64   { (i >> 24) as u8 as i8 as i64 }
+#[inline(always)]
+pub fn iop(i: u32) -> u8 {
+    (i & 0xFF) as u8
+}
+#[inline(always)]
+pub fn ia(i: u32) -> usize {
+    ((i >> 8) & 0xFF) as usize
+}
+#[inline(always)]
+pub fn ib(i: u32) -> usize {
+    ((i >> 16) & 0xFF) as usize
+}
+#[inline(always)]
+pub fn ic(i: u32) -> usize {
+    ((i >> 24) & 0xFF) as usize
+}
+#[inline(always)]
+pub fn ibx(i: u32) -> usize {
+    ((i >> 16) & 0xFFFF) as usize
+}
+#[inline(always)]
+pub fn isbx(i: u32) -> i32 {
+    ((i >> 16) as u16 as i32) - BIAS
+}
+#[inline(always)]
+pub fn ici(i: u32) -> i64 {
+    (i >> 24) as u8 as i8 as i64
+}
 
 #[inline(always)]
 pub fn enc_abc(op: Op, a: u8, b: u8, c: u8) -> u32 {
@@ -36,15 +57,27 @@ pub enum Op {
     LoadK,
     Move,
 
-    Add, Sub, Mul, Div, IDiv, Mod, Pow,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    IDiv,
+    Mod,
+    Pow,
     Unm,
-    BAnd, BOr, BXor, Shl, Shr,
+    BAnd,
+    BOr,
+    BXor,
+    Shl,
+    Shr,
     BNot,
     Concat,
     Len,
     Not,
 
-    Eq, Lt, Le,
+    Eq,
+    Lt,
+    Le,
 
     Test,
     TestSet,
@@ -130,8 +163,14 @@ impl Op {
 }
 
 pub const RK_BIT: usize = 0x80;
-#[inline(always)] pub fn is_rk(x: usize) -> bool { x & RK_BIT != 0 }
-#[inline(always)] pub fn rk_idx(x: usize) -> usize { x & !RK_BIT }
+#[inline(always)]
+pub fn is_rk(x: usize) -> bool {
+    x & RK_BIT != 0
+}
+#[inline(always)]
+pub fn rk_idx(x: usize) -> usize {
+    x & !RK_BIT
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Const {
@@ -159,16 +198,24 @@ impl StrConst {
         StrConst { s, cached: Cell::new((0, 0)) }
     }
 
-    pub fn cached(&self) -> (u64, u64) { self.cached.get() }
-    pub fn set_cached(&self, owner: u64, bits: u64) { self.cached.set((owner, bits)); }
+    pub fn cached(&self) -> (u64, u64) {
+        self.cached.get()
+    }
+    pub fn set_cached(&self, owner: u64, bits: u64) {
+        self.cached.set((owner, bits));
+    }
 }
 
 impl Clone for StrConst {
-    fn clone(&self) -> Self { StrConst::new(self.s.clone()) }
+    fn clone(&self) -> Self {
+        StrConst::new(self.s.clone())
+    }
 }
 
 impl PartialEq for StrConst {
-    fn eq(&self, other: &Self) -> bool { self.s == other.s }
+    fn eq(&self, other: &Self) -> bool {
+        self.s == other.s
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -287,13 +334,16 @@ impl Proto {
 
     pub(crate) fn add_const(&mut self, c: Const) -> usize {
         for (i, existing) in self.consts.iter().enumerate() {
-            if *existing == c { return i; }
+            if *existing == c {
+                return i;
+            }
         }
         let i = self.consts.len();
         self.consts.push(c);
         i
     }
 
-
-    pub(crate) fn current_pc(&self) -> usize { self.code.len() }
+    pub(crate) fn current_pc(&self) -> usize {
+        self.code.len()
+    }
 }

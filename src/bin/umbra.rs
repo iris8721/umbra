@@ -126,7 +126,9 @@ fn repl() {
             Ok(_) => {}
         }
         let src = line.trim();
-        if src.is_empty() { continue; }
+        if src.is_empty() {
+            continue;
+        }
         // A bare expression isn't a statement; retry it as `return <line>`
         // so `1+1` prints 2 instead of a parse error.
         let src = match umbra::parse(src) {
@@ -138,7 +140,9 @@ fn repl() {
                 let mut cx = vm.ctx();
                 // The chunk's results are reachable from nothing once it
                 // returned, and a __tostring can collect: root them first.
-                for &v in &vals { cx.root(v); }
+                for &v in &vals {
+                    cx.root(v);
+                }
                 let tostring = cx.get_global("tostring");
                 let mut out = Vec::with_capacity(vals.len());
                 for v in vals {

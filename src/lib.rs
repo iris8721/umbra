@@ -1,9 +1,9 @@
 pub mod api;
 pub mod ast;
-pub mod gc;
 pub mod chunk;
 pub mod compiler;
 pub mod embed;
+pub mod gc;
 mod heap;
 pub mod lexer;
 pub mod pack;
@@ -12,8 +12,8 @@ pub mod pattern;
 pub mod value;
 pub mod vm;
 
-pub use parser::parse;
 pub use compiler::compile;
+pub use parser::parse;
 
 pub fn run(src: &str) -> Result<(), String> {
     run_with_vm(src, &mut vm::Vm::new())
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn parse_binary_precedence() {
-        use ast::{Expr, Binop};
+        use ast::{Binop, Expr};
         let (block, errs) = parse("let _ = 1 + 2 * 3");
         assert!(errs.is_empty(), "{:?}", errs);
         if let ast::Stmt::Local { values, .. } = &block.stmts[0] {
@@ -188,8 +188,7 @@ mod tests {
     #[test]
     fn value_int_roundtrip() {
         use value::Value;
-        for n in [0i64, 1, -1, 42, -42, i32::MAX as i64, i32::MIN as i64,
-                  (1i64 << 47) - 1, -((1i64 << 47))] {
+        for n in [0i64, 1, -1, 42, -42, i32::MAX as i64, i32::MIN as i64, (1i64 << 47) - 1, -(1i64 << 47)] {
             let v = Value::int(n);
             assert!(v.is_int(), "n={n}");
             assert_eq!(v.as_int(), Some(n), "n={n}");
@@ -199,8 +198,7 @@ mod tests {
     #[test]
     fn value_float_roundtrip() {
         use value::Value;
-        for f in [0.0f64, 1.0, -1.0, 3.14, f64::INFINITY, f64::NEG_INFINITY,
-                  f64::MAX, f64::MIN_POSITIVE] {
+        for f in [0.0f64, 1.0, -1.0, 3.14, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, f64::MIN_POSITIVE] {
             let v = Value::float(f);
             assert!(v.is_float(), "f={f}");
             assert_eq!(v.as_float().unwrap().to_bits(), f.to_bits(), "f={f}");
@@ -241,10 +239,10 @@ mod tests {
     #[test]
     fn value_type_names() {
         use value::Value;
-        assert_eq!(Value::nil().type_name(),       "none");
-        assert_eq!(Value::bool(true).type_name(),  "boolean");
-        assert_eq!(Value::int(0).type_name(),       "integer");
-        assert_eq!(Value::float(1.0).type_name(),   "float");
+        assert_eq!(Value::nil().type_name(), "none");
+        assert_eq!(Value::bool(true).type_name(), "boolean");
+        assert_eq!(Value::int(0).type_name(), "integer");
+        assert_eq!(Value::float(1.0).type_name(), "float");
     }
 
     fn capture(src: &str) -> Vec<String> {
@@ -262,12 +260,12 @@ mod tests {
 
     #[test]
     fn vm_arithmetic() {
-        assert_output("print(1 + 2)",   &["3"]);
-        assert_output("print(10 - 3)",  &["7"]);
-        assert_output("print(2 * 6)",   &["12"]);
-        assert_output("print(7 / 2)",   &["3.5"]);
-        assert_output("print(10 % 3)",  &["1"]);
-        assert_output("print(2 ^ 10)",  &["1024.0"]);
+        assert_output("print(1 + 2)", &["3"]);
+        assert_output("print(10 - 3)", &["7"]);
+        assert_output("print(2 * 6)", &["12"]);
+        assert_output("print(7 / 2)", &["3.5"]);
+        assert_output("print(10 % 3)", &["1"]);
+        assert_output("print(2 ^ 10)", &["1024.0"]);
     }
 
     #[test]
@@ -353,9 +351,10 @@ mod tests {
         // Lua's get2digits caps width/precision at two digits.
         assert!(run("string.format(\"%999999999999d\", 1)").is_err());
         assert!(run("string.format(\"%.100f\", 1.5)").is_err());
-        assert_output("print(string.format(\"%99d\", 1))", &[
-            "                                                                                                  1",
-        ]);
+        assert_output(
+            "print(string.format(\"%99d\", 1))",
+            &["                                                                                                  1"],
+        );
     }
 
     #[test]
@@ -591,15 +590,9 @@ mod tests {
             print(b)",
             &["7", "9"],
         );
-        assert_output(
-            "let a, b = string.find(\"abc\", \"^a\")\nprint(a)\nprint(b)",
-            &["1", "1"],
-        );
+        assert_output("let a, b = string.find(\"abc\", \"^a\")\nprint(a)\nprint(b)", &["1", "1"]);
         assert_output(r#"print(string.find("abc", "^b"))"#, &["none"]);
-        assert_output(
-            "let a, b = string.find(\"abc\", \"c$\")\nprint(a)\nprint(b)",
-            &["3", "3"],
-        );
+        assert_output("let a, b = string.find(\"abc\", \"c$\")\nprint(a)\nprint(b)", &["3", "3"]);
     }
 
     #[test]
@@ -621,10 +614,7 @@ mod tests {
             print(d)"#,
             &["2026", "07", "19"],
         );
-        assert_output(
-            "let a, b = string.match(\"hello\", \"()ll()\")\nprint(a)\nprint(b)",
-            &["3", "5"],
-        );
+        assert_output("let a, b = string.match(\"hello\", \"()ll()\")\nprint(a)\nprint(b)", &["3", "5"]);
     }
 
     #[test]
@@ -773,12 +763,7 @@ mod tests {
         let mut vm = vm::Vm::new_with_print(move |text, newline| log2.lock().unwrap().push((text.to_owned(), newline)));
         run_with_vm("io.write(\"a\", 1)\nio.write(\"b\\n\")\nprint(\"c\", 2)\nio.write()", &mut vm).unwrap();
         let got = log.lock().unwrap().clone();
-        assert_eq!(got, [
-            ("a1".to_owned(), false),
-            ("b\n".to_owned(), false),
-            ("c\t2".to_owned(), true),
-            (String::new(), false),
-        ]);
+        assert_eq!(got, [("a1".to_owned(), false), ("b\n".to_owned(), false), ("c\t2".to_owned(), true), (String::new(), false),]);
     }
 
     #[test]
@@ -792,18 +777,12 @@ mod tests {
 
     #[test]
     fn os_getenv_returns_nil_for_unset_var() {
-        assert_output(
-            "print(os.getenv(\"UMBRA_DEFINITELY_UNSET_VAR_XYZ\"))",
-            &["none"],
-        );
+        assert_output("print(os.getenv(\"UMBRA_DEFINITELY_UNSET_VAR_XYZ\"))", &["none"]);
     }
 
     #[test]
     fn os_date_from_script_with_explicit_epoch() {
-        assert_output(
-            "print(os.date(\"%Y-%m-%d\", 0))",
-            &["1970-01-01"],
-        );
+        assert_output("print(os.date(\"%Y-%m-%d\", 0))", &["1970-01-01"]);
     }
 
     #[test]
@@ -820,8 +799,9 @@ mod tests {
             while i < 5000 {
                 let junk = {i, i, i}
                 i = i + 1
-            }"
-        ).unwrap();
+            }",
+        )
+        .unwrap();
         assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
         let live = unsafe { api::umbra_gc_livecount(U) };
         assert!(live < 5000, "expected auto-GC to keep live count well below total allocations, got {live}");
@@ -977,8 +957,9 @@ print(pcall(f))"#,
             while true {
                 arr[i] = {1, 2, 3}
                 i = i + 1
-            }"
-        ).unwrap();
+            }",
+        )
+        .unwrap();
         let rc = unsafe { api::umbra_dostring(U, src.as_ptr()) };
         assert_eq!(rc, 1);
         unsafe { api::umbra_close(U) };
@@ -1279,58 +1260,37 @@ print(pcall(f))"#,
 
     #[test]
     fn vm_while_loop() {
-        assert_output(
-            "var i = 0 var s = 0 while i < 5 { i = i + 1 s = s + i } print(s)",
-            &["15"],
-        );
+        assert_output("var i = 0 var s = 0 while i < 5 { i = i + 1 s = s + i } print(s)", &["15"]);
     }
 
     #[test]
     fn vm_for_numeric() {
-        assert_output(
-            "var s = 0 for i = 1, 10 { s = s + i } print(s)",
-            &["55"],
-        );
+        assert_output("var s = 0 for i = 1, 10 { s = s + i } print(s)", &["55"]);
     }
 
     #[test]
     fn vm_for_step() {
-        assert_output(
-            "var s = 0 for i = 0, 10, 2 { s = s + i } print(s)",
-            &["30"],
-        );
+        assert_output("var s = 0 for i = 0, 10, 2 { s = s + i } print(s)", &["30"]);
     }
 
     #[test]
     fn vm_function_call_and_return() {
-        assert_output(
-            "let fn add(a, b) { return a + b } print(add(3, 4))",
-            &["7"],
-        );
+        assert_output("let fn add(a, b) { return a + b } print(add(3, 4))", &["7"]);
     }
 
     #[test]
     fn vm_implicit_return() {
-        assert_output(
-            "fn double(x) { x * 2 } print(double(21))",
-            &["42"],
-        );
+        assert_output("fn double(x) { x * 2 } print(double(21))", &["42"]);
     }
 
     #[test]
     fn vm_closure_shorthand() {
-        assert_output(
-            "let sq = |x| x * x print(sq(9))",
-            &["81"],
-        );
+        assert_output("let sq = |x| x * x print(sq(9))", &["81"]);
     }
 
     #[test]
     fn vm_recursion() {
-        assert_output(
-            "fn fact(n) { if n <= 1 { return 1 } return n * fact(n - 1) } print(fact(10))",
-            &["3628800"],
-        );
+        assert_output("fn fact(n) { if n <= 1 { return 1 } return n * fact(n - 1) } print(fact(10))", &["3628800"]);
     }
 
     #[test]
@@ -1409,18 +1369,12 @@ print(pcall(f))"#,
 
     #[test]
     fn vm_table_basic() {
-        assert_output(
-            "let t = {} t.x = 10 t.y = 20 print(t.x + t.y)",
-            &["30"],
-        );
+        assert_output("let t = {} t.x = 10 t.y = 20 print(t.x + t.y)", &["30"]);
     }
 
     #[test]
     fn vm_table_array() {
-        assert_output(
-            "let t = {10, 20, 30} print(t[1] + t[2] + t[3])",
-            &["60"],
-        );
+        assert_output("let t = {10, 20, 30} print(t[1] + t[2] + t[3])", &["60"]);
     }
 
     #[test]
@@ -1734,10 +1688,7 @@ print(pcall(f))"#,
 
     #[test]
     fn vm_closures() {
-        assert_output(
-            "let fn make() { let fn f(x) { return x * 2 } return f } let g = make() print(g(21))",
-            &["42"],
-        );
+        assert_output("let fn make() { let fn f(x) { return x * 2 } return f } let g = make() print(g(21))", &["42"]);
     }
 
     #[test]
@@ -1825,9 +1776,7 @@ print(pcall(f))"#,
 
         let U = api::umbra_newstate();
 
-        let src = CString::new(
-            r#"let a = "gc_test_alpha" let b = "gc_test_beta" let c = a .. b"#
-        ).unwrap();
+        let src = CString::new(r#"let a = "gc_test_alpha" let b = "gc_test_beta" let c = a .. b"#).unwrap();
         unsafe { api::umbra_dostring(U, src.as_ptr()) };
 
         let before = unsafe { api::umbra_gc_livecount(U) };
@@ -2013,15 +1962,7 @@ print(coroutine.resume(co))
 let w2 = coroutine.wrap(tostring)
 print(w2(42))
 "#,
-            &[
-                "a\tb",
-                "suspended",
-                "x",
-                "true",
-                "dead",
-                "false\tcannot resume dead coroutine",
-                "42",
-            ],
+            &["a\tb", "suspended", "x", "true", "dead", "false\tcannot resume dead coroutine", "42"],
         );
     }
 
@@ -2298,8 +2239,8 @@ print(obj:greet())
 
     #[test]
     fn mt_gc_finalizer() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
 
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
@@ -2310,7 +2251,8 @@ print(obj:greet())
             r#"gcfired = false
 gcobj = setmetatable({}, { __gc = fn(self) { gcfired = true } })"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
 
         run_with_vm("gcobj = none", &mut vm).unwrap();
 
@@ -2325,8 +2267,7 @@ gcobj = setmetatable({}, { __gc = fn(self) { gcfired = true } })"#,
         use std::ffi::CString;
         use std::sync::{Arc, Mutex};
 
-        static CALLED_WITH: std::sync::OnceLock<Arc<Mutex<Vec<f64>>>> =
-            std::sync::OnceLock::new();
+        static CALLED_WITH: std::sync::OnceLock<Arc<Mutex<Vec<f64>>>> = std::sync::OnceLock::new();
         let log = Arc::new(Mutex::new(Vec::new()));
         CALLED_WITH.get_or_init(|| log.clone());
 
@@ -2681,8 +2622,11 @@ print(co())
 
     #[test]
     fn stdlib_string_find() {
-        assert_output(r#"let s, e = string.find("hello world", "world")
-print(s, e)"#, &["7\t11"]);
+        assert_output(
+            r#"let s, e = string.find("hello world", "world")
+print(s, e)"#,
+            &["7\t11"],
+        );
         assert_output(r#"print(string.find("hello", "xyz"))"#, &["none"]);
     }
 
@@ -2699,8 +2643,11 @@ print(s, e)"#, &["7\t11"]);
     fn string_method_call() {
         assert_output(r#"print(("hello"):upper())"#, &["HELLO"]);
         assert_output(r#"print(("world"):sub(1, 3))"#, &["wor"]);
-        assert_output(r#"let s = "hello"
-print(s:len())"#, &["5"]);
+        assert_output(
+            r#"let s = "hello"
+print(s:len())"#,
+            &["5"],
+        );
     }
 
     #[test]
@@ -2736,43 +2683,65 @@ print(s:len())"#, &["5"]);
 
     #[test]
     fn stdlib_table_insert() {
-        assert_output(r#"let t = {1, 2, 3}
+        assert_output(
+            r#"let t = {1, 2, 3}
 table.insert(t, 4)
-print(#t, t[4])"#, &["4\t4"]);
-        assert_output(r#"let t = {1, 2, 3}
+print(#t, t[4])"#,
+            &["4\t4"],
+        );
+        assert_output(
+            r#"let t = {1, 2, 3}
 table.insert(t, 2, 10)
-print(t[1], t[2], t[3], t[4])"#, &["1\t10\t2\t3"]);
+print(t[1], t[2], t[3], t[4])"#,
+            &["1\t10\t2\t3"],
+        );
     }
 
     #[test]
     fn stdlib_table_remove() {
-        assert_output(r#"let t = {10, 20, 30}
+        assert_output(
+            r#"let t = {10, 20, 30}
 let v = table.remove(t)
-print(v, #t)"#, &["30\t2"]);
-        assert_output(r#"let t = {10, 20, 30}
+print(v, #t)"#,
+            &["30\t2"],
+        );
+        assert_output(
+            r#"let t = {10, 20, 30}
 let v = table.remove(t, 2)
-print(v, t[1], t[2])"#, &["20\t10\t30"]);
+print(v, t[1], t[2])"#,
+            &["20\t10\t30"],
+        );
     }
 
     #[test]
     fn stdlib_table_concat() {
-        assert_output(r#"let t = {"a", "b", "c"}
-print(table.concat(t, "-"))"#, &["a-b-c"]);
+        assert_output(
+            r#"let t = {"a", "b", "c"}
+print(table.concat(t, "-"))"#,
+            &["a-b-c"],
+        );
     }
 
     #[test]
     fn stdlib_table_sort() {
-        assert_output(r#"let t = {3, 1, 4, 1, 5, 9, 2, 6}
+        assert_output(
+            r#"let t = {3, 1, 4, 1, 5, 9, 2, 6}
 table.sort(t)
-print(t[1], t[2], t[3], t[8])"#, &["1\t1\t2\t9"]);
-        assert_output(r#"let t = {3, 1, 2}
+print(t[1], t[2], t[3], t[8])"#,
+            &["1\t1\t2\t9"],
+        );
+        assert_output(
+            r#"let t = {3, 1, 2}
 table.sort(t, fn(a, b) { a > b })
-print(t[1], t[2], t[3])"#, &["3\t2\t1"]);
+print(t[1], t[2], t[3])"#,
+            &["3\t2\t1"],
+        );
     }
 
     #[test]
     fn coroutine_resume_yield_values() {
-        assert_output(r#"let co = coroutine.create(fn() {
+        assert_output(
+            r#"let co = coroutine.create(fn() {
     let x = yield(1)
     let y = yield(2)
     print(x, y)
@@ -2780,13 +2749,15 @@ print(t[1], t[2], t[3])"#, &["3\t2\t1"]);
 coroutine.resume(co)
 coroutine.resume(co, 10)
 coroutine.resume(co, 20)
-"#, &["10\t20"]);
+"#,
+            &["10\t20"],
+        );
     }
 
     #[test]
     fn gc_finalizer_closure_and_fields_survive_until_it_runs() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
 
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
@@ -2799,7 +2770,8 @@ coroutine.resume(co, 20)
 let tag = "tagged"
 gcobj = setmetatable({ payload = {1, 2, 3} }, { __gc = fn(self) { seen = tag .. ":" .. #self.payload } })"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         run_with_vm("gcobj = none", &mut vm).unwrap();
         vm.gc_collect();
         run_with_vm("print(seen)", &mut vm).unwrap();
@@ -2808,8 +2780,8 @@ gcobj = setmetatable({ payload = {1, 2, 3} }, { __gc = fn(self) { seen = tag .. 
 
     #[test]
     fn gc_finalizer_runs_once_per_object_with_shared_metatable() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
 
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
@@ -2821,7 +2793,8 @@ let mt = { __gc = fn(self) { count = count + 1 } }
 objs = {}
 for i = 1, 5 { objs[i] = setmetatable({}, mt) }"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         run_with_vm("objs = none", &mut vm).unwrap();
         vm.gc_collect();
         vm.gc_collect();
@@ -2831,8 +2804,8 @@ for i = 1, 5 { objs[i] = setmetatable({}, mt) }"#,
 
     #[test]
     fn gc_nested_collection_inside_a_finalizer_keeps_pending_finalizers_alive() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
 
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
@@ -2851,7 +2824,8 @@ let mt = { __gc = fn(self) {
 objs = {}
 for i = 1, 8 { objs[i] = setmetatable({ i }, mt) }"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         run_with_vm("objs = none", &mut vm).unwrap();
         vm.gc_collect();
         run_with_vm("print(count)", &mut vm).unwrap();
@@ -2913,8 +2887,9 @@ for i = 1, 8 { objs[i] = setmetatable({ i }, mt) }"#,
                 for i = 1, 200 { junk[i] = {} }
             })
             coroutine.resume(co)
-            co = none"
-        ).unwrap();
+            co = none",
+        )
+        .unwrap();
         assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
         unsafe { api::umbra_gc_collect(U) };
         let live = unsafe { api::umbra_gc_livecount(U) };
@@ -2935,7 +2910,8 @@ for i = 1, 200 {
     assert(f("aa" .. i, "bb" .. i, "cc" .. i, "dd" .. i, "ee" .. i) == "aa" .. i .. "bb" .. i .. "cc" .. i .. "dd" .. i .. "ee" .. i)
 }"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2954,8 +2930,8 @@ for i, v in step, 3, 0 { print(i, v) }"#,
 
     #[test]
     fn gc_varargs_are_roots() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
@@ -2972,14 +2948,15 @@ fn f(...) {
 f(setmetatable({x = 7}, mt), setmetatable({x = 8}, mt))
 print(finalized)"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(*log.lock().unwrap(), vec!["7", "0"]);
     }
 
     #[test]
     fn gc_frame_top_results_are_roots() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
@@ -2996,15 +2973,16 @@ fn many() {
 print(many())
 print(finalized)"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         let lines = log.lock().unwrap().clone();
         assert_eq!(lines.last().unwrap(), "0", "live call results were finalized early: {lines:?}");
     }
 
     #[test]
     fn gc_weak_key_entry_whose_value_keeps_its_key_is_collected() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
@@ -3014,21 +2992,23 @@ var k = {}
 wt[k] = { owner = k }
 k = none"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         vm.gc_collect();
         run_with_vm(
             "var n = 0
 for k, v in pairs(wt) { n = n + 1 }
 print(n)",
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(*log.lock().unwrap(), vec!["0"]);
     }
 
     #[test]
     fn gc_finalizers_queued_during_a_drain_run_on_later_collects() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
@@ -3057,18 +3037,19 @@ mt = { __gc = fn(self) {
 var t = setmetatable({}, mt)
 t = none"#,
             &mut vm,
-        ).unwrap();
-        for _ in 0..8 { vm.gc_collect(); }
+        )
+        .unwrap();
+        for _ in 0..8 {
+            vm.gc_collect();
+        }
         run_with_vm("print(depth, made)", &mut vm).unwrap();
         assert_eq!(*log.lock().unwrap(), vec!["13\t12"]);
     }
 
-
-
     #[test]
     fn gc_varargs_survive_collection_inside_pcall() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
@@ -3086,15 +3067,15 @@ fn f(...) {
 f(setmetatable({x = 7}, mt))
 print(finalized)"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(*log.lock().unwrap(), vec!["7", "0"]);
     }
 
-
     #[test]
     fn gc_finalizer_can_resurrect_its_object() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
@@ -3103,7 +3084,8 @@ print(finalized)"#,
 var t = setmetatable({ x = 42 }, { __gc = fn(self) { saved = self } })
 t = none"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         vm.gc_collect();
         vm.gc_collect();
         run_with_vm("print(saved.x)", &mut vm).unwrap();
@@ -3112,8 +3094,8 @@ t = none"#,
 
     #[test]
     fn gc_suspended_coroutine_varargs_are_roots() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
@@ -3127,7 +3109,8 @@ co = coroutine.create(fn(...) {
 })
 coroutine.resume(co, setmetatable({x = 9}, mt))"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         vm.gc_collect();
         run_with_vm("coroutine.resume(co)\nprint(finalized)", &mut vm).unwrap();
         assert_eq!(*log.lock().unwrap(), vec!["9", "0"]);
@@ -3153,7 +3136,8 @@ t = none
 mt = none
 f = none"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         vm.gc_collect();
         let after = vm.gc.live_count();
         vm.gc_collect();
@@ -3163,7 +3147,6 @@ f = none"#,
         let baseline = vm.gc.live_count();
         assert!(after <= baseline + 4, "cycle leaked: after={after} baseline={baseline}");
     }
-
 
     #[test]
     fn gc_byte_pacing_collects_large_dead_strings() {
@@ -3178,7 +3161,8 @@ f = none"#,
 for i = 1, 20000 { keep[i] = "k" .. i }
 for i = 1, 2000 { let junk = string.rep("x", 4096) }"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         let live = vm.gc.live_count();
         assert!(live < 21500, "dead large strings should have been collected, live={live}");
     }
@@ -3195,7 +3179,8 @@ for i = 1, 2000 { let junk = string.rep("x", 4096) }"#,
     let t = { i, "s" .. i, { nested = i } }
 }"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         vm.gc_collect();
         vm.gc_collect();
         let after = vm.gc.live_count();
@@ -3221,8 +3206,8 @@ print(t[2.5], t[-0.0])"#,
 
     #[test]
     fn gc_unpack_spill_results_are_roots() {
-        use vm::Vm;
         use std::sync::{Arc, Mutex};
+        use vm::Vm;
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let mut vm = Vm::new_with_print(move |l, _| log2.lock().unwrap().push(l.to_owned()));
@@ -3238,7 +3223,8 @@ fn mk() {
 print(unpack(mk()))
 print(finalized)"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         let lines = log.lock().unwrap().clone();
         assert_eq!(lines.last().unwrap(), "0", "live call results were finalized early: {lines:?}");
     }
@@ -3271,10 +3257,7 @@ print(calls)"#,
     #[test]
     fn table_constructor_past_fifty_positional_fields() {
         let items: Vec<String> = (1..=120).map(|i| i.to_string()).collect();
-        assert_output(
-            &format!("let t = {{ {} }}\nprint(#t, t[50], t[51], t[100], t[101], t[120])", items.join(", ")),
-            &["120\t50\t51\t100\t101\t120"],
-        );
+        assert_output(&format!("let t = {{ {} }}\nprint(#t, t[50], t[51], t[100], t[101], t[120])", items.join(", ")), &["120\t50\t51\t100\t101\t120"]);
     }
 
     #[test]
@@ -3282,7 +3265,9 @@ print(calls)"#,
         // More string constants than the 7-bit RK operand can address: the
         // extras must be loaded through a register rather than aliased.
         let mut src = String::from("let t = {}\n");
-        for i in 1..=300 { src.push_str(&format!("t.k{i} = {i}\n")); }
+        for i in 1..=300 {
+            src.push_str(&format!("t.k{i} = {i}\n"));
+        }
         src.push_str("print(t.k1, t.k129, t.k200, t.k300)");
         assert_output(&src, &["1\t129\t200\t300"]);
     }
@@ -3290,7 +3275,9 @@ print(calls)"#,
     #[test]
     fn too_many_registers_is_a_compile_error() {
         let mut src = String::new();
-        for i in 1..=140 { src.push_str(&format!("let v{i} = {i}\n")); }
+        for i in 1..=140 {
+            src.push_str(&format!("let v{i} = {i}\n"));
+        }
         assert!(run(&src).unwrap_err().contains("registers"));
     }
 
@@ -3340,11 +3327,7 @@ let ok, err = pcall(fn() {
     error("x")
 })
 print(ok, err)"#,
-            &[
-                "close b got [string \"...\"]:5: x",
-                "close a got [string \"...\"]:5: x",
-                "false\t[string \"...\"]:5: x",
-            ],
+            &["close b got [string \"...\"]:5: x", "close a got [string \"...\"]:5: x", "false\t[string \"...\"]:5: x"],
         );
     }
 
@@ -3404,10 +3387,7 @@ print(coroutine.resume(co))"#,
 
     #[test]
     fn shifts_follow_lua_semantics() {
-        assert_output(
-            "print(1 << 64, 1 << -1, 8 >> -2, -1 >> 63, 1 << 63)",
-            &["0\t0\t32\t1\t-9223372036854775808"],
-        );
+        assert_output("print(1 << 64, 1 << -1, 8 >> -2, -1 >> 63, 1 << 63)", &["0\t0\t32\t1\t-9223372036854775808"]);
     }
 
     #[test]
@@ -3439,10 +3419,7 @@ print(f(table.unpack(big)))"##,
             "print(math.maxinteger < 9223372036854775808.0, math.maxinteger == 9223372036854775808.0, -0.0 == 0.0, 1 == 1.0)",
             &["true\tfalse\ttrue\ttrue"],
         );
-        assert_output(
-            "let t = {}\nt[math.maxinteger] = \"int\"\nt[9223372036854775808.0] = \"float\"\nprint(t[math.maxinteger])",
-            &["int"],
-        );
+        assert_output("let t = {}\nt[math.maxinteger] = \"int\"\nt[9223372036854775808.0] = \"float\"\nprint(t[math.maxinteger])", &["int"]);
     }
 
     #[test]
@@ -3485,20 +3462,29 @@ print(ok, #t, t[1] + t[2] + t[3])"#,
     #[test]
     fn anchored_gsub_and_gmatch_match_once() {
         assert_output(r#"print(string.gsub("aaa", "^a", "b"))"#, &["baa\t1"]);
-        assert_output(r#"var n = 0
+        assert_output(
+            r#"var n = 0
 for m in string.gmatch("aaa", "^a") { n = n + 1 }
-print(n)"#, &["1"]);
+print(n)"#,
+            &["1"],
+        );
     }
 
     #[test]
     fn utf8_codes_skips_continuation_positions() {
-        assert_output(r#"var n = 0
+        assert_output(
+            r#"var n = 0
 for p, c in utf8.codes("héllo") { n = n + 1 }
-print(n)"#, &["5"]);
+print(n)"#,
+            &["5"],
+        );
         // Like Lua's iter_aux: a control value inside a character skips
         // forward to the next character rather than erroring.
-        assert_output(r#"let it = utf8.codes("héllo")
-print(it("héllo", 3))"#, &["4\t108"]);
+        assert_output(
+            r#"let it = utf8.codes("héllo")
+print(it("héllo", 3))"#,
+            &["4\t108"],
+        );
     }
 
     #[test]
@@ -3513,10 +3499,7 @@ print(it("héllo", 3))"#, &["4\t108"]);
 
     #[test]
     fn math_random_near_integer_limits() {
-        assert_output(
-            "let r = math.random(math.maxinteger - 1, math.maxinteger)\nprint(r >= math.maxinteger - 1 and r <= math.maxinteger)",
-            &["true"],
-        );
+        assert_output("let r = math.random(math.maxinteger - 1, math.maxinteger)\nprint(r >= math.maxinteger - 1 and r <= math.maxinteger)", &["true"]);
     }
 
     #[test]
@@ -3581,7 +3564,9 @@ print(coroutine.isyieldable())"#,
     #[test]
     fn api_pop_removes_exactly_n_values() {
         let U = api::umbra_newstate();
-        for i in 0..5 { unsafe { api::umbra_pushinteger(U, i) }; }
+        for i in 0..5 {
+            unsafe { api::umbra_pushinteger(U, i) };
+        }
         unsafe { api::umbra_pop(U, 2) };
         assert_eq!(unsafe { api::umbra_gettop(U) }, 3);
         assert_eq!(unsafe { api::umbra_tointeger(U, -1) }, 2);
@@ -3654,14 +3639,8 @@ print(coroutine.isyieldable())"#,
 
     #[test]
     fn parse_ternary_allows_ident_and_call_branches() {
-        assert_output(
-            "let x = 5\nlet big = \"B\"\nlet small = \"S\"\nprint(x > 3 ? big : small)",
-            &["B"],
-        );
-        assert_output(
-            "let t = {m = fn(self) { return \"M\" }}\nprint(true ? t:m() : \"no\")",
-            &["M"],
-        );
+        assert_output("let x = 5\nlet big = \"B\"\nlet small = \"S\"\nprint(x > 3 ? big : small)", &["B"]);
+        assert_output("let t = {m = fn(self) { return \"M\" }}\nprint(true ? t:m() : \"no\")", &["M"]);
         assert_output("print(false ? 1 : true ? 2 : 3)", &["2"]);
         // `:` after a field is the separator even when a call follows;
         // `:` after a method call is too.
@@ -3680,10 +3659,7 @@ print(coroutine.isyieldable())"#,
         let blocks = format!("if true {{ {} print(1) {}", "{ ".repeat(5000), "}".repeat(5000));
         assert!(run(&blocks).is_err());
         // Reasonable nesting still works.
-        assert_output(
-            &format!("print({}1{})", "(".repeat(50), ")".repeat(50)),
-            &["1"],
-        );
+        assert_output(&format!("print({}1{})", "(".repeat(50), ")".repeat(50)), &["1"]);
     }
 
     #[test]
@@ -3691,10 +3667,7 @@ print(coroutine.isyieldable())"#,
         assert!(run("print(\"${a b}\")").is_err());
         assert!(run("print(\"${{1,2}[1]}\")").is_err());
         // Interpolated strings work as call arguments too.
-        assert_output(
-            "fn f(s) { return s }\nlet n = \"x\"\nprint(f\"${n}\")",
-            &["x"],
-        );
+        assert_output("fn f(s) { return s }\nlet n = \"x\"\nprint(f\"${n}\")", &["x"]);
     }
 
     #[test]
@@ -3715,8 +3688,9 @@ print(coroutine.isyieldable())"#,
             "inner = 0
             fn outer(x) { let y = x * 2; let r = reenter(); return y + r }
             assert(outer(5) == 17)
-            assert(inner == 1)"
-        ).unwrap();
+            assert(inner == 1)",
+        )
+        .unwrap();
         assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
         unsafe { api::umbra_close(U) };
     }
@@ -3810,13 +3784,11 @@ print(coroutine.isyieldable())"#,
 
         let U = api::umbra_newstate();
         let bad = CString::new("this is not valid umbra !!!").unwrap();
-        assert_eq!(unsafe { api::umbra_dostring(U, bad.as_ptr()) },
-                   api::UmbraStatus::SyntaxError as std::ffi::c_int);
+        assert_eq!(unsafe { api::umbra_dostring(U, bad.as_ptr()) }, api::UmbraStatus::SyntaxError as std::ffi::c_int);
         let good = CString::new("x = 1").unwrap();
         assert_eq!(unsafe { api::umbra_dostring(U, good.as_ptr()) }, 0);
         let boom = CString::new("error(\"boom\")").unwrap();
-        assert_eq!(unsafe { api::umbra_dostring(U, boom.as_ptr()) },
-                   api::UmbraStatus::RuntimeError as std::ffi::c_int);
+        assert_eq!(unsafe { api::umbra_dostring(U, boom.as_ptr()) }, api::UmbraStatus::RuntimeError as std::ffi::c_int);
         unsafe { api::umbra_close(U) };
     }
 
@@ -3825,9 +3797,7 @@ print(coroutine.isyieldable())"#,
         use std::ffi::CString;
 
         let U = api::umbra_newstate();
-        let src = CString::new(
-            "t = setmetatable({}, {__call = fn(self, x) { return x * 2 }})"
-        ).unwrap();
+        let src = CString::new("t = setmetatable({}, {__call = fn(self, x) { return x * 2 }})").unwrap();
         assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
         let name = CString::new("t").unwrap();
         unsafe { api::umbra_getglobal(U, name.as_ptr()) };
@@ -3921,13 +3891,9 @@ print(-x + -x)"#,
     fn goto_into_nested_block_is_rejected() {
         // Lua: a label is only visible inside its own block (plus the
         // enclosing block when it's the block's last statement).
-        assert!(run("goto inner\nif true {\n  ::inner::\n}\nprint(1)")
-            .unwrap_err().contains("no visible label"));
+        assert!(run("goto inner\nif true {\n  ::inner::\n}\nprint(1)").unwrap_err().contains("no visible label"));
         // The end-of-block label idiom stays legal.
-        assert_output(
-            "var n = 0\nfor i = 1, 5 {\n  if i == 3 { goto cont }\n  n = n + i\n  ::cont::\n}\nprint(n)",
-            &["12"],
-        );
+        assert_output("var n = 0\nfor i = 1, 5 {\n  if i == 3 { goto cont }\n  n = n + i\n  ::cont::\n}\nprint(n)", &["12"]);
     }
 
     #[test]
@@ -4058,15 +4024,15 @@ pub fn disasm(c: &compiler::Compiled) -> String {
     fn dump(p: &chunk::Proto, depth: usize, out: &mut String) {
         use chunk::*;
         let pad = "  ".repeat(depth);
-        out.push_str(&format!("{pad}proto params={} vararg={} regs={} consts={}\n",
-            p.params, p.is_vararg, p.max_regs, p.consts.len()));
+        out.push_str(&format!("{pad}proto params={} vararg={} regs={} consts={}\n", p.params, p.is_vararg, p.max_regs, p.consts.len()));
         for (i, &ins) in p.code.iter().enumerate() {
             let op = Op::from_u8(iop(ins)).map(|o| format!("{o:?}")).unwrap_or_else(|| "?".into());
-            out.push_str(&format!("{pad}{i:4} {op:10} a={} b={} c={} bx={} sbx={}\n",
-                ia(ins), ib(ins), ic(ins), ibx(ins), isbx(ins)));
+            out.push_str(&format!("{pad}{i:4} {op:10} a={} b={} c={} bx={} sbx={}\n", ia(ins), ib(ins), ic(ins), ibx(ins), isbx(ins)));
         }
         // SAFETY: the children of a Compiled's tree, which it owns.
-        for &c in p.protos.iter() { dump(unsafe { &(*c).proto }, depth + 1, out); }
+        for &c in p.protos.iter() {
+            dump(unsafe { &(*c).proto }, depth + 1, out);
+        }
     }
     dump(c.proto(), 0, &mut out);
     out
@@ -4092,14 +4058,8 @@ mod stdlib_second_pass_tests {
 
     #[test]
     fn string_gmatch_honors_init_argument() {
-        assert_output(
-            r#"for w in string.gmatch("a1b2", "%a", 3) { print(w) }"#,
-            &["b"],
-        );
-        assert_output(
-            r#"for w in string.gmatch("abc", "%a", 10) { print(w) }"#,
-            &[],
-        );
+        assert_output(r#"for w in string.gmatch("a1b2", "%a", 3) { print(w) }"#, &["b"]);
+        assert_output(r#"for w in string.gmatch("abc", "%a", 10) { print(w) }"#, &[]);
     }
 
     #[test]
@@ -4192,10 +4152,7 @@ mod stdlib_second_pass_tests {
 
     #[test]
     fn math_random_full_range_and_arg_errors() {
-        assert_output(
-            "let r = math.random(math.mininteger, math.maxinteger)\nprint(math.type(r))",
-            &["integer"],
-        );
+        assert_output("let r = math.random(math.mininteger, math.maxinteger)\nprint(math.type(r))", &["integer"]);
         // random(0) is a full-range integer, like Lua.
         assert_output("print(math.type(math.random(0)))", &["integer"]);
         assert!(run("math.random(1, 2, 3)").is_err());
@@ -4232,14 +4189,8 @@ mod stdlib_second_pass_tests {
 
     #[test]
     fn os_time_from_table_and_date_table_form() {
-        assert_output(
-            "print(os.time({year=1970, month=1, day=1, hour=0, min=0, sec=0}))",
-            &["0"],
-        );
-        assert_output(
-            "print(os.time({year=1970, month=1, day=1}))",
-            &["43200"],
-        );
+        assert_output("print(os.time({year=1970, month=1, day=1, hour=0, min=0, sec=0}))", &["0"]);
+        assert_output("print(os.time({year=1970, month=1, day=1}))", &["43200"]);
         assert!(run("os.time({})").is_err());
         assert_output(
             r#"let t = os.date("*t", 0)
@@ -4274,10 +4225,7 @@ mod stdlib_second_pass_tests {
             r2:close()"#,
             &["3.5 42 rest\n", "3.5"],
         );
-        assert_output(
-            r#"for l in io.lines("/tmp/umbra_test_handle.txt") { print(l) }"#,
-            &["3.5 42 rest", "last"],
-        );
+        assert_output(r#"for l in io.lines("/tmp/umbra_test_handle.txt") { print(l) }"#, &["3.5 42 rest", "last"]);
         assert!(run(r#"io.lines("/nonexistent_umbra_path")"#).is_err());
     }
 
@@ -4320,7 +4268,6 @@ mod bytes_and_pack_tests {
         assert_eq!(run_capture(src).unwrap(), expected, "script: {src}");
     }
 
-
     #[test]
     fn bytes_new_from_index_and_len() {
         assert_output(
@@ -4333,7 +4280,6 @@ mod bytes_and_pack_tests {
             &["4\tbytes", "65\t0\t255", "none\tnone"],
         );
     }
-
 
     #[test]
     fn bytes_index_bounds_and_value_range() {
@@ -4535,7 +4481,9 @@ mod error_naming_tests {
 fn mid() { let t = deep() return t }
 fn outer() { let t = mid() return t }
 print(outer())"#,
-            &["msg\nstack traceback:\n\t[string \"...\"]:1: in function 'deep'\n\t[string \"...\"]:2: in function 'mid'\n\t[string \"...\"]:3: in function 'outer'\n\t[string \"...\"]:4: in main chunk"],
+            &[
+                "msg\nstack traceback:\n\t[string \"...\"]:1: in function 'deep'\n\t[string \"...\"]:2: in function 'mid'\n\t[string \"...\"]:3: in function 'outer'\n\t[string \"...\"]:4: in main chunk",
+            ],
         );
     }
 
@@ -4546,20 +4494,16 @@ print(outer())"#,
 fn f() { return tail() }
 let ok, tb = xpcall(f, debug.traceback)
 print(tb)"#,
-            &["[string \"...\"]:1: boom\nstack traceback:\n\t[string \"...\"]:1: in function 'tail'\n\t(...tail calls...)\n\t[string \"...\"]:3: in main chunk"],
+            &[
+                "[string \"...\"]:1: boom\nstack traceback:\n\t[string \"...\"]:1: in function 'tail'\n\t(...tail calls...)\n\t[string \"...\"]:3: in main chunk",
+            ],
         );
     }
 
     #[test]
     fn type_is_number_and_math_type_splits() {
-        assert_output(
-            "print(type(1), type(1.5), type(\"s\"), type(none), type({}))",
-            &["number\tnumber\tstring\tnone\ttable"],
-        );
-        assert_output(
-            "print(math.type(1), math.type(1.5), math.type(\"s\"))",
-            &["integer\tfloat\tnone"],
-        );
+        assert_output("print(type(1), type(1.5), type(\"s\"), type(none), type({}))", &["number\tnumber\tstring\tnone\ttable"]);
+        assert_output("print(math.type(1), math.type(1.5), math.type(\"s\"))", &["integer\tfloat\tnone"]);
     }
 }
 
@@ -4584,8 +4528,12 @@ mod gc_incremental_tests {
             vm.gc_step();
             guard += 1;
             assert!(guard < 1_000_000, "cycle never reached a state with t black");
-            if vm.gc.phase() == GcPhase::Pause { break; }
-            if unsafe { (*t_hdr).color } == GcColor::Black { break; }
+            if vm.gc.phase() == GcPhase::Pause {
+                break;
+            }
+            if unsafe { (*t_hdr).color } == GcColor::Black {
+                break;
+            }
         }
         assert_ne!(vm.gc.phase(), GcPhase::Pause, "cycle finished before t blackened");
         assert_eq!(unsafe { (*t_hdr).color }, GcColor::Black);
@@ -4608,12 +4556,12 @@ mod gc_incremental_tests {
 for i = 1, 100000 { keep[i] = { i } }
 for i = 1, 5000000 { let t = { i } }"#,
             &mut vm,
-        ).unwrap();
+        )
+        .unwrap();
         let max_step = vm.gc.max_step_work();
         let cycle = vm.gc.last_cycle_work();
         assert!(cycle > 0, "no incremental cycle ran during churn");
-        assert!(max_step * 10 <= cycle,
-            "max step {max_step} exceeds 10% of cycle work {cycle}");
+        assert!(max_step * 10 <= cycle, "max step {max_step} exceeds 10% of cycle work {cycle}");
     }
 }
 
@@ -4629,38 +4577,23 @@ mod stdlib_format_coverage_tests {
     #[test]
     fn string_format_matches_lua_specifiers() {
         // All values verified against Lua 5.4.7.
-        assert_output(
-            r#"print(string.format("%d %i %u %c %x %X %o", 42, -7, 300, 65, 255, 255, 8))"#,
-            &["42 -7 300 A ff FF 10"],
-        );
+        assert_output(r#"print(string.format("%d %i %u %c %x %X %o", 42, -7, 300, 65, 255, 255, 8))"#, &["42 -7 300 A ff FF 10"]);
         assert_output(
             r#"print(string.format("%e %E %f %g %G", 1234.5678, 1234.5678, 1234.5678, 1234.5678, 1234.5678))"#,
             &["1.234568e+03 1.234568E+03 1234.567800 1234.57 1234.57"],
         );
         assert_output(r#"print(string.format("%a %A", 1.0, 1.0))"#, &["0x1p+0 0X1P+0"]);
-        assert_output(
-            r#"print(string.format("%-5d|%+d|% d|%#x|%05d", 42, 42, 42, 255, 42))"#,
-            &["42   |+42| 42|0xff|00042"],
-        );
-        assert_output(
-            r#"print(string.format("%5.2f|%-10s|%.3s|%05d", 3.14159, "hi", "hello", 42))"#,
-            &[" 3.14|hi        |hel|00042"],
-        );
-        assert_output(r#"print(string.format("%x %o %u", -1, -1, -1))"#,
-            &["ffffffffffffffff 1777777777777777777777 18446744073709551615"]);
+        assert_output(r#"print(string.format("%-5d|%+d|% d|%#x|%05d", 42, 42, 42, 255, 42))"#, &["42   |+42| 42|0xff|00042"]);
+        assert_output(r#"print(string.format("%5.2f|%-10s|%.3s|%05d", 3.14159, "hi", "hello", 42))"#, &[" 3.14|hi        |hel|00042"]);
+        assert_output(r#"print(string.format("%x %o %u", -1, -1, -1))"#, &["ffffffffffffffff 1777777777777777777777 18446744073709551615"]);
         assert_output(r#"print(string.format("%#o %#x %#X", 8, 255, 255))"#, &["010 0xff 0XFF"]);
-        assert_output(r#"print(string.format("%.0f %.0f %.0f %.0f", -0.5, 0.5, 1.5, 2.5))"#,
-            &["-0 0 2 2"]);
+        assert_output(r#"print(string.format("%.0f %.0f %.0f %.0f", -0.5, 0.5, 1.5, 2.5))"#, &["-0 0 2 2"]);
         assert_output(r#"print(string.format("%.0a %.3a", 1.5, 1.0))"#, &["0x2p+0 0x1.000p+0"]);
-        assert_output(r#"print(string.format("%#g %#.0f %#.0e", 1.0, 2.0, 100.0))"#,
-            &["1.00000 2. 1.e+02"]);
-        assert_output(r#"print(string.format("%g %g %g %g", 100000, 1000000, 1e-4, 1e-5))"#,
-            &["100000 1e+06 0.0001 1e-05"]);
+        assert_output(r#"print(string.format("%#g %#.0f %#.0e", 1.0, 2.0, 100.0))"#, &["1.00000 2. 1.e+02"]);
+        assert_output(r#"print(string.format("%g %g %g %g", 100000, 1000000, 1e-4, 1e-5))"#, &["100000 1e+06 0.0001 1e-05"]);
         assert_output(r#"print(string.format("%d", 3.0))"#, &["3"]);
-        assert_output(r#"print(string.format("%d", "0x1F"), string.format("%d", "  42  "))"#,
-            &["31\t42"]);
-        assert_output(r#"print(string.format("%s", setmetatable({}, {__tostring = fn() { return "MT!" }})))"#,
-            &["MT!"]);
+        assert_output(r#"print(string.format("%d", "0x1F"), string.format("%d", "  42  "))"#, &["31\t42"]);
+        assert_output(r#"print(string.format("%s", setmetatable({}, {__tostring = fn() { return "MT!" }})))"#, &["MT!"]);
         assert_output(r#"print(string.format("%s", none), string.format("%s", true))"#, &["none\ttrue"]);
         assert_output(r#"print(string.format("%c", 0) == "\0")"#, &["true"]);
         assert_output(r#"print(string.format("%.3s", "héllo"))"#, &["hé"]);
@@ -4670,19 +4603,20 @@ mod stdlib_format_coverage_tests {
     #[test]
     fn string_format_q_matches_lua() {
         assert_output(r#"print(string.format("%q", 1/3))"#, &["0x1.5555555555555p-2"]);
-        assert_output(r#"print(string.format("%q", 3.5), string.format("%q", 3.0))"#,
-            &["0x1.cp+1\t0x1.8p+1"]);
+        assert_output(r#"print(string.format("%q", 3.5), string.format("%q", 3.0))"#, &["0x1.cp+1\t0x1.8p+1"]);
         assert_output(r#"print(string.format("%q", -0.0))"#, &["-0x0p+0"]);
-        assert_output(r#"print(string.format("%q", 1/0), string.format("%q", -1/0))"#,
-            &["1e9999\t-1e9999"]);
+        assert_output(r#"print(string.format("%q", 1/0), string.format("%q", -1/0))"#, &["1e9999\t-1e9999"]);
         assert_output(r#"print(string.format("%q", math.mininteger))"#, &["0x8000000000000000"]);
         assert_output(r#"print(string.format("%q", "a\0b"))"#, &[r#""a\0b""#]);
         assert_output(r#"print(string.format("%q", "\1\31\127"))"#, &[r#""\1\31\127""#]);
         assert_output(r#"print(string.format("%q", "\r\n"))"#, &["\"\\13\\\n\""]);
         assert_output(r#"print(string.format("%q", "back\\slash"))"#, &[r#""back\\slash""#]);
         // %q output re-reads as the same value.
-        assert_output(r#"let s = string.format("%q", "a\"b\nc")
-print(load("return " .. s)() == "a\"b\nc")"#, &["true"]);
+        assert_output(
+            r#"let s = string.format("%q", "a\"b\nc")
+print(load("return " .. s)() == "a\"b\nc")"#,
+            &["true"],
+        );
         assert_output(r#"print(load("return " .. string.format("%q", 1/3))() == 1/3)"#, &["true"]);
     }
 
@@ -4717,10 +4651,8 @@ print(load("return " .. s)() == "a\"b\nc")"#, &["true"]);
             r#"print(os.date("!%d %H %I %j %m %M %p %S %U %w %W %x %X %y %Y %%", 1700000000))"#,
             &["14 22 10 318 11 13 PM 20 46 2 46 11/14/23 22:13:20 23 2023 %"],
         );
-        assert_output(r#"print(os.date("!%u %V %g %G %C %z %r", 1700000000))"#,
-            &["2 46 23 2023 20 +0000 10:13:20 PM"]);
-        assert_output(r#"print(os.date("!%D %F %R %T %e %h", 1700000000))"#,
-            &["11/14/23 2023-11-14 22:13 22:13:20 14 Nov"]);
+        assert_output(r#"print(os.date("!%u %V %g %G %C %z %r", 1700000000))"#, &["2 46 23 2023 20 +0000 10:13:20 PM"]);
+        assert_output(r#"print(os.date("!%D %F %R %T %e %h", 1700000000))"#, &["11/14/23 2023-11-14 22:13 22:13:20 14 Nov"]);
         assert_output(r#"print(os.date("!%Y-%m-%d", -1))"#, &["1969-12-31"]);
         assert_output(r#"print(os.date("!%Y-%m-%d", -62135596800))"#, &["1-01-01"]);
         assert_output(
@@ -4759,23 +4691,16 @@ print(tt.wday, tt.yday, tt.isdst, tt.hour)"#,
             r#"print(tostring(1e15), tostring(1e16), tostring(2^53), tostring(-0.0), tostring(1/0), tostring(3.0), tostring(0.1))"#,
             &["1e+15\t1e+16\t9.007199254741e+15\t-0.0\tinf\t3.0\t0.1"],
         );
-        assert_output(
-            r#"print(tonumber("0x10"), tonumber("1e2"), tonumber(" 12 "), tonumber("12a"), tonumber("z", 36))"#,
-            &["16\t100.0\t12\tnone\t35"],
-        );
+        assert_output(r#"print(tonumber("0x10"), tonumber("1e2"), tonumber(" 12 "), tonumber("12a"), tonumber("z", 36))"#, &["16\t100.0\t12\tnone\t35"]);
         assert_output(
             r#"print(tonumber("0x1.8p1"), tonumber("  0x10  "), tonumber("-0x10"), tonumber("10", 2), tonumber("-z", 36))"#,
             &["3.0\t16\t-16\t2\t-35"],
         );
-        assert_output(r#"print(tonumber("0x10000000000000000"), tonumber("0xFFFFFFFFFFFFFFFFF"))"#,
-            &["0\t-1"]);
-        assert_output(r#"print(tonumber("1e999"), tonumber("nan"), tonumber("inf"), tonumber("0x"), tonumber("."))"#,
-            &["inf\tnone\tnone\tnone\tnone"]);
-        assert_output(r#"print(tonumber("1."), tonumber(".5"), tonumber("1e"), tonumber(""))"#,
-            &["1.0\t0.5\tnone\tnone"]);
+        assert_output(r#"print(tonumber("0x10000000000000000"), tonumber("0xFFFFFFFFFFFFFFFFF"))"#, &["0\t-1"]);
+        assert_output(r#"print(tonumber("1e999"), tonumber("nan"), tonumber("inf"), tonumber("0x"), tonumber("."))"#, &["inf\tnone\tnone\tnone\tnone"]);
+        assert_output(r#"print(tonumber("1."), tonumber(".5"), tonumber("1e"), tonumber(""))"#, &["1.0\t0.5\tnone\tnone"]);
         assert_output(r#"print(tonumber(42), tonumber(4.5), tonumber(none))"#, &["42\t4.5\tnone"]);
-        assert_output(r#"print(math.type(tonumber("0x10")), math.type(tonumber("1e2")), math.type(tonumber("10.0")))"#,
-            &["integer\tfloat\tfloat"]);
+        assert_output(r#"print(math.type(tonumber("0x10")), math.type(tonumber("1e2")), math.type(tonumber("10.0")))"#, &["integer\tfloat\tfloat"]);
         assert!(run("tonumber()").is_err());
         assert!(run("tonumber(42, 10)").is_err());
         assert!(run("tonumber(42, 16)").is_err());
@@ -4791,13 +4716,13 @@ print(tt.wday, tt.yday, tt.isdst, tt.hour)"#,
 print(string.sub(s, -1), string.sub(s, 0), string.sub(s, 100), string.sub(s, -100), string.sub(s, 2, -2), string.sub(s, -3, -1), string.sub(s, 0, 0), string.sub(s, 3, 2), string.sub(s, -100, 100))"#,
             &["o\thello\t\thello\tell\tllo\t\t\thello"],
         );
-        assert_output(r#"print(string.rep("ab", 0), "|", string.rep("ab", -1), "|", string.rep("ab", 3, "-"), "|", string.rep("", 5))"#,
-            &["\t|\t\t|\tab-ab-ab\t|\t"]);
-        assert_output(r#"print(string.byte("ABC", 1, 3), string.byte("ABC", -1), string.byte("ABC", 0))"#,
-            &["65\t67"]);
+        assert_output(
+            r#"print(string.rep("ab", 0), "|", string.rep("ab", -1), "|", string.rep("ab", 3, "-"), "|", string.rep("", 5))"#,
+            &["\t|\t\t|\tab-ab-ab\t|\t"],
+        );
+        assert_output(r#"print(string.byte("ABC", 1, 3), string.byte("ABC", -1), string.byte("ABC", 0))"#, &["65\t67"]);
         assert_output(r#"print(string.byte("ABC", 2, 1) == none)"#, &["true"]);
-        assert_output(r#"print(string.char(72, 105), #string.char(0), string.byte(string.char(0)))"#,
-            &["Hi\t1\t0"]);
+        assert_output(r#"print(string.char(72, 105), #string.char(0), string.byte(string.char(0)))"#, &["Hi\t1\t0"]);
         // C-locale case mapping: ASCII only, like Lua.
         assert_output(r#"print(string.upper("héllo"), string.lower("HÉLLO"))"#, &["HéLLO\thÉllo"]);
         assert_output(r#"print(string.upper("ß"), string.lower("İ"))"#, &["ß\tİ"]);
@@ -4814,10 +4739,8 @@ print(string.sub(s, -1), string.sub(s, 0), string.sub(s, 100), string.sub(s, -10
 
     #[test]
     fn table_edge_cases_match_lua() {
-        assert_output(r#"print(table.concat({1,2,3}), table.concat({1,2,3}, "-"), table.concat({1,2.5,"x"}, ","))"#,
-            &["123\t1-2-3\t1,2.5,x"]);
-        assert_output(r#"print(table.concat({1,2,3}, "-", 2, 3), table.concat({1,2,3}, "-", 3, 2), table.concat({}, "-"))"#,
-            &["2-3\t\t"]);
+        assert_output(r#"print(table.concat({1,2,3}), table.concat({1,2,3}, "-"), table.concat({1,2.5,"x"}, ","))"#, &["123\t1-2-3\t1,2.5,x"]);
+        assert_output(r#"print(table.concat({1,2,3}, "-", 2, 3), table.concat({1,2,3}, "-", 3, 2), table.concat({}, "-"))"#, &["2-3\t\t"]);
         assert!(run(r#"table.concat({{}})"#).is_err());
         assert_output(
             r#"let t = {10,20,30}
@@ -4835,63 +4758,58 @@ print(table.concat(t, ","))"#,
         assert_output(r#"print(table.concat(table.move({1,2,3}, 1, 3, 2, {9,9,9,9,9}), ","))"#, &["9,1,2,3,9"]);
         assert_output(r#"print(table.unpack({1,2,3}, 0, 2))"#, &["none\t1\t2"]);
         assert_output(r##"print(select("#", table.unpack({1,2,3}, 4, 5)))"##, &["2"]);
-        assert_output(r#"let pk = table.pack(1, none, 3)
-print(pk.n, pk[1], pk[2], pk[3])"#, &["3\t1\tnone\t3"]);
+        assert_output(
+            r#"let pk = table.pack(1, none, 3)
+print(pk.n, pk[1], pk[2], pk[3])"#,
+            &["3\t1\tnone\t3"],
+        );
         assert_output(r#"print(table.pack().n)"#, &["0"]);
         assert!(run(r#"table.unpack({1,2,3}, 1, 1e18)"#).is_err());
         assert!(run(r#"table.move({1,2,3}, 1, 2, math.maxinteger)"#).is_err());
         assert!(run(r#"table.sort({1,"x"})"#).is_err());
         // An always-true comparator is not an error (Lua detects invalid
         // order functions only incidentally during partitioning).
-        assert_output(r#"let t = {1,2,3}
-print(pcall(table.sort, t, fn(a,b) { return true }))"#, &["true"]);
+        assert_output(
+            r#"let t = {1,2,3}
+print(pcall(table.sort, t, fn(a,b) { return true }))"#,
+            &["true"],
+        );
         assert_output(r#"print(pcall(table.sort, {1,2,3}, fn(a,b) { return 1 }))"#, &["true"]);
     }
 
     #[test]
     fn math_edge_cases_match_lua() {
-        assert_output(r#"print(math.floor(3.7), math.floor(-3.7), math.type(math.floor(3.7)))"#,
-            &["3\t-4\tinteger"]);
-        assert_output(r#"print(math.ceil(3.2), math.ceil(-3.2), math.type(math.ceil(3.2)))"#,
-            &["4\t-3\tinteger"]);
-        assert_output(r#"print(math.floor(2^63), math.type(math.floor(2^63)))"#,
-            &["9.2233720368548e+18\tfloat"]);
-        assert_output(r#"print(math.floor(-2^63), math.type(math.floor(-2^63)))"#,
-            &["-9223372036854775808\tinteger"]);
-        assert_output(r#"print(math.abs(-5), math.abs(5.5), math.abs(math.mininteger))"#,
-            &["5\t5.5\t-9223372036854775808"]);
-        assert_output(r#"print(math.fmod(-7, 3), math.fmod(7, -3), -7 % 3, 7 % -3)"#,
-            &["-1\t1\t2\t-2"]);
+        assert_output(r#"print(math.floor(3.7), math.floor(-3.7), math.type(math.floor(3.7)))"#, &["3\t-4\tinteger"]);
+        assert_output(r#"print(math.ceil(3.2), math.ceil(-3.2), math.type(math.ceil(3.2)))"#, &["4\t-3\tinteger"]);
+        assert_output(r#"print(math.floor(2^63), math.type(math.floor(2^63)))"#, &["9.2233720368548e+18\tfloat"]);
+        assert_output(r#"print(math.floor(-2^63), math.type(math.floor(-2^63)))"#, &["-9223372036854775808\tinteger"]);
+        assert_output(r#"print(math.abs(-5), math.abs(5.5), math.abs(math.mininteger))"#, &["5\t5.5\t-9223372036854775808"]);
+        assert_output(r#"print(math.fmod(-7, 3), math.fmod(7, -3), -7 % 3, 7 % -3)"#, &["-1\t1\t2\t-2"]);
         assert_output(r#"print(math.fmod(5.5, 2), math.fmod(-5.5, 2))"#, &["1.5\t-1.5"]);
         assert!(run("math.fmod(1, 0)").is_err());
-        assert_output(r#"print(math.tointeger("8"), math.tointeger("8.0"), math.tointeger("0x10"), math.tointeger(8.5), math.tointeger(2^63))"#,
-            &["8\t8\t16\tnone\tnone"]);
-        assert_output(r#"print(math.max(1, 2.5), math.type(math.max(1, 2.5)), math.min(1, 2.5), math.type(math.min(1, 2.5)))"#,
-            &["2.5\tfloat\t1\tinteger"]);
-        assert_output(r#"print(math.max(3, 3.0), math.type(math.max(3, 3.0)), math.min(3, 3.0), math.type(math.min(3, 3.0)))"#,
-            &["3\tinteger\t3\tinteger"]);
-        assert_output(r#"print(math.maxinteger + 1 == math.mininteger, math.mininteger - 1 == math.maxinteger)"#,
-            &["true\ttrue"]);
-        assert_output(r#"print(math.ult(1, 2), math.ult(-1, 2), math.ult(2, -1), math.ult(math.mininteger, 0))"#,
-            &["true\tfalse\ttrue\tfalse"]);
+        assert_output(
+            r#"print(math.tointeger("8"), math.tointeger("8.0"), math.tointeger("0x10"), math.tointeger(8.5), math.tointeger(2^63))"#,
+            &["8\t8\t16\tnone\tnone"],
+        );
+        assert_output(r#"print(math.max(1, 2.5), math.type(math.max(1, 2.5)), math.min(1, 2.5), math.type(math.min(1, 2.5)))"#, &["2.5\tfloat\t1\tinteger"]);
+        assert_output(r#"print(math.max(3, 3.0), math.type(math.max(3, 3.0)), math.min(3, 3.0), math.type(math.min(3, 3.0)))"#, &["3\tinteger\t3\tinteger"]);
+        assert_output(r#"print(math.maxinteger + 1 == math.mininteger, math.mininteger - 1 == math.maxinteger)"#, &["true\ttrue"]);
+        assert_output(r#"print(math.ult(1, 2), math.ult(-1, 2), math.ult(2, -1), math.ult(math.mininteger, 0))"#, &["true\tfalse\ttrue\tfalse"]);
         assert_output(r#"print(math.type(math.random(0)))"#, &["integer"]);
         assert!(run("math.random(3, 1)").is_err());
         assert!(run("math.random(-5)").is_err());
-        assert_output(r#"print(math.type(math.random()), math.type(math.random(5)), math.type(math.random(1,5)))"#,
-            &["float\tinteger\tinteger"]);
+        assert_output(r#"print(math.type(math.random()), math.type(math.random(5)), math.type(math.random(1,5)))"#, &["float\tinteger\tinteger"]);
         assert_output(r#"print(math.modf(3.7))"#, &["3\t0.7"]);
         assert_output(r#"print(math.modf(-3.7))"#, &["-3\t-0.7"]);
         assert_output(r#"print(math.modf(5), math.type(math.modf(5)))"#, &["5\tinteger"]);
-        assert_output(r#"print(math.log(8, 2), math.log(100, 10), math.log(math.exp(1)))"#,
-            &["3.0\t2.0\t1.0"]);
+        assert_output(r#"print(math.log(8, 2), math.log(100, 10), math.log(math.exp(1)))"#, &["3.0\t2.0\t1.0"]);
         assert_output(r#"print(math.log(0), math.log(-1))"#, &["-inf\tnone"]);
         // Numeric strings coerce like luaL_checknumber/luaL_checkinteger.
         assert_output(r#"print(math.floor("3.5"), math.floor("3"), math.abs("-5"))"#, &["3\t3\t5.0"]);
         assert!(run(r#"math.floor("x")"#).is_err());
         assert!(run(r#"math.abs("x")"#).is_err());
         assert!(run("math.tointeger()").is_err());
-        assert_output(r#"print(math.type(1), math.type(1.0), math.type("x"), math.type(none))"#,
-            &["integer\tfloat\tnone\tnone"]);
+        assert_output(r#"print(math.type(1), math.type(1.0), math.type("x"), math.type(none))"#, &["integer\tfloat\tnone\tnone"]);
     }
 
     #[test]
@@ -4904,36 +4822,37 @@ print(pcall(table.sort, t, fn(a,b) { return true }))"#, &["true"]);
         // j may sit mid-character; i may not.
         assert_output(r#"print(utf8.len("héllo", 1, 2))"#, &["2"]);
         assert_output(r#"print(utf8.len("héllo", 3))"#, &["none\t3"]);
-        assert_output(r#"print(utf8.len("abc", 2, 1), utf8.len("abc", 1, 3), utf8.len("abc", -1), utf8.len("abc", 4))"#,
-            &["0\t3\t1\t0"]);
+        assert_output(r#"print(utf8.len("abc", 2, 1), utf8.len("abc", 1, 3), utf8.len("abc", -1), utf8.len("abc", 4))"#, &["0\t3\t1\t0"]);
         assert!(run(r#"utf8.len("abc", 0)"#).is_err());
         assert!(run(r#"utf8.len("abc", 1, 5)"#).is_err());
-        assert_output(r#"print(utf8.offset("héllo", 1), utf8.offset("héllo", 2), utf8.offset("héllo", 3), utf8.offset("héllo", 5), utf8.offset("héllo", 6))"#,
-            &["1\t2\t4\t6\t7"]);
-        assert_output(r#"print(utf8.offset("héllo", -1), utf8.offset("héllo", -2), utf8.offset("héllo", 0))"#,
-            &["6\t5\t1"]);
+        assert_output(
+            r#"print(utf8.offset("héllo", 1), utf8.offset("héllo", 2), utf8.offset("héllo", 3), utf8.offset("héllo", 5), utf8.offset("héllo", 6))"#,
+            &["1\t2\t4\t6\t7"],
+        );
+        assert_output(r#"print(utf8.offset("héllo", -1), utf8.offset("héllo", -2), utf8.offset("héllo", 0))"#, &["6\t5\t1"]);
         assert_output(r#"print(utf8.offset("héllo", 1, 2), utf8.offset("héllo", -1, 4))"#, &["2\t2"]);
-        assert_output(r#"print(utf8.offset("abc", 4), utf8.offset("abc", 5), utf8.offset("abc", -4))"#,
-            &["4\tnone\tnone"]);
-        assert_output(r#"print(utf8.offset("abc", 1, 4), utf8.offset("abc", 2, 4), utf8.offset("abc", 0, 4))"#,
-            &["4\tnone\t4"]);
+        assert_output(r#"print(utf8.offset("abc", 4), utf8.offset("abc", 5), utf8.offset("abc", -4))"#, &["4\tnone\tnone"]);
+        assert_output(r#"print(utf8.offset("abc", 1, 4), utf8.offset("abc", 2, 4), utf8.offset("abc", 0, 4))"#, &["4\tnone\t4"]);
         assert_output(r#"print(utf8.offset("abc", -1, 4), utf8.offset("abc", -4, 4))"#, &["3\tnone"]);
         assert_output(r#"print(utf8.offset("", 1), utf8.offset("", -1), utf8.offset("", 0))"#, &["1\tnone\t1"]);
         assert_output(r#"print(utf8.offset("héllo", 2, -1), utf8.offset("héllo", -1, -1))"#, &["7\t5"]);
-        assert_output(r#"print(utf8.offset("héllo", 1, 2), utf8.offset("héllo", 0, 2), utf8.offset("héllo", 0, 3), utf8.offset("héllo", 0, 4))"#,
-            &["2\t2\t2\t4"]);
-        assert_output(r#"print(utf8.offset("héllo", -1, 6), utf8.offset("héllo", 1, 6), utf8.offset("héllo", 2, 6))"#,
-            &["5\t6\t7"]);
+        assert_output(
+            r#"print(utf8.offset("héllo", 1, 2), utf8.offset("héllo", 0, 2), utf8.offset("héllo", 0, 3), utf8.offset("héllo", 0, 4))"#,
+            &["2\t2\t2\t4"],
+        );
+        assert_output(r#"print(utf8.offset("héllo", -1, 6), utf8.offset("héllo", 1, 6), utf8.offset("héllo", 2, 6))"#, &["5\t6\t7"]);
         assert!(run(r#"utf8.offset("abc", 1, 5)"#).is_err());
         assert!(run(r#"utf8.offset("abc", 1, 0)"#).is_err());
         assert!(run(r#"utf8.offset("héllo", 1, 3)"#).is_err());
-        assert_output(r#"var out = ""
+        assert_output(
+            r#"var out = ""
 for p, c in utf8.codes("a😀b") { out = out .. p .. ":" .. c .. " " }
-print(out)"#, &["1:97 2:128512 6:98 "]);
+print(out)"#,
+            &["1:97 2:128512 6:98 "],
+        );
         assert_output(r#"print(utf8.codepoint("😀"), utf8.codepoint("😀", 1, 4))"#, &["128512\t128512"]);
         assert!(run(r#"utf8.codepoint("😀", 2)"#).is_err());
-        assert_output(r#"print(utf8.offset("😀x", 2), utf8.offset("😀x", -1), utf8.offset("😀x", 1, 5))"#,
-            &["5\t5\t5"]);
+        assert_output(r#"print(utf8.offset("😀x", 2), utf8.offset("😀x", -1), utf8.offset("😀x", 1, 5))"#, &["5\t5\t5"]);
         assert!(run(r#"utf8.char(0x110000)"#).is_err());
         assert!(run(r#"utf8.char(-1)"#).is_err());
         assert!(run(r#"utf8.char(0xD800)"#).is_err());
@@ -4948,7 +4867,8 @@ print(out)"#, &["1:97 2:128512 6:98 "]);
 for i = 1, 10000 { t[i] = i }
 table.sort(t)
 table.sort(t, fn(a, b) { return a < b })
-print(t[1], t[10000])"#).unwrap();
+print(t[1], t[10000])"#)
+        .unwrap();
         assert!(start.elapsed().as_secs() < 10);
     }
 }
@@ -4984,11 +4904,15 @@ mod embed_tests {
         // A threshold of 1 keeps the collector cycling through the churn
         // below, so a result that wasn't handed back rooted would be swept.
         vm.gc.threshold = 1;
-        run_with_vm(r#"let p, d = make_point(3)
+        run_with_vm(
+            r#"let p, d = make_point(3)
 let junk = {}
 for i = 1, 2000 { junk[i % 10] = { i } }
 assert(p.x == 3 and p.label == "point")
-assert(d == "point at 3")"#, &mut vm).unwrap();
+assert(d == "point at 3")"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5006,7 +4930,8 @@ assert(d == "point at 3")"#, &mut vm).unwrap();
             Ok(vec![out])
         });
         vm.gc.threshold = 1;
-        run_with_vm(r#"let t = map_twice(fn(x) {
+        run_with_vm(
+            r#"let t = map_twice(fn(x) {
     var junk = {}
     for i = 1, 500 { junk = { i, tostring(i) } }
     return "v" .. x
@@ -5014,10 +4939,15 @@ assert(d == "point at 3")"#, &mut vm).unwrap();
 assert(t[1] == "v1" and t[2] == "v2")
 let ok, err = pcall(map_twice, fn(x) { error("boom") })
 assert(not ok)
-assert(err == "[string \"...\"]:7: boom", err)"#, &mut vm).unwrap();
+assert(err == "[string \"...\"]:7: boom", err)"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 
-    struct Score { points: i64 }
+    struct Score {
+        points: i64,
+    }
     struct Other;
 
     #[test]
@@ -5036,10 +4966,12 @@ assert(err == "[string \"...\"]:7: boom", err)"#, &mut vm).unwrap();
         let mut score = Score { points: 0 };
         let mut cx = vm.ctx();
         let f = cx.load_chunk("return add_points(5) + add_points(2)", "host.umbra").unwrap();
-        let r = cx.with_host(&mut score, |cx| {
-            // A loan of another type doesn't hide Score.
-            cx.with_host(&mut Other, |cx| cx.call(f, &[]))
-        }).unwrap();
+        let r = cx
+            .with_host(&mut score, |cx| {
+                // A loan of another type doesn't hide Score.
+                cx.with_host(&mut Other, |cx| cx.call(f, &[]))
+            })
+            .unwrap();
         assert_eq!(r[0].as_int(), Some(12));
 
         // The loan ended with with_host: the same native finds nothing.
@@ -5121,13 +5053,16 @@ assert(err == "[string \"...\"]:7: boom", err)"#, &mut vm).unwrap();
     fn host_drives_metatable_class_objects() {
         let mut vm = Vm::new();
         let mut cx = vm.ctx();
-        let class = exec(&mut cx, r#"let Spinner = {}
+        let class = exec(
+            &mut cx,
+            r#"let Spinner = {}
 Spinner.__index = Spinner
 fn Spinner.new(speed) { return setmetatable({ angle = 0, speed = speed }, Spinner) }
 fn Spinner:update(dt) { self.angle = self.angle + self.speed * dt
     return self.angle }
 fn Spinner:fail() { error("spinner jammed") }
-return Spinner"#)[0];
+return Spinner"#,
+        )[0];
 
         // One instance built by script...
         let new = cx.get_field(class, "new").unwrap();
@@ -5166,9 +5101,12 @@ return Spinner"#)[0];
     fn host_iterates_tables_and_bypasses_metamethods_with_raw_access() {
         let mut vm = Vm::new();
         let mut cx = vm.ctx();
-        let t = exec(&mut cx, r#"return setmetatable({ 10, 20, 30, name = "x" }, {
+        let t = exec(
+            &mut cx,
+            r#"return setmetatable({ 10, 20, 30, name = "x" }, {
     __index = fn(t, k) { return "default" },
-    __newindex = fn(t, k, v) { rawset(t, k, v * 2) } })"#)[0];
+    __newindex = fn(t, k, v) { rawset(t, k, v * 2) } })"#,
+        )[0];
         assert_eq!(cx.raw_len(t).unwrap(), 3);
 
         let mut sum = 0;
@@ -5184,10 +5122,13 @@ return Spinner"#)[0];
         assert_eq!((sum, names), (60, vec!["name".to_owned()]));
         // Same walk from script: a hash key used to restart the array part,
         // so pairs over a mixed table never ended.
-        exec(&mut cx, r#"var n = 0
+        exec(
+            &mut cx,
+            r#"var n = 0
 for k, v in pairs({ 10, 20, name = "x", [100] = 1 }) { n = n + 1
     assert(n <= 4, "pairs revisited a key") }
-assert(n == 4)"#);
+assert(n == 4)"#,
+        );
 
         let missing = cx.get_field(t, "missing").unwrap();
         assert_eq!(cx.to_str(missing), Some("default"));
@@ -5224,11 +5165,16 @@ assert(n == 4)"#);
                 None => Err(format!("module '{name}' not found in assets")),
             }
         });
-        let mut assets = Assets([
-            ("scripts/util/math.umbra", "return { double = fn(x) { return x * 2 } }"),
-            ("scripts/broken.umbra", "let x = 1\nlet y = none\nreturn y.z"),
-            ("scripts/bad_syntax.umbra", "let = 1"),
-        ].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect());
+        let mut assets = Assets(
+            [
+                ("scripts/util/math.umbra", "return { double = fn(x) { return x * 2 } }"),
+                ("scripts/broken.umbra", "let x = 1\nlet y = none\nreturn y.z"),
+                ("scripts/bad_syntax.umbra", "let = 1"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        );
 
         let mut cx = vm.ctx();
         cx.with_host(&mut assets, |cx| {
@@ -5321,7 +5267,9 @@ assert(n == 4)"#);
             let helper = CString::new("helper").unwrap();
             unsafe { api::umbra_getglobal(U, helper.as_ptr()) };
             unsafe { api::umbra_pushinteger(U, x) };
-            if unsafe { api::umbra_pcall(U, 1, 1) } != 0 { return -1; }
+            if unsafe { api::umbra_pcall(U, 1, 1) } != 0 {
+                return -1;
+            }
             unsafe { api::umbra_gc_collect(U) };
             let done = CString::new("done").unwrap();
             unsafe { api::umbra_pushstring(U, done.as_ptr()) };
@@ -5332,13 +5280,16 @@ assert(n == 4)"#);
         STATE.store(U, Ordering::Relaxed);
         let name = CString::new("churn").unwrap();
         unsafe { api::umbra_register(U, name.as_ptr(), Some(churn)) };
-        let src = CString::new(r#"fn helper(n) {
+        let src = CString::new(
+            r#"fn helper(n) {
     let t = {}
     for i = 1, 100 { t[i] = tostring(i) }
     return #t + n
 }
 let a, b = churn(5)
-result = tostring(a) .. " " .. b"#).unwrap();
+result = tostring(a) .. " " .. b"#,
+        )
+        .unwrap();
         assert_eq!(unsafe { api::umbra_dostring(U, src.as_ptr()) }, 0);
         assert!(SAME_STATE.load(Ordering::Relaxed));
         let g = CString::new("result").unwrap();
@@ -5365,8 +5316,12 @@ mod heap_safety_tests {
         run_with_vm("x = 1", &mut vm).unwrap();
         vm.gc_collect();
         let baseline = vm.gc.live_count();
-        run_with_vm(r#"keep = {}
-for i = 1, 200 { keep[i] = string.gmatch("a b", "%a") }"#, &mut vm).unwrap();
+        run_with_vm(
+            r#"keep = {}
+for i = 1, 200 { keep[i] = string.gmatch("a b", "%a") }"#,
+            &mut vm,
+        )
+        .unwrap();
         vm.gc_collect();
         let held = vm.gc.live_count();
         assert!(held >= baseline + 200, "iterators aren't heap objects: baseline {baseline} held {held}");
@@ -5404,10 +5359,14 @@ for i = 1, 200 { keep[i] = string.gmatch("a b", "%a") }"#, &mut vm).unwrap();
         run_with_vm(&src, &mut vm).unwrap();
         vm.gc_collect();
         vm.gc_collect();
-        run_with_vm(r#"for i = 1, 100 { let junk = { i } }
+        run_with_vm(
+            r#"for i = 1, 100 { let junk = { i } }
 let h = w(none, "abc")
 assert(type(h) == "table" and h.write == w)
-h:close()"#, &mut vm).unwrap();
+h:close()"#,
+            &mut vm,
+        )
+        .unwrap();
         drop(vm);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "abc");
         let _ = std::fs::remove_file(&path);
@@ -5419,11 +5378,15 @@ h:close()"#, &mut vm).unwrap();
         run_with_vm("next = none", &mut vm).unwrap();
         vm.gc_collect();
         vm.gc_collect();
-        run_with_vm(r#"for i = 1, 100 { let junk = { i } }
+        run_with_vm(
+            r#"for i = 1, 100 { let junk = { i } }
 var n = 0
 for k, v in pairs({1, 2, x = 3}) { n = n + v }
 for i, v in ipairs({4, 5}) { n = n + v }
-assert(n == 15)"#, &mut vm).unwrap();
+assert(n == 15)"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 
     // A VM where a collector step is due right after any of its natives
@@ -5468,7 +5431,8 @@ assert(n == 15)"#, &mut vm).unwrap();
     #[test]
     fn index_function_result_survives_a_due_step() {
         let mut vm = vm_with_due_steps();
-        run_with_vm(r#"let mt = {__index = fresh}
+        run_with_vm(
+            r#"let mt = {__index = fresh}
 for i = 1, 3 {
     let p = setmetatable({}, mt).transform
     assert(rawget(p, "n") == 2, "iteration ${tostring(i)}: p is not the __index result")
@@ -5476,7 +5440,10 @@ for i = 1, 3 {
     assert(q:method() == 2)
     let r = setmetatable({}, mt)["k"]
     assert(rawget(r, "n") == 2)
-}"#, &mut vm).unwrap();
+}"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 
     // The same pattern in the compares: a checkpoint before the fused Jmp
@@ -5484,7 +5451,8 @@ for i = 1, 3 {
     #[test]
     fn compare_metamethod_results_survive_a_due_step() {
         let mut vm = vm_with_due_steps();
-        run_with_vm(r#"let mt = {__lt = yes, __le = yes, __eq = yes}
+        run_with_vm(
+            r#"let mt = {__lt = yes, __le = yes, __eq = yes}
 let a = setmetatable({}, mt)
 let b = setmetatable({}, mt)
 var hits = 0
@@ -5497,13 +5465,17 @@ for i = 1, 3 {
     if a > 5 { hits = hits + 1 }
     if a >= 5 { hits = hits + 1 }
 }
-assert(hits == 21, "hits ${tostring(hits)}")"#, &mut vm).unwrap();
+assert(hits == 21, "hits ${tostring(hits)}")"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 
     #[test]
     fn other_metamethod_results_survive_a_due_step() {
         let mut vm = vm_with_due_steps();
-        run_with_vm(r#"let mt = {__len = fresh, __concat = fresh, __unm = fresh, __add = fresh,
+        run_with_vm(
+            r#"let mt = {__len = fresh, __concat = fresh, __unm = fresh, __add = fresh,
     __div = fresh, __call = fresh, __tostring = fresh_str}
 let o = setmetatable({}, mt)
 for i = 1, 3 {
@@ -5515,7 +5487,10 @@ for i = 1, 3 {
     assert(rawget(o / 2, "n") == 2)
     assert(rawget(o(), "n") == 2)
     assert(tostring(o) == "fresh")
-}"#, &mut vm).unwrap();
+}"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 
     // A __call handler that drops its own metatable was reachable from
@@ -5524,7 +5499,8 @@ for i = 1, 3 {
     #[test]
     fn call_handler_stays_alive_after_dropping_its_metatable() {
         let mut vm = vm_with_due_steps();
-        run_with_vm(r#"let t = {}
+        run_with_vm(
+            r#"let t = {}
 setmetatable(t, {__call = (fn() {
     let tag = { "up" }
     return fn(self) {
@@ -5535,7 +5511,10 @@ setmetatable(t, {__call = (fn() {
     }
 })()})
 let ok, v = pcall(t)
-assert(ok and v == "up", tostring(v))"#, &mut vm).unwrap();
+assert(ok and v == "up", tostring(v))"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 
     // Stress-test finding 18: table.sort's working copy was unrooted while
@@ -5543,7 +5522,8 @@ assert(ok and v == "up", tostring(v))"#, &mut vm).unwrap();
     #[test]
     fn sort_keeps_elements_the_comparator_removed() {
         let mut vm = vm_with_due_steps();
-        run_with_vm(r#"let t = { {v = 3}, {v = 1}, {v = 2} }
+        run_with_vm(
+            r#"let t = { {v = 3}, {v = 1}, {v = 2} }
 var emptied = false
 table.sort(t, fn(a, b) {
     if not emptied {
@@ -5554,7 +5534,10 @@ table.sort(t, fn(a, b) {
     }
     return a.v < b.v
 })
-assert(t[1].v == 1 and t[2].v == 2 and t[3].v == 3)"#, &mut vm).unwrap();
+assert(t[1].v == 1 and t[2].v == 2 and t[3].v == 3)"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 }
 
@@ -5579,10 +5562,14 @@ mod nesting_tests {
         on_big_stack(|| {
             let mut vm = Vm::new();
             for _ in 0..2 {
-                run_with_vm(r#"fn f(n) { return pcall(f, n + 1) }
+                run_with_vm(
+                    r#"fn f(n) { return pcall(f, n + 1) }
 let r = table.pack(f(0))
 assert(r[r.n] == "stack overflow" and r[r.n - 1] == false, tostring(r[r.n]))
-depth = r.n - 2"#, &mut vm).unwrap();
+depth = r.n - 2"#,
+                    &mut vm,
+                )
+                .unwrap();
                 assert_eq!(vm.nesting, 0);
                 // The chunk runs one level deep and each pcall that got in
                 // added one. The same depth both times: the count came
@@ -5597,8 +5584,7 @@ depth = r.n - 2"#, &mut vm).unwrap();
     fn index_metamethod_recursion_is_an_error() {
         on_big_stack(|| {
             let mut vm = Vm::new();
-            let err = run_with_vm("let t = setmetatable({}, {__index = fn(t, k) { return t[k] }})\nprint(t.x)", &mut vm)
-                .unwrap_err();
+            let err = run_with_vm("let t = setmetatable({}, {__index = fn(t, k) { return t[k] }})\nprint(t.x)", &mut vm).unwrap_err();
             assert_eq!(err, "[string \"...\"]:1: stack overflow");
             assert_eq!(vm.nesting, 0);
             run_with_vm("let ok, e = pcall(fn() { return setmetatable({}, {__index = fn(t, k) { return t[k] }}).x })\nassert(not ok and e == \"[string \\\"...\\\"]:1: stack overflow\", e)", &mut vm).unwrap();
@@ -5653,12 +5639,16 @@ depth = r.n - 2"#, &mut vm).unwrap();
             assert!(err.ends_with("stack overflow"), "{err}");
             assert_eq!(vm.nesting, 0);
             // Sort comparators and __tostring count too.
-            run_with_vm(r#"fn s(n) { table.sort({2, 1}, fn(a, b) { s(n + 1) return a < b }) }
+            run_with_vm(
+                r#"fn s(n) { table.sort({2, 1}, fn(a, b) { s(n + 1) return a < b }) }
 let ok, e = pcall(s, 0)
 assert(not ok and e:sub(-14) == "stack overflow", e)
 fn ts(n) { return tostring(setmetatable({}, {__tostring = fn() { return ts(n + 1) }})) }
 let ok2, e2 = pcall(ts, 0)
-assert(not ok2 and e2:sub(-14) == "stack overflow", e2)"#, &mut vm).unwrap();
+assert(not ok2 and e2:sub(-14) == "stack overflow", e2)"#,
+                &mut vm,
+            )
+            .unwrap();
             assert_eq!(vm.nesting, 0);
         });
     }
@@ -5668,9 +5658,7 @@ assert(not ok2 and e2:sub(-14) == "stack overflow", e2)"#, &mut vm).unwrap();
     #[test]
     fn caught_panic_restores_the_count() {
         let mut vm = Vm::new();
-        vm.set_global_cfn("panic_nested", |cx, _args| {
-            cx.vm.nested(|_| -> crate::vm::VmResult<Vec<Value>> { panic!("deep") })
-        });
+        vm.set_global_cfn("panic_nested", |cx, _args| cx.vm.nested(|_| -> crate::vm::VmResult<Vec<Value>> { panic!("deep") }));
         let err = run_with_vm("panic_nested()", &mut vm).unwrap_err();
         assert!(err.contains("internal error (panic): deep"), "{err}");
         assert_eq!(vm.nesting, 0);
@@ -5697,7 +5685,9 @@ mod ownership_tests {
             assert!(errs.is_empty());
             let results = vm.exec(compile(block, None).unwrap()).unwrap();
             let mut cx = vm.ctx();
-            for &v in &results { cx.root(v); }
+            for &v in &results {
+                cx.root(v);
+            }
             let t = cx.new_table();
             cx.raw_set(t, Value::int(1), results[0]).unwrap();
             cx.raw_set(t, Value::int(2), results[1]).unwrap();
@@ -5722,11 +5712,18 @@ mod ownership_tests {
         let p = vm.gc.closure_proto(f).unwrap();
         // SAFETY: the proto of a function value the caller keeps rooted.
         let p = unsafe { crate::heap::proto(p) };
-        let mut out: Vec<(u64, u64)> = p.consts.iter().filter_map(|c| match c {
-            chunk::Const::Str(sc) => Some(sc.cached()),
-            _ => None,
-        }).collect();
-        out.extend(p.global_cache.iter().map(|c| { let (owner, _, bits) = c.get(); (owner, bits) }));
+        let mut out: Vec<(u64, u64)> = p
+            .consts
+            .iter()
+            .filter_map(|c| match c {
+                chunk::Const::Str(sc) => Some(sc.cached()),
+                _ => None,
+            })
+            .collect();
+        out.extend(p.global_cache.iter().map(|c| {
+            let (owner, _, bits) = c.get();
+            (owner, bits)
+        }));
         out.retain(|&(_, bits)| bits != 0);
         out
     }
@@ -5808,7 +5805,8 @@ mod coroutine_gc_tests {
         assert!(vm.gc.live_count() >= baseline + 100);
         run_with_vm("keep = none", &mut vm).unwrap();
         // Suspended, finished and wrapped ones, all dropped at once.
-        let src = format!(r#"var peak = 0
+        let src = format!(
+            r#"var peak = 0
 for i = 1, {n} {{
     let co = coroutine.create(fn(a) {{ let t = {{ a }} yield(t) return a }})
     coroutine.resume(co, i)
@@ -5817,7 +5815,8 @@ for i = 1, {n} {{
     w()
     if i % 100 == 0 {{ let l = live() if l > peak {{ peak = l }} }}
 }}
-return peak"#);
+return peak"#
+        );
         let mut cx = vm.ctx();
         let f = cx.load_chunk(&src, "churn.umbra").unwrap();
         let peak = cx.call(f, &[]).unwrap()[0].as_int().unwrap() as usize;
@@ -5833,7 +5832,8 @@ return peak"#);
     #[test]
     fn suspended_coroutine_held_by_a_table_survives_and_resumes() {
         let mut vm = vm_with_collect();
-        run_with_vm(r#"holder = { co = coroutine.create(fn(a) {
+        run_with_vm(
+            r#"holder = { co = coroutine.create(fn(a) {
     let t = { "x", "y" }
     let s = "str" .. a
     let b = yield(1)
@@ -5842,19 +5842,28 @@ return peak"#);
     return t[2] .. s .. c
 }) }
 let ok, v = coroutine.resume(holder.co, 5)
-assert(ok and v == 1)"#, &mut vm).unwrap();
+assert(ok and v == 1)"#,
+            &mut vm,
+        )
+        .unwrap();
         let churn = "for i = 1, 200 { let junk = { tostring(i) } }";
-        for step in ["let ok, v = coroutine.resume(holder.co, 7)\nassert(ok and v == 2, v)",
-                     "let ok, v = coroutine.resume(holder.co, \"!\")\nassert(ok and v == \"ystr5!\", v)\nassert(coroutine.status(holder.co) == \"dead\")"] {
+        for step in [
+            "let ok, v = coroutine.resume(holder.co, 7)\nassert(ok and v == 2, v)",
+            "let ok, v = coroutine.resume(holder.co, \"!\")\nassert(ok and v == \"ystr5!\", v)\nassert(coroutine.status(holder.co) == \"dead\")",
+        ] {
             vm.gc_collect();
             run_with_vm(churn, &mut vm).unwrap();
             vm.gc_collect();
             run_with_vm(step, &mut vm).unwrap();
         }
-        run_with_vm(r#"let ok, e = coroutine.resume(holder.co)
+        run_with_vm(
+            r#"let ok, e = coroutine.resume(holder.co)
 assert(not ok and e == "cannot resume dead coroutine")
 weak = setmetatable({ holder.co }, { __mode = "v" })
-holder = none"#, &mut vm).unwrap();
+holder = none"#,
+            &mut vm,
+        )
+        .unwrap();
         vm.gc_collect();
         run_with_vm("assert(weak[1] == none)", &mut vm).unwrap();
     }
@@ -5864,7 +5873,8 @@ holder = none"#, &mut vm).unwrap();
     #[test]
     fn the_resume_chain_and_its_parked_stacks_survive_a_collection() {
         let mut vm = vm_with_collect();
-        run_with_vm(r#"let main_data = { "main" }
+        run_with_vm(
+            r#"let main_data = { "main" }
 let r = coroutine.wrap(fn() {
     let outer_data = { "outer" }
     var inner = none
@@ -5881,7 +5891,10 @@ let r = coroutine.wrap(fn() {
     assert(coroutine.status(inner) == "suspended")
     return v .. " " .. outer_data[1]
 })()
-assert(r == "inner outer" and main_data[1] == "main", r)"#, &mut vm).unwrap();
+assert(r == "inner outer" and main_data[1] == "main", r)"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 
     // A coroutine scanned early in an incremental cycle runs again before
@@ -5893,7 +5906,9 @@ assert(r == "inner outer" and main_data[1] == "main", r)"#, &mut vm).unwrap();
         let mut vm = Vm::new();
         vm.gc.threshold = 1;
         vm.gc.byte_threshold = 1024;
-        run_with_vm(&format!(r#"let gen = coroutine.wrap(fn() {{
+        run_with_vm(
+            &format!(
+                r#"let gen = coroutine.wrap(fn() {{
     var keep = none
     for i = 1, {n} {{ keep = {{ i, tostring(i), keep }} yield(i) }}
     var k = {n}
@@ -5905,7 +5920,11 @@ assert(r == "inner outer" and main_data[1] == "main", r)"#, &mut vm).unwrap();
     return "ok"
 }})
 for i = 1, {n} {{ assert(gen() == i) let junk = {{ {{}}, {{}} }} }}
-assert(gen() == "ok")"#), &mut vm).unwrap();
+assert(gen() == "ok")"#
+            ),
+            &mut vm,
+        )
+        .unwrap();
     }
 }
 
@@ -5937,14 +5956,16 @@ mod proto_gc_tests {
         let baseline = vm.gc.live_count();
         // Each chunk has a nested function, an upvalue-less one and a
         // string constant of its own, which its proto caches once run.
-        let src = format!(r#"var peak = 0
+        let src = format!(
+            r#"var peak = 0
 for i = 1, {n} {{
     let f = load("let s = \"s" .. i .. "\"\nreturn fn() {{ return s }}, fn() {{ return " .. i .. " }}")
     let a, b = f()
     assert(a() == "s" .. i and b() == i)
     if i % 100 == 0 {{ let l = live() if l > peak {{ peak = l }} }}
 }}
-return peak"#);
+return peak"#
+        );
         let mut cx = vm.ctx();
         let f = cx.load_chunk(&src, "loads.umbra").unwrap();
         let peak = cx.call(f, &[]).unwrap()[0].as_int().unwrap() as usize;
@@ -5971,7 +5992,9 @@ return peak"#);
             let module = cx.call(f, &[]).unwrap()[0];
             let r = cx.call_method(module, "update", &[Value::int(2)]).unwrap()[0];
             assert_eq!(r.as_int(), Some(2 * i));
-            if let Some(old) = current.replace(cx.make_ref(module)) { cx.release_ref(old); }
+            if let Some(old) = current.replace(cx.make_ref(module)) {
+                cx.release_ref(old);
+            }
         }
         vm.gc_collect();
         vm.gc_collect();
@@ -5994,26 +6017,35 @@ for i = 1, {n} {{
             vm.gc_collect();
             run_with_vm("for i = 1, 300 { let junk = { tostring(i) } }", &mut vm).unwrap();
         }
-        run_with_vm(&format!(r#"for i = 1, {n} {{
+        run_with_vm(
+            &format!(
+                r#"for i = 1, {n} {{
     let f = keep[i]
     assert(f[1]("x") == "c" .. i .. "x")
     assert(f[2]() == "plain" .. i)
     let inner = f[3]()
     collect()
     assert(inner() == "deep" .. i)
-}}"#), &mut vm).unwrap();
+}}"#
+            ),
+            &mut vm,
+        )
+        .unwrap();
     }
 
     #[test]
     fn required_module_functions_keep_working() {
         let mut vm = vm_with_collect();
-        vm.set_module_loader(|_cx, name| Ok(crate::embed::Module {
-            source: "let tag = \"mod\"\nreturn { f = fn() { return tag }, g = fn() { return \"g\" } }".into(),
-            chunk_name: format!("{name}.umbra"),
-        }));
+        vm.set_module_loader(|_cx, name| {
+            Ok(crate::embed::Module {
+                source: "let tag = \"mod\"\nreturn { f = fn() { return tag }, g = fn() { return \"g\" } }".into(),
+                chunk_name: format!("{name}.umbra"),
+            })
+        });
         run_with_vm("m = require(\"m\")", &mut vm).unwrap();
         vm.gc_collect();
-        run_with_vm("for i = 1, 300 { let junk = { tostring(i) } }\ncollect()\nassert(m.f() == \"mod\" and m.g() == \"g\" and require(\"m\") == m)", &mut vm).unwrap();
+        run_with_vm("for i = 1, 300 { let junk = { tostring(i) } }\ncollect()\nassert(m.f() == \"mod\" and m.g() == \"g\" and require(\"m\") == m)", &mut vm)
+            .unwrap();
     }
 
     // A proto scanned early in an incremental cycle caches a string
@@ -6026,13 +6058,20 @@ for i = 1, {n} {{
         vm.gc.threshold = 1;
         vm.gc.byte_threshold = 1024;
         let body: String = (1..=n).map(|j| format!("if i == {j} {{ return \"const_{j}\" }}\n")).collect();
-        run_with_vm(&format!(r#"let f = load("return fn(i) {{\n{body}}}")()
+        run_with_vm(
+            &format!(
+                r#"let f = load("return fn(i) {{\n{body}}}")()
 for round = 1, 3 {{
     for i = 1, {n} {{
         assert(f(i) == "const_" .. i, "round " .. round .. ": constant " .. i)
         let junk = {{ {{}}, {{}}, tostring(i) }}
     }}
-}}"#, body = body.replace('"', "\\\"").replace('\n', "\\n")), &mut vm).unwrap();
+}}"#,
+                body = body.replace('"', "\\\"").replace('\n', "\\n")
+            ),
+            &mut vm,
+        )
+        .unwrap();
     }
 }
 
@@ -6050,11 +6089,14 @@ mod ctx_function_tests {
         vm.set_global_cfn("bind", |cx, args| {
             let (obj, name) = (args[0], args[1]);
             let method = cx.get(obj, name)?;
-            let bound = cx.new_closure(|cx, args, up| {
-                let mut full = vec![up[0]];
-                full.extend_from_slice(args);
-                Ok(cx.call(up[1], &full)?)
-            }, &[obj, method]);
+            let bound = cx.new_closure(
+                |cx, args, up| {
+                    let mut full = vec![up[0]];
+                    full.extend_from_slice(args);
+                    Ok(cx.call(up[1], &full)?)
+                },
+                &[obj, method],
+            );
             Ok(vec![bound])
         });
         vm.set_global_cfn("collect", |cx, _args| {
@@ -6063,7 +6105,8 @@ mod ctx_function_tests {
         });
         // Only the bound closure's upvalues reach the object and its method
         // once `make` returns.
-        run_with_vm(r#"fn make(n) {
+        run_with_vm(
+            r#"fn make(n) {
     let o = { n = n, add = fn(self, x) { return self.n + x } }
     return bind(o, "add")
 }
@@ -6072,7 +6115,10 @@ collect()
 for i = 1, 300 { let junk = { tostring(i) } }
 collect()
 assert(f(3) == 8)
-assert(f(10) == 15)"#, &mut vm).unwrap();
+assert(f(10) == 15)"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 
     // A host builds a module table entirely through one Ctx, with the
@@ -6087,12 +6133,15 @@ assert(f(10) == 15)"#, &mut vm).unwrap();
         let label = cx.new_string("count");
         let counter = cx.new_table();
         cx.set_field(counter, "n", Value::int(0)).unwrap();
-        let next = cx.new_closure(|cx, _args, up| {
-            let n = cx.get_field(up[0], "n")?.as_int().unwrap_or(0) + 1;
-            cx.set_field(up[0], "n", Value::int(n))?;
-            let s = cx.to_str(up[1]).unwrap_or("?").to_owned();
-            Ok(vec![cx.new_string(&format!("{s} {n}"))])
-        }, &[counter, label]);
+        let next = cx.new_closure(
+            |cx, _args, up| {
+                let n = cx.get_field(up[0], "n")?.as_int().unwrap_or(0) + 1;
+                cx.set_field(up[0], "n", Value::int(n))?;
+                let s = cx.to_str(up[1]).unwrap_or("?").to_owned();
+                Ok(vec![cx.new_string(&format!("{s} {n}"))])
+            },
+            &[counter, label],
+        );
         let churn = cx.load_chunk("for i = 1, 500 { let junk = { tostring(i) } }", "churn.umbra").unwrap();
         cx.call(churn, &[]).unwrap();
         cx.set_field(module, "answer", answer).unwrap();
@@ -6100,10 +6149,14 @@ assert(f(10) == 15)"#, &mut vm).unwrap();
         cx.set_global("m", module);
         drop(cx);
         vm.gc_collect();
-        run_with_vm(r#"for i = 1, 300 { let junk = { tostring(i) } }
+        run_with_vm(
+            r#"for i = 1, 300 { let junk = { tostring(i) } }
 assert(m.answer() == 42)
 assert(m.next() == "count 1")
-assert(m.next() == "count 2")"#, &mut vm).unwrap();
+assert(m.next() == "count 2")"#,
+            &mut vm,
+        )
+        .unwrap();
     }
 }
 
@@ -6120,28 +6173,43 @@ mod interp_tests {
     // Each part is what tostring() makes of it, as in print.
     #[test]
     fn parts_use_tostring() {
-        assert_eq!(out(r#"let v = setmetatable({}, {__tostring = fn(v) { return "V" }})
+        assert_eq!(
+            out(r#"let v = setmetatable({}, {__tostring = fn(v) { return "V" }})
 print("a ${v}")
 print("${v}")
-print("${v}${v} and ${v}!")"#), ["a V", "V", "VV and V!"]);
+print("${v}${v} and ${v}!")"#),
+            ["a V", "V", "VV and V!"]
+        );
         assert_eq!(out(r#"print("${true} ${false} ${none}")"#), ["true false none"]);
         assert_eq!(out(r#"print("${1} ${2.5} ${3.0} ${-0.0} ${1 // 0.0}")"#), ["1 2.5 3.0 -0.0 inf"]);
-        assert_eq!(out(r#"let t = {}
-print("${t} ${print} ${"s"}" == tostring(t) .. " " .. tostring(print) .. " s")"#), ["true"]);
+        assert_eq!(
+            out(r#"let t = {}
+print("${t} ${print} ${"s"}" == tostring(t) .. " " .. tostring(print) .. " s")"#),
+            ["true"]
+        );
         // __tostring may return a number, like tostring() allows.
-        assert_eq!(out(r#"let n = setmetatable({}, {__tostring = fn() { return 7 }})
-print("n=${n}")"#), ["n=7"]);
+        assert_eq!(
+            out(r#"let n = setmetatable({}, {__tostring = fn() { return 7 }})
+print("n=${n}")"#),
+            ["n=7"]
+        );
         // __concat is not consulted: interpolation isn't `..`.
-        assert_eq!(out(r#"let c = setmetatable({}, {__concat = fn() { return "cat" }, __tostring = fn() { return "str" }})
-print("${c}")"#), ["str"]);
+        assert_eq!(
+            out(r#"let c = setmetatable({}, {__concat = fn() { return "cat" }, __tostring = fn() { return "str" }})
+print("${c}")"#),
+            ["str"]
+        );
     }
 
     #[test]
     fn a_script_tostring_does_not_change_it() {
-        assert_eq!(out(r#"tostring = fn(x) { return "global" }
+        assert_eq!(
+            out(r#"tostring = fn(x) { return "global" }
 print("${1} ${true}")
 let tostring = fn(x) { return "local" }
-print("${2} ${none}")"#), ["1 true", "2 none"]);
+print("${2} ${none}")"#),
+            ["1 true", "2 none"]
+        );
     }
 
     #[test]
@@ -6199,27 +6267,34 @@ mod traceback_tests {
     #[test]
     fn a_required_module_error_shows_the_whole_chain() {
         let mut vm = Vm::new();
-        vm.set_module_loader(|_cx, name| Ok(Module {
-            source: "fn boom() { error(\"deep\") }\nboom()".to_owned(),
-            chunk_name: format!("{name}.umbra"),
-        }));
+        vm.set_module_loader(|_cx, name| Ok(Module { source: "fn boom() { error(\"deep\") }\nboom()".to_owned(), chunk_name: format!("{name}.umbra") }));
         let mut cx = vm.ctx();
         let err = fail(&mut cx, "fn get() { let m = require(\"mod\") return m }\nget()", "main.umbra");
         assert_eq!(err.message, "mod.umbra:1: deep");
-        assert_eq!(err.traceback, "\tmod.umbra:1: in function 'boom'\n\tmod.umbra:2: in main chunk\n\
-            \tmain.umbra:1: in function 'get'\n\tmain.umbra:2: in main chunk");
+        assert_eq!(
+            err.traceback,
+            "\tmod.umbra:1: in function 'boom'\n\tmod.umbra:2: in main chunk\n\
+            \tmain.umbra:1: in function 'get'\n\tmain.umbra:2: in main chunk"
+        );
     }
 
     #[test]
     fn an_index_metamethod_error_shows_the_whole_chain() {
         let mut vm = Vm::new();
         let mut cx = vm.ctx();
-        let err = fail(&mut cx, r#"let t = setmetatable({}, {__index = fn(t, k) { error("no field " .. k) }})
+        let err = fail(
+            &mut cx,
+            r#"let t = setmetatable({}, {__index = fn(t, k) { error("no field " .. k) }})
 fn read() { let v = t.missing return v }
-read()"#, "idx.umbra");
+read()"#,
+            "idx.umbra",
+        );
         assert_eq!(err.message, "idx.umbra:1: no field missing");
-        assert_eq!(err.traceback, "\tidx.umbra:1: in function <idx.umbra:1>\n\
-            \tidx.umbra:2: in function 'read'\n\tidx.umbra:3: in main chunk");
+        assert_eq!(
+            err.traceback,
+            "\tidx.umbra:1: in function <idx.umbra:1>\n\
+            \tidx.umbra:2: in function 'read'\n\tidx.umbra:3: in main chunk"
+        );
     }
 
     // A native that passes on a failed Ctx::call: the callback's frames,
@@ -6231,8 +6306,11 @@ read()"#, "idx.umbra");
         let mut cx = vm.ctx();
         let err = fail(&mut cx, "fn inner() { error(\"in callback\") }\nfn outer() { call(inner) }\nouter()", "cb.umbra");
         assert_eq!(err.message, "cb.umbra:1: in callback");
-        assert_eq!(err.traceback, "\tcb.umbra:1: in function 'inner'\n\
-            \tcb.umbra:2: in function 'outer'\n\tcb.umbra:3: in main chunk");
+        assert_eq!(
+            err.traceback,
+            "\tcb.umbra:1: in function 'inner'\n\
+            \tcb.umbra:2: in function 'outer'\n\tcb.umbra:3: in main chunk"
+        );
     }
 
     // Finding 46: an error raised before any script ran in a Ctx::call
@@ -6260,23 +6338,32 @@ read()"#, "idx.umbra");
         let mut cx = vm.ctx();
         let err = fail(&mut cx, "let gen = coroutine.wrap(fn() { error(\"in co\") })\nfn drive() { gen() }\ndrive()", "co.umbra");
         assert_eq!(err.message, "co.umbra:1: in co");
-        assert_eq!(err.traceback, "\tco.umbra:1: in function <co.umbra:1>\n\
-            \tco.umbra:2: in function 'drive'\n\tco.umbra:3: in main chunk");
+        assert_eq!(
+            err.traceback,
+            "\tco.umbra:1: in function <co.umbra:1>\n\
+            \tco.umbra:2: in function 'drive'\n\tco.umbra:3: in main chunk"
+        );
     }
 
     // An xpcall handler sees its own frames, then the stack the error was
     // raised on, even after a pcall of its own failed.
     #[test]
     fn debug_traceback_in_a_handler_shows_the_error_stack() {
-        let out = run_capture(r#"fn fail() { error("x") }
+        let out = run_capture(
+            r#"fn fail() { error("x") }
 fn handler(e) { pcall(fn() { error("inner") }) return debug.traceback(e) }
 fn run() { let ok, tb = xpcall(fail, handler) return tb }
-print(run())"#).unwrap();
-        assert_eq!(out, ["[string \"...\"]:1: x\nstack traceback:\n\
+print(run())"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            ["[string \"...\"]:1: x\nstack traceback:\n\
             \t[string \"...\"]:2: in function 'handler'\n\
             \t[string \"...\"]:1: in function 'fail'\n\
             \t[string \"...\"]:3: in function 'run'\n\
-            \t[string \"...\"]:4: in main chunk"]);
+            \t[string \"...\"]:4: in main chunk"]
+        );
     }
 
     // Only the first enrichment records: an error that was handled leaves
@@ -6298,7 +6385,9 @@ print(run())"#).unwrap();
     fn frames_are_named_after_their_declaration() {
         let mut vm = Vm::new();
         let mut cx = vm.ctx();
-        let f = cx.load_chunk(r#"let A = {}
+        let f = cx
+            .load_chunk(
+                r#"let A = {}
 fn A:update() { error("e") }
 fn A.make() { error("e") }
 fn top() { error("e") }
@@ -6307,7 +6396,10 @@ var vf = fn() { error("e") }
 let fn lfn() { error("e") }
 let anon = { f = fn() { error("e") } }
 let p, q = fn() { error("e") }, fn() { error("e") }
-return A, top, lf, vf, lfn, anon.f, p, q"#, "n.umbra").unwrap();
+return A, top, lf, vf, lfn, anon.f, p, q"#,
+                "n.umbra",
+            )
+            .unwrap();
         let r = cx.call(f, &[]).unwrap();
         let err = cx.call_method(r[0], "update", &[]).unwrap_err();
         assert_eq!(err.traceback, "\tn.umbra:2: in method 'update'");
@@ -6316,16 +6408,19 @@ return A, top, lf, vf, lfn, anon.f, p, q"#, "n.umbra").unwrap();
         for &f in &r[1..] {
             tracebacks.push(cx.call(f, &[]).unwrap_err().traceback);
         }
-        assert_eq!(tracebacks, [
-            "\tn.umbra:3: in function 'A.make'",
-            "\tn.umbra:4: in function 'top'",
-            "\tn.umbra:5: in function 'lf'",
-            "\tn.umbra:6: in function 'vf'",
-            "\tn.umbra:7: in function 'lfn'",
-            "\tn.umbra:8: in function <n.umbra:8>",
-            "\tn.umbra:9: in function 'p'",
-            "\tn.umbra:9: in function 'q'",
-        ]);
+        assert_eq!(
+            tracebacks,
+            [
+                "\tn.umbra:3: in function 'A.make'",
+                "\tn.umbra:4: in function 'top'",
+                "\tn.umbra:5: in function 'lf'",
+                "\tn.umbra:6: in function 'vf'",
+                "\tn.umbra:7: in function 'lfn'",
+                "\tn.umbra:8: in function <n.umbra:8>",
+                "\tn.umbra:9: in function 'p'",
+                "\tn.umbra:9: in function 'q'",
+            ]
+        );
         // Where the call site names the function, that name wins, as in Lua.
         let err = fail(&mut cx, "fn top() { error(\"e\") }\nlet g = top\nfn run() { g() }\nrun()", "c.umbra");
         assert_eq!(err.traceback, "\tc.umbra:1: in upvalue 'g'\n\tc.umbra:3: in function 'run'\n\tc.umbra:4: in main chunk");
@@ -6334,10 +6429,13 @@ return A, top, lf, vf, lfn, anon.f, p, q"#, "n.umbra").unwrap();
     // Stress-test finding 20: load's syntax errors name the chunk.
     #[test]
     fn load_syntax_errors_name_the_chunk() {
-        let out = run_capture(r#"let f, e = load("let x = 1\nlet = 2", "cfg.umbra")
+        let out = run_capture(
+            r#"let f, e = load("let x = 1\nlet = 2", "cfg.umbra")
 print(f, e)
 let g, e2 = load("let = 1")
-print(g, e2)"#).unwrap();
+print(g, e2)"#,
+        )
+        .unwrap();
         assert_eq!(out, ["none\tcfg.umbra: line 2: expected identifier", "none\t[string \"...\"]: line 1: expected identifier"]);
     }
 
@@ -6347,11 +6445,15 @@ print(g, e2)"#).unwrap();
         let mut vm = Vm::new();
         vm.gc.threshold = 1;
         let mut cx = vm.ctx();
-        let err = fail(&mut cx, r#"fn gc_fail() { ran = true error("in gc") }
+        let err = fail(
+            &mut cx,
+            r#"fn gc_fail() { ran = true error("in gc") }
 setmetatable({}, {__gc = gc_fail})
 for i = 1, 5000 { let junk = { i } }
 if not ran { error("no finalizer ran") }
-error("after")"#, "g.umbra");
+error("after")"#,
+            "g.umbra",
+        );
         assert_eq!(err.message, "g.umbra:5: after");
         assert_eq!(err.traceback, "\tg.umbra:5: in main chunk");
     }
@@ -6368,7 +6470,8 @@ mod collectgarbage_tests {
 
     #[test]
     fn collect_frees_and_count_reports_kilobytes() {
-        assert_eq!(out(r#"let weak = setmetatable({}, {__mode = "v"})
+        assert_eq!(
+            out(r#"let weak = setmetatable({}, {__mode = "v"})
 weak[1] = {}
 print(collectgarbage("collect"), weak[1])
 weak[1] = {}
@@ -6382,14 +6485,18 @@ print(grown - before > 100000 * 8 / 1024)
 big = none
 collectgarbage()
 print(collectgarbage("count") < grown)"#),
-            ["0\tnone", "0\tnone", "float\ttrue", "true", "true"]);
+            ["0\tnone", "0\tnone", "float\ttrue", "true", "true"]
+        );
     }
 
     #[test]
     fn step_reports_a_finished_cycle() {
-        assert_eq!(out(r#"var steps = 0
+        assert_eq!(
+            out(r#"var steps = 0
 while not collectgarbage("step") { steps = steps + 1 }
-print(steps > 0, type(collectgarbage("step")))"#), ["true\tboolean"]);
+print(steps > 0, type(collectgarbage("step")))"#),
+            ["true\tboolean"]
+        );
     }
 
     #[test]
@@ -6402,7 +6509,8 @@ print(steps > 0, type(collectgarbage("step")))"#), ["true\tboolean"]);
 
     #[test]
     fn tostring_prints_a_stable_identity() {
-        assert_eq!(out(r#"let t = {}
+        assert_eq!(
+            out(r#"let t = {}
 let co = coroutine.create(fn() {})
 let b = bytes.new(4)
 let up = 1
@@ -6412,10 +6520,18 @@ for _, v in ipairs({t, print, fn() {}, fn() { return up }, co, b}) {
 }
 print(tostring({}) != tostring(t))
 let named = setmetatable({}, {__tostring = fn() { return "named" }})
-print(named, "${named}")"#), [
-            "table\ttrue\ttrue", "function\ttrue\ttrue", "function\ttrue\ttrue", "function\ttrue\ttrue",
-            "coroutine\ttrue\ttrue", "bytes\ttrue\ttrue", "true", "named\tnamed",
-        ]);
+print(named, "${named}")"#),
+            [
+                "table\ttrue\ttrue",
+                "function\ttrue\ttrue",
+                "function\ttrue\ttrue",
+                "function\ttrue\ttrue",
+                "coroutine\ttrue\ttrue",
+                "bytes\ttrue\ttrue",
+                "true",
+                "named\tnamed",
+            ]
+        );
         // print and interpolation show the same identity.
         assert_eq!(out("let t = {}\nprint(t == t, tostring(t) == \"${t}\")"), ["true\ttrue"]);
         let printed = out("let t = {}\nprint(t)\nprint(tostring(t))");
@@ -6437,12 +6553,15 @@ mod none_tests {
 
     #[test]
     fn none_is_spelled_none() {
-        assert_eq!(out(r#"print(none, type(none), tostring(none), "${none}", math.type("x"))
+        assert_eq!(
+            out(r#"print(none, type(none), tostring(none), "${none}", math.type("x"))
 print(string.format("%s %q", none, none))
 print(load("return " .. string.format("%q", none))() == none)
 let t = {}
 let ok, e = pcall(fn() { return t.a.b })
-print(e)"#), ["none\tnone\tnone\tnone\tnone", "none none", "true", "[string \"...\"]:5: attempt to index a none value (field 'a')"]);
+print(e)"#),
+            ["none\tnone\tnone\tnone\tnone", "none none", "true", "[string \"...\"]:5: attempt to index a none value (field 'a')"]
+        );
         assert_eq!(Value::nil().to_string(), "none");
         assert_eq!(format!("{:?}", Value::nil()), "none");
         let err = run("let f = none\nf()").unwrap_err();
@@ -6451,20 +6570,28 @@ print(e)"#), ["none\tnone\tnone\tnone\tnone", "none none", "true", "[string \"..
 
     #[test]
     fn storing_under_a_none_key_is_an_error() {
-        for src in ["let t = {}\nt[none] = 1", "let t = {}\nt[0/0] = 1", "let t = {}\nt[none] = none",
-                    "let k = none\nlet t = {[k] = 1}", "let t = {}\nrawset(t, none, 1)",
-                    // A __newindex table passes the key on to the store.
-                    "let t = setmetatable({}, {__newindex = {}})\nt[none] = 1"] {
+        for src in [
+            "let t = {}\nt[none] = 1",
+            "let t = {}\nt[0/0] = 1",
+            "let t = {}\nt[none] = none",
+            "let k = none\nlet t = {[k] = 1}",
+            "let t = {}\nrawset(t, none, 1)",
+            // A __newindex table passes the key on to the store.
+            "let t = setmetatable({}, {__newindex = {}})\nt[none] = 1",
+        ] {
             assert_eq!(run(src).unwrap_err(), "[string \"...\"]:2: index is none", "{src}");
         }
         // Reading one is fine, as in Lua; and a __newindex function sees the
         // none key like any other.
-        assert_eq!(out(r#"let t = {1}
+        assert_eq!(
+            out(r#"let t = {1}
 print(t[none], rawget(t, none))
 var seen = false
 let p = setmetatable({}, {__newindex = fn(t, k, v) { seen = k == none and v == 2 }})
 p[none] = 2
-print(seen)"#), ["none\tnone", "true"]);
+print(seen)"#),
+            ["none\tnone", "true"]
+        );
     }
 
     #[test]
@@ -6478,7 +6605,10 @@ print(seen)"#), ["none\tnone", "true"]);
         assert!(cx.next(t, Value::nil()).unwrap().is_none());
         // From a native the error carries the calling script's position.
         drop(cx);
-        vm.set_global_cfn("store", |cx, args| { cx.raw_set(args[0], args[1], args[2])?; Ok(vec![]) });
+        vm.set_global_cfn("store", |cx, args| {
+            cx.raw_set(args[0], args[1], args[2])?;
+            Ok(vec![])
+        });
         let err = run_with_vm("let t = {}\nstore(t, none, 1)", &mut vm).unwrap_err();
         assert_eq!(err, "[string \"...\"]:2: index is none");
     }
@@ -6532,9 +6662,7 @@ mod require_tests {
 
     #[test]
     fn a_module_whose_load_failed_is_not_cached() {
-        let modules = Rc::new(RefCell::new(vec![
-            ("m", "error(\"not yet\")".to_owned()),
-        ]));
+        let modules = Rc::new(RefCell::new(vec![("m", "error(\"not yet\")".to_owned())]));
         let loads = Rc::new(Cell::new(0));
         let mut vm = vm_with(modules.clone(), loads.clone());
         let mut cx = vm.ctx();
@@ -6582,13 +6710,18 @@ mod provenance_tests {
         assert_eq!(f.as_userdata().unwrap().addr() as u64 & crate::heap::NATIVE_BIT, 0);
         assert_eq!(f.gc_ptr(), f.as_userdata());
         // Closures, upvalue-less functions, coroutines and bytes, from script.
-        let chunk = cx.load_chunk(r#"let up = 2
+        let chunk = cx
+            .load_chunk(
+                r#"let up = 2
 let add = fn(x) { return x + up }
 let plain = fn(x) { return x * 3 }
 let co = coroutine.wrap(fn(a) { let b = yield(a + 1) return b * 2 })
 let b = bytes.new(2)
 b[1] = 9
-return add(1), plain(2), co(1), co(5), b[1], #b"#, "p.umbra").unwrap();
+return add(1), plain(2), co(1), co(5), b[1], #b"#,
+                "p.umbra",
+            )
+            .unwrap();
         let r: Vec<i64> = cx.call(chunk, &[]).unwrap().iter().map(|v| v.as_int().unwrap()).collect();
         assert_eq!(r, [3, 6, 2, 10, 9, 2]);
         drop(cx);

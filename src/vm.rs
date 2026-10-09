@@ -1,10 +1,10 @@
-use std::cell::Cell;
-use std::collections::HashMap;
-use crate::chunk::{Const, GcProto, Op, Proto, StrConst, ia, ib, ic, ibx, isbx, iop, ici, is_rk, rk_idx};
+use crate::chunk::{Const, GcProto, Op, Proto, StrConst, ia, ib, ibx, ic, ici, iop, is_rk, isbx, rk_idx};
 use crate::embed::{Ctx, ModuleLoader};
 use crate::gc::{Gc, GcColor};
 use crate::pack;
 use crate::pattern;
+use std::cell::Cell;
+use std::collections::HashMap;
 
 // Where print and io.write go instead of stdout (Vm::new_with_print).
 type PrintHook = Box<dyn Fn(&str, bool)>;
@@ -17,7 +17,9 @@ fn emit_line(vm: &Vm, line: String, newline: bool) {
         hook(&line, newline);
         return;
     }
-    if newline { println!("{line}"); } else {
+    if newline {
+        println!("{line}");
+    } else {
         use std::io::Write;
         print!("{line}");
         let _ = std::io::stdout().flush();
@@ -73,8 +75,7 @@ fn civil_fields(epoch_secs: i64) -> (i64, u32, u32, u32, u32) {
 // Lua's checkoption.
 pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> Result<String, VmError> {
     const WDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June",
-                                "July", "August", "September", "October", "November", "December"];
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
     let days = epoch_secs.div_euclid(86400);
     let secs_of_day = epoch_secs.rem_euclid(86400);
     let (year, month, day, yday, wday) = civil_fields(epoch_secs);
@@ -91,11 +92,16 @@ pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> Result<String, VmError> 
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
-        if c != '%' { out.push(c); continue; }
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
         let mut spec = chars.next();
         // E/O modifiers select alternative locale representations; the C
         // locale has none, so they reduce to the base specifier.
-        if matches!(spec, Some('E') | Some('O')) { spec = chars.next(); }
+        if matches!(spec, Some('E') | Some('O')) {
+            spec = chars.next();
+        }
         match spec {
             Some('Y') => out.push_str(&year.to_string()),
             Some('y') => out.push_str(&format!("{:02}", year.rem_euclid(100))),
@@ -120,13 +126,19 @@ pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> Result<String, VmError> 
             Some('G') => out.push_str(&iso_year.to_string()),
             Some('w') => out.push_str(&wday.to_string()),
             Some('u') => out.push_str(&iso_wday.to_string()),
-            Some('c') => out.push_str(&format!("{} {} {:2} {:02}:{:02}:{:02} {}",
-                &WDAYS[wday as usize][..3], &MONTHS[(month - 1) as usize][..3],
-                day, hour, min, sec, year)),
+            Some('c') => out.push_str(&format!(
+                "{} {} {:2} {:02}:{:02}:{:02} {}",
+                &WDAYS[wday as usize][..3],
+                &MONTHS[(month - 1) as usize][..3],
+                day,
+                hour,
+                min,
+                sec,
+                year
+            )),
             Some('x') => out.push_str(&format!("{month:02}/{day:02}/{:02}", year.rem_euclid(100))),
             Some('X') | Some('T') => out.push_str(&format!("{hour:02}:{min:02}:{sec:02}")),
-            Some('r') => out.push_str(&format!("{hour12:02}:{min:02}:{sec:02} {}",
-                if hour < 12 { "AM" } else { "PM" })),
+            Some('r') => out.push_str(&format!("{hour12:02}:{min:02}:{sec:02} {}", if hour < 12 { "AM" } else { "PM" })),
             Some('D') => out.push_str(&format!("{month:02}/{day:02}/{:02}", year.rem_euclid(100))),
             Some('F') => out.push_str(&format!("{year}-{month:02}-{day:02}")),
             Some('R') => out.push_str(&format!("{hour:02}:{min:02}")),
@@ -135,10 +147,8 @@ pub fn format_civil_time(epoch_secs: i64, fmt: &str) -> Result<String, VmError> 
             Some('z') => out.push_str("+0000"),
             Some('Z') => out.push_str("GMT"),
             Some('%') => out.push('%'),
-            Some(other) => return Err(VmError::RuntimeError(
-                format!("os.date: invalid conversion specifier '%{other}'"))),
-            None => return Err(VmError::RuntimeError(
-                "os.date: invalid conversion specifier '%'".into())),
+            Some(other) => return Err(VmError::RuntimeError(format!("os.date: invalid conversion specifier '%{other}'"))),
+            None => return Err(VmError::RuntimeError("os.date: invalid conversion specifier '%'".into())),
         }
     }
     Ok(out)
@@ -154,7 +164,9 @@ pub(crate) const MAX_ALLOC_LEN: usize = 64 * 1024 * 1024;
 // buys nothing for script tables and intern caches, and it dominated the
 // profile on global/table lookups.
 #[derive(Default, Clone, Copy)]
-pub struct FxHasher { hash: u64 }
+pub struct FxHasher {
+    hash: u64,
+}
 
 impl FxHasher {
     #[inline(always)]
@@ -167,7 +179,9 @@ impl std::hash::Hasher for FxHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks { self.add(u64::from_ne_bytes(c.try_into().unwrap())); }
+        for c in &mut chunks {
+            self.add(u64::from_ne_bytes(c.try_into().unwrap()));
+        }
         let rem = chunks.remainder();
         if !rem.is_empty() {
             let mut w = [0u8; 8];
@@ -175,12 +189,30 @@ impl std::hash::Hasher for FxHasher {
             self.add(u64::from_ne_bytes(w));
         }
     }
-    #[inline(always)] fn write_u8(&mut self, n: u8)       { self.add(n as u64); }
-    #[inline(always)] fn write_u32(&mut self, n: u32)     { self.add(n as u64); }
-    #[inline(always)] fn write_u64(&mut self, n: u64)     { self.add(n); }
-    #[inline(always)] fn write_i64(&mut self, n: i64)     { self.add(n as u64); }
-    #[inline(always)] fn write_usize(&mut self, n: usize) { self.add(n as u64); }
-    #[inline(always)] fn finish(&self) -> u64 { self.hash }
+    #[inline(always)]
+    fn write_u8(&mut self, n: u8) {
+        self.add(n as u64);
+    }
+    #[inline(always)]
+    fn write_u32(&mut self, n: u32) {
+        self.add(n as u64);
+    }
+    #[inline(always)]
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+    #[inline(always)]
+    fn write_i64(&mut self, n: i64) {
+        self.add(n as u64);
+    }
+    #[inline(always)]
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -189,7 +221,9 @@ pub struct FxBuild;
 impl std::hash::BuildHasher for FxBuild {
     type Hasher = FxHasher;
     #[inline(always)]
-    fn build_hasher(&self) -> FxHasher { FxHasher::default() }
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher::default()
+    }
 }
 
 pub type FxMap<K, V> = HashMap<K, V, FxBuild>;
@@ -199,7 +233,6 @@ fn fx_str_hash_bytes(b: &[u8]) -> u64 {
     std::hash::Hasher::write(&mut h, b);
     std::hash::Hasher::finish(&h)
 }
-
 
 // bytes[..len] is valid UTF-8; bytes[len] == 0. The trailing NUL makes
 // as_c_ptr() safe to hand to a C host expecting a NUL-terminated string
@@ -214,7 +247,9 @@ pub struct RtString {
 }
 
 impl RtString {
-    pub fn as_c_ptr(&self) -> *const u8 { self.bytes.as_ptr() }
+    pub fn as_c_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
 }
 
 fn alloc_string_raw(s: &str) -> *mut u8 {
@@ -293,10 +328,10 @@ impl PartialEq for TableKey {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (TableKey::Int(a), TableKey::Int(b))   => a == b,
-            (TableKey::Str(a), TableKey::Str(b))   => a == b || crate::heap::key_str(a) == crate::heap::key_str(b),
+            (TableKey::Int(a), TableKey::Int(b)) => a == b,
+            (TableKey::Str(a), TableKey::Str(b)) => a == b || crate::heap::key_str(a) == crate::heap::key_str(b),
             (TableKey::Bool(a), TableKey::Bool(b)) => a == b,
-            (TableKey::Ptr(a), TableKey::Ptr(b))   => a == b,
+            (TableKey::Ptr(a), TableKey::Ptr(b)) => a == b,
             _ => false,
         }
     }
@@ -307,18 +342,34 @@ impl Eq for TableKey {}
 impl std::hash::Hash for TableKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
-            TableKey::Int(n)  => { state.write_u8(0); state.write_i64(*n); }
-            TableKey::Str(p)  => { state.write_u8(1); state.write_u64(crate::heap::key_hash(*p)); }
-            TableKey::Bool(b) => { state.write_u8(2); state.write_u8(*b as u8); }
-            TableKey::Ptr(p)  => { state.write_u8(3); state.write_u64(*p); }
+            TableKey::Int(n) => {
+                state.write_u8(0);
+                state.write_i64(*n);
+            }
+            TableKey::Str(p) => {
+                state.write_u8(1);
+                state.write_u64(crate::heap::key_hash(*p));
+            }
+            TableKey::Bool(b) => {
+                state.write_u8(2);
+                state.write_u8(*b as u8);
+            }
+            TableKey::Ptr(p) => {
+                state.write_u8(3);
+                state.write_u64(*p);
+            }
         }
     }
 }
 
 impl TableKey {
     fn from_value(v: Value) -> Option<Self> {
-        if v.is_nil() { return None; }
-        if v.is_int_like() { return Some(TableKey::Int(v.as_int().unwrap())); }
+        if v.is_nil() {
+            return None;
+        }
+        if v.is_int_like() {
+            return Some(TableKey::Int(v.as_int().unwrap()));
+        }
         if v.is_float() {
             let f = v.as_float().unwrap();
             if f.fract() == 0.0 && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
@@ -326,7 +377,9 @@ impl TableKey {
             }
             return Some(TableKey::Ptr(f.to_bits()));
         }
-        if v.is_bool() { return Some(TableKey::Bool(v.as_bool().unwrap())); }
+        if v.is_bool() {
+            return Some(TableKey::Bool(v.as_bool().unwrap()));
+        }
         if v.is_string() {
             return Some(TableKey::Str(v.as_string().unwrap()));
         }
@@ -345,7 +398,9 @@ pub struct KeyMap {
 }
 
 impl KeyMap {
-    fn new() -> Self { KeyMap { slots: Vec::new(), len: 0, used: 0 } }
+    fn new() -> Self {
+        KeyMap { slots: Vec::new(), len: 0, used: 0 }
+    }
 
     // Heap bytes held by the slot array, for the GC's byte-paced trigger.
     pub fn capacity_bytes(&self) -> usize {
@@ -363,24 +418,30 @@ impl KeyMap {
             (h ^ (h >> 32)) | 2
         };
         match k {
-            TableKey::Int(n)  => mix(*n as u64),
-            TableKey::Str(p)  => mix(crate::heap::key_hash(*p)),
+            TableKey::Int(n) => mix(*n as u64),
+            TableKey::Str(p) => mix(crate::heap::key_hash(*p)),
             TableKey::Bool(b) => mix(*b as u64),
-            TableKey::Ptr(p)  => mix(*p),
+            TableKey::Ptr(p) => mix(*p),
         }
     }
 
     #[inline(always)]
     pub fn get(&self, k: &TableKey) -> Option<&Value> {
-        if self.slots.is_empty() { return None; }
+        if self.slots.is_empty() {
+            return None;
+        }
         let mask = self.slots.len() - 1;
         let h = Self::key_hash(k);
         let mut i = (h as usize >> 2) & mask;
         loop {
             // SAFETY: i is masked by len - 1 and len is a power of two.
             let (tag, sk, v) = unsafe { self.slots.get_unchecked(i) };
-            if *tag == 0 { return None; }
-            if *tag == h && sk == k { return Some(v); }
+            if *tag == 0 {
+                return None;
+            }
+            if *tag == h && sk == k {
+                return Some(v);
+            }
             i = (i + 1) & mask;
         }
     }
@@ -389,14 +450,18 @@ impl KeyMap {
     // or the first empty slot on a miss. next() uses it to resume iteration
     // without rescanning the whole map.
     fn probe_slot(&self, k: &TableKey) -> Option<usize> {
-        if self.slots.is_empty() { return None; }
+        if self.slots.is_empty() {
+            return None;
+        }
         let mask = self.slots.len() - 1;
         let h = Self::key_hash(k);
         let mut i = (h as usize >> 2) & mask;
         loop {
             // SAFETY: i is masked by len - 1 and len is a power of two.
             let (tag, sk, _) = unsafe { self.slots.get_unchecked(i) };
-            if *tag == 0 || (*tag == h && sk == k) { return Some(i); }
+            if *tag == 0 || (*tag == h && sk == k) {
+                return Some(i);
+            }
             i = (i + 1) & mask;
         }
     }
@@ -411,7 +476,9 @@ impl KeyMap {
             if tag > 1 {
                 let mask = self.slots.len() - 1;
                 let mut i = (tag as usize >> 2) & mask;
-                while self.slots[i].0 != 0 { i = (i + 1) & mask; }
+                while self.slots[i].0 != 0 {
+                    i = (i + 1) & mask;
+                }
                 self.slots[i] = (tag, k, v);
                 self.used += 1;
             }
@@ -419,7 +486,9 @@ impl KeyMap {
     }
 
     pub fn insert(&mut self, k: TableKey, v: Value) {
-        if (self.used + 1) * 4 >= self.slots.len().max(1) * 3 { self.grow(); }
+        if (self.used + 1) * 4 >= self.slots.len().max(1) * 3 {
+            self.grow();
+        }
         let mask = self.slots.len() - 1;
         let h = Self::key_hash(&k);
         let mut i = (h as usize >> 2) & mask;
@@ -431,27 +500,35 @@ impl KeyMap {
                 let at = if tomb != usize::MAX { tomb } else { i };
                 self.slots[at] = (h, k, v);
                 self.len += 1;
-                if tomb == usize::MAX { self.used += 1; }
+                if tomb == usize::MAX {
+                    self.used += 1;
+                }
                 return;
             }
             if slot.0 == h && slot.1 == k {
                 slot.2 = v;
                 return;
             }
-            if slot.0 == 1 && tomb == usize::MAX { tomb = i; }
+            if slot.0 == 1 && tomb == usize::MAX {
+                tomb = i;
+            }
             i = (i + 1) & mask;
         }
     }
 
     pub fn remove(&mut self, k: &TableKey) {
-        if self.slots.is_empty() { return; }
+        if self.slots.is_empty() {
+            return;
+        }
         let mask = self.slots.len() - 1;
         let h = Self::key_hash(k);
         let mut i = (h as usize >> 2) & mask;
         loop {
             // SAFETY: i is masked by len - 1 and len is a power of two.
             let slot = unsafe { self.slots.get_unchecked_mut(i) };
-            if slot.0 == 0 { return; }
+            if slot.0 == 0 {
+                return;
+            }
             if slot.0 == h && slot.1 == *k {
                 slot.0 = 1;
                 self.len -= 1;
@@ -489,8 +566,7 @@ impl Table {
         }
         // String keys dominate; skip the full from_value cascade for them.
         if key.is_string() {
-            return self.hash.get(&TableKey::Str(key.as_string().unwrap()))
-                .copied().unwrap_or(Value::nil());
+            return self.hash.get(&TableKey::Str(key.as_string().unwrap())).copied().unwrap_or(Value::nil());
         }
         if let Some(k) = TableKey::from_value(key) {
             return self.hash.get(&k).copied().unwrap_or(Value::nil());
@@ -529,7 +605,9 @@ impl Table {
                 // The key may already live in the hash part (inserted before
                 // the array grew this far); drop it so the key exists in
                 // exactly one place and next() can't yield it twice.
-                if self.hash.len > 0 { self.hash.remove(&TableKey::Int(i)); }
+                if self.hash.len > 0 {
+                    self.hash.remove(&TableKey::Int(i));
+                }
                 let idx = (i - 1) as usize;
                 if idx == self.array.len() {
                     self.array.push(val);
@@ -540,17 +618,27 @@ impl Table {
             }
         }
         if let Some(k) = TableKey::from_value(key) {
-            if val.is_nil() { self.hash.remove(&k); } else { self.hash.insert(k, val); }
+            if val.is_nil() {
+                self.hash.remove(&k);
+            } else {
+                self.hash.insert(k, val);
+            }
         }
     }
 
     pub fn length(&self) -> i64 {
-        if self.array.is_empty() { return 0; }
+        if self.array.is_empty() {
+            return 0;
+        }
         let mut lo = 0usize;
         let mut hi = self.array.len();
         while lo < hi {
             let mid = (lo + hi + 1) / 2;
-            if self.array[mid - 1].is_nil() { hi = mid - 1; } else { lo = mid; }
+            if self.array[mid - 1].is_nil() {
+                hi = mid - 1;
+            } else {
+                lo = mid;
+            }
         }
         lo as i64
     }
@@ -561,7 +649,11 @@ fn alloc_table_raw() -> *mut u8 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoStatus { Suspended, Running, Dead }
+pub enum CoStatus {
+    Suspended,
+    Running,
+    Dead,
+}
 
 // A coroutine as a heap object, collected once nothing reaches it. While it
 // is suspended, `regs`/`frames` hold its own stack; while it runs they hold
@@ -633,7 +725,9 @@ impl Frame {
     // Upvalue i of the running closure; nil past the end.
     #[inline(always)]
     pub(crate) fn upval(&self, i: usize) -> Value {
-        if i >= self.upvals_len { return Value::nil(); }
+        if i >= self.upvals_len {
+            return Value::nil();
+        }
         // SAFETY: upvals_ptr/len describe the running closure's upvalue Vec
         // (Gc::callable), which never resizes. The closure stays rooted while
         // its frame runs: by the caller's register, Frame::callable after a
@@ -643,9 +737,13 @@ impl Frame {
 
     #[inline(always)]
     pub(crate) fn set_upval(&mut self, i: usize, v: Value) {
-        if i >= self.upvals_len { return; }
+        if i >= self.upvals_len {
+            return;
+        }
         // SAFETY: as upval.
-        unsafe { *self.upvals_ptr.add(i) = v; }
+        unsafe {
+            *self.upvals_ptr.add(i) = v;
+        }
     }
 }
 
@@ -800,18 +898,39 @@ fn find_set_reg(proto: &Proto, pc: usize, reg: usize) -> Option<usize> {
             Op::TForCall => reg >= a + 4,
             Op::ForLoop => reg == a || reg == a + 3,
             Op::TForLoop => reg == a + 2,
-            Op::SetTable | Op::SetField | Op::SetList | Op::SetGlobal | Op::SetUpval
-            | Op::Jmp | Op::Test | Op::Eq | Op::Lt | Op::Le
-            | Op::LtI | Op::LeI | Op::GtI | Op::GeI | Op::EqI
-            | Op::ForPrep | Op::Tbc | Op::TbcPop | Op::Return => false,
+            Op::SetTable
+            | Op::SetField
+            | Op::SetList
+            | Op::SetGlobal
+            | Op::SetUpval
+            | Op::Jmp
+            | Op::Test
+            | Op::Eq
+            | Op::Lt
+            | Op::Le
+            | Op::LtI
+            | Op::LeI
+            | Op::GtI
+            | Op::GeI
+            | Op::EqI
+            | Op::ForPrep
+            | Op::Tbc
+            | Op::TbcPop
+            | Op::Return => false,
             _ => reg == a,
         };
-        if writes { set = Some(i); }
+        if writes {
+            set = Some(i);
+        }
         if matches!(op, Op::Jmp | Op::ForPrep) {
             let target = (i as i32 + 1 + isbx(instr)) as usize;
-            if target <= pc { jmptarget = target; }
+            if target <= pc {
+                jmptarget = target;
+            }
         }
-        if i < jmptarget { set = None; }
+        if i < jmptarget {
+            set = None;
+        }
     }
     set
 }
@@ -830,7 +949,10 @@ fn reg_name(proto: &Proto, pc: usize, reg: usize) -> Option<(&'static str, Strin
     let set = find_set_reg(proto, pc, reg)?;
     let instr = proto.code[set];
     let const_str = |i: usize| -> Option<&str> {
-        match proto.consts.get(i) { Some(Const::Str(s)) => Some(s.s.as_str()), _ => None }
+        match proto.consts.get(i) {
+            Some(Const::Str(s)) => Some(s.s.as_str()),
+            _ => None,
+        }
     };
     match Op::from_u8(iop(instr))? {
         Op::Move => reg_name(proto, set, ib(instr)),
@@ -865,7 +987,9 @@ fn varinfo(proto: &Proto, pc: usize, reg: usize) -> String {
 // usize::MAX marks a non-register operand (an immediate literal) that
 // shouldn't be named at all.
 fn rk_varinfo(proto: &Proto, pc: usize, rk: usize) -> String {
-    if rk == usize::MAX { return String::new(); }
+    if rk == usize::MAX {
+        return String::new();
+    }
     if is_rk(rk) {
         let name = match proto.consts.get(rk_idx(rk)) {
             Some(Const::Str(s)) => s.s.clone(),
@@ -902,12 +1026,13 @@ pub(crate) fn has_position_prefix(msg: &str) -> bool {
 // through untouched.
 fn name_order_err(e: VmError, proto: &Proto, pc: usize, a: Value, b: Value, ra: usize, rb: usize) -> VmError {
     match &e {
-        VmError::RuntimeError(m) if m.starts_with("attempt to compare") => {
-            VmError::RuntimeError(format!(
-                "attempt to compare {}{} with {}{}",
-                a.type_name(), rk_varinfo(proto, pc, ra),
-                b.type_name(), rk_varinfo(proto, pc, rb)))
-        }
+        VmError::RuntimeError(m) if m.starts_with("attempt to compare") => VmError::RuntimeError(format!(
+            "attempt to compare {}{} with {}{}",
+            a.type_name(),
+            rk_varinfo(proto, pc, ra),
+            b.type_name(),
+            rk_varinfo(proto, pc, rb)
+        )),
         _ => e,
     }
 }
@@ -925,7 +1050,9 @@ fn build_traceback(frames: &[Frame]) -> String {
         // The call site names the function, as in Lua. A segment's first
         // frame has none in the segment (the host, pcall or a metamethod
         // called it), so the name it was declared under stands in.
-        let named = if i == 0 { None } else {
+        let named = if i == 0 {
+            None
+        } else {
             let caller = &frames[i - 1];
             call_site_name(caller.proto(), caller.pc.saturating_sub(1))
         };
@@ -934,14 +1061,20 @@ fn build_traceback(frames: &[Frame]) -> String {
             Some((kind, name)) => out.push(format!("\t{src}:{line}: in {kind} '{name}'")),
             None => out.push(format!("\t{src}:{line}: in function <{src}:{}>", proto.line_defined)),
         }
-        if f.tail { out.push("\t(...tail calls...)".to_owned()); }
+        if f.tail {
+            out.push("\t(...tail calls...)".to_owned());
+        }
     }
     out.join("\n")
 }
 
 pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() { return (*s).to_owned(); }
-    if let Some(s) = payload.downcast_ref::<String>() { return s.clone(); }
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_owned();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
     "unknown panic".to_owned()
 }
 
@@ -1025,9 +1158,10 @@ impl Vm {
         vm
     }
 
-
     pub(crate) fn intern(&mut self, s: &str) -> Value {
-        if let Some(&v) = self.string_cache.get(s) { return v; }
+        if let Some(&v) = self.string_cache.get(s) {
+            return v;
+        }
         let ptr = alloc_string_raw(s);
         self.gc.register(ptr);
         let v = Value::string(ptr);
@@ -1088,12 +1222,10 @@ impl Vm {
             ai = t.array.len();
             if key.is_int_like() {
                 let i = key.as_int().unwrap();
-                if i >= 1 && (i as usize) <= t.array.len()
-                    && !t.array[(i - 1) as usize].is_nil() {
+                if i >= 1 && (i as usize) <= t.array.len() && !t.array[(i - 1) as usize].is_nil() {
                     ai = i as usize;
                 } else {
-                    hi = t.hash.probe_slot(&TableKey::Int(i))
-                        .map(|s| s + 1).unwrap_or(0);
+                    hi = t.hash.probe_slot(&TableKey::Int(i)).map(|s| s + 1).unwrap_or(0);
                 }
             } else if let Some(tk) = TableKey::from_value(key) {
                 hi = t.hash.probe_slot(&tk).map(|s| s + 1).unwrap_or(0);
@@ -1101,16 +1233,16 @@ impl Vm {
         }
         for i in ai..t.array.len() {
             let v = t.array[i];
-            if !v.is_nil() { return Some((Value::int((i + 1) as i64), v)); }
+            if !v.is_nil() {
+                return Some((Value::int((i + 1) as i64), v));
+            }
         }
-        let (tk, v) = t.hash.slots.get(hi..)?.iter()
-            .find(|(tag, _, _)| *tag > 1)
-            .map(|(_, tk, v)| (tk.clone(), *v))?;
+        let (tk, v) = t.hash.slots.get(hi..)?.iter().find(|(tag, _, _)| *tag > 1).map(|(_, tk, v)| (tk.clone(), *v))?;
         let k = match tk {
-            TableKey::Int(n)  => self.make_int(n),
+            TableKey::Int(n) => self.make_int(n),
             TableKey::Bool(b) => Value::bool(b),
-            TableKey::Str(p)  => Value::string(p),
-            TableKey::Ptr(p)  => Value::from_raw(p),
+            TableKey::Str(p) => Value::string(p),
+            TableKey::Ptr(p) => Value::from_raw(p),
         };
         Some((k, v))
     }
@@ -1136,13 +1268,15 @@ impl Vm {
     pub(crate) fn load_proto(&mut self, src: &str, chunk_name: Option<String>) -> Result<Value, String> {
         // The parser and compiler recurse once per nesting level of the
         // source, so a compile is one more level on the Rust stack.
-        let chunk = self.nested(|_| {
-            let (block, parse_errs) = crate::parse(src);
-            if let Some(e) = parse_errs.first() {
-                return Err(VmError::RuntimeError(e.to_string()));
-            }
-            crate::compile(block, chunk_name).map_err(|e| VmError::RuntimeError(e.to_string()))
-        }).map_err(|e| e.to_string())?;
+        let chunk = self
+            .nested(|_| {
+                let (block, parse_errs) = crate::parse(src);
+                if let Some(e) = parse_errs.first() {
+                    return Err(VmError::RuntimeError(e.to_string()));
+                }
+                crate::compile(block, chunk_name).map_err(|e| VmError::RuntimeError(e.to_string()))
+            })
+            .map_err(|e| e.to_string())?;
         Ok(Value::userdata(self.own_proto(chunk) as *mut u8))
     }
 
@@ -1156,11 +1290,15 @@ impl Vm {
         }
         // A call from the host starts with no error in flight: what an
         // earlier one recorded was for the host to read (Ctx::guard).
-        if self.nesting == 0 { self.err_traces.clear(); }
+        if self.nesting == 0 {
+            self.err_traces.clear();
+        }
         self.nesting += 1;
         let result = f(self);
         self.nesting -= 1;
-        if result.is_err() { self.deliver_error(); }
+        if result.is_err() {
+            self.deliver_error();
+        }
         result
     }
 
@@ -1169,7 +1307,9 @@ impl Vm {
     #[cold]
     fn deliver_error(&mut self) {
         let n = self.err_traces.len();
-        if n == 0 || self.err_traces[n - 1].level != self.nesting + 1 { return; }
+        if n == 0 || self.err_traces[n - 1].level != self.nesting + 1 {
+            return;
+        }
         self.err_traces[n - 1].level = self.nesting;
         if n >= 2 && self.err_traces[n - 2].level == self.nesting {
             self.err_traces.remove(n - 2);
@@ -1208,9 +1348,7 @@ impl Vm {
         // reach past base + max_regs after a multi-value call or `...` spill,
         // and those results are still live until the next instruction consumes
         // them.
-        let reg_top = self.frames.iter().map(|f| {
-            (f.base + f.proto().max_regs as usize).max(f.top)
-        }).max().unwrap_or(0).min(self.regs.len());
+        let reg_top = self.frames.iter().map(|f| (f.base + f.proto().max_regs as usize).max(f.top)).max().unwrap_or(0).min(self.regs.len());
         let mut roots: Vec<Value> = self.regs[..reg_top].to_vec();
         // Varargs are copied out of the register window into the frame, so
         // they need their own scan — nothing else references them. The
@@ -1276,7 +1414,9 @@ impl Vm {
         loop {
             let roots = if self.gc.needs_roots() { Some(self.gc_roots()) } else { None };
             self.gc.step(roots, &mut self.string_cache, true);
-            if self.gc.phase() == crate::gc::GcPhase::Pause { break; }
+            if self.gc.phase() == crate::gc::GcPhase::Pause {
+                break;
+            }
         }
     }
 
@@ -1288,7 +1428,9 @@ impl Vm {
     // dispatch round, so the empty case stays inline and the drain doesn't.
     #[inline(always)]
     fn run_pending_finalizers(&mut self) {
-        if self.gc.pending_finalizers.is_empty() || !self.gc.running_finalizers.is_empty() { return; }
+        if self.gc.pending_finalizers.is_empty() || !self.gc.running_finalizers.is_empty() {
+            return;
+        }
         self.drain_finalizers();
     }
 
@@ -1321,7 +1463,6 @@ impl Vm {
         self.gc_full_cycle();
     }
 
-
     // Runs close() on every to-be-closed register of the frames an error is
     // about to discard: innermost frame first, innermost local first, each
     // call receiving the pending error as its second argument (Lua 5.4's
@@ -1330,7 +1471,10 @@ impl Vm {
     // frames that survive the unwind (parked by run_isolated) and are left
     // alone. Call while self.frames/self.regs still hold the dying stack.
     fn unwind_closes(&mut self, err: VmError, floor: usize) -> VmError {
-        if self.poisoned { self.tbc.truncate(floor); return err; }
+        if self.poisoned {
+            self.tbc.truncate(floor);
+            return err;
+        }
         let mut err = err;
         // The error object is handed to each close call; a close that fails
         // replaces it (and the pending error) for the rest of the unwind.
@@ -1356,7 +1500,9 @@ impl Vm {
         }
         while self.tbc.len() > floor {
             let (reg, boxed) = self.tbc.pop().unwrap();
-            if self.poisoned { break; }
+            if self.poisoned {
+                break;
+            }
             let mut v = self.regs[reg];
             if boxed && v.is_table() {
                 v = self.gc.table(v).raw_get(Value::int(1));
@@ -1369,18 +1515,16 @@ impl Vm {
                 } else {
                     match self.table_index_chain(v, close_key) {
                         Ok(r) => r,
-                        Err(e) => { replace_err!(e); continue; }
+                        Err(e) => {
+                            replace_err!(e);
+                            continue;
+                        }
                     }
                 }
             } else if v.is_string() {
-                if self.string_lib.is_table() {
-                    self.gc.table(self.string_lib).raw_get(close_key)
-                } else {
-                    Value::nil()
-                }
+                if self.string_lib.is_table() { self.gc.table(self.string_lib).raw_get(close_key) } else { Value::nil() }
             } else {
-                replace_err!(VmError::RuntimeError(
-                    format!("attempt to index a {} value", v.type_name())));
+                replace_err!(VmError::RuntimeError(format!("attempt to index a {} value", v.type_name())));
                 continue;
             };
             if let Err(e) = self.call_value_isolated(close, &[v, err_val]) {
@@ -1395,8 +1539,7 @@ impl Vm {
     // First register above every live frame; scratch space for calls that
     // must not clobber the running function's registers.
     fn scratch_base(&self) -> usize {
-        self.frames.iter().map(|f| f.base + f.proto().max_regs as usize)
-            .max().map(|top| top + 8).unwrap_or(0)
+        self.frames.iter().map(|f| f.base + f.proto().max_regs as usize).max().map(|top| top + 8).unwrap_or(0)
     }
 
     // Runs `fn_val` in an isolated frame above the active call stack, so a
@@ -1418,9 +1561,7 @@ impl Vm {
     fn call_value_isolated_inner(&mut self, fn_val: Value, args: &[Value]) -> VmResult<Vec<Value>> {
         if crate::heap::is_native(fn_val) {
             let nesting = self.nesting;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.call_native(fn_val, args)
-            }));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.call_native(fn_val, args)));
             return match result {
                 Ok(r) => r,
                 Err(payload) => {
@@ -1460,8 +1601,12 @@ impl Vm {
         self.saved_frames.push(std::mem::take(&mut self.frames));
         // SAFETY: `proto` came from a function Value or from exec.
         let needed = base + unsafe { crate::heap::proto(proto) }.max_regs as usize + 8;
-        if needed > self.regs.len() { self.regs.resize(needed + 64, Value::nil()); }
-        for (i, &v) in args.iter().enumerate() { self.regs[base + i] = v; }
+        if needed > self.regs.len() {
+            self.regs.resize(needed + 64, Value::nil());
+        }
+        for (i, &v) in args.iter().enumerate() {
+            self.regs[base + i] = v;
+        }
         if let Err(e) = self.push_frame(proto, upvals_ptr, upvals_len, base, args.len() as u8, 255) {
             self.frames = self.saved_frames.pop().unwrap();
             return Err(e);
@@ -1476,7 +1621,9 @@ impl Vm {
                 // still hold them.
                 let e = if matches!(e, VmError::Yield(_)) && !self.resume_chain.is_empty() {
                     VmError::RuntimeError("attempt to yield across a C-call boundary".into())
-                } else { e };
+                } else {
+                    e
+                };
                 Err(self.unwind_closes(e, tbc_floor))
             }
         };
@@ -1542,7 +1689,10 @@ impl Vm {
         let setup: VmResult<()> = if !started {
             if crate::heap::is_native(fn_val) {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.call_native(fn_val, args))) {
-                    Ok(Ok(vals)) => { self.top_level_results = vals; Ok(()) }
+                    Ok(Ok(vals)) => {
+                        self.top_level_results = vals;
+                        Ok(())
+                    }
                     Ok(Err(e)) => Err(e),
                     Err(payload) => {
                         self.poison(nesting);
@@ -1554,8 +1704,12 @@ impl Vm {
                 let base = 1usize;
                 // SAFETY: the proto of a function Value.
                 let needed = base + unsafe { crate::heap::proto(cp.proto) }.max_regs as usize + 8;
-                if self.regs.len() < needed { self.regs.resize(needed + 64, Value::nil()); }
-                for (i, &v) in args.iter().enumerate() { self.regs[base + i] = v; }
+                if self.regs.len() < needed {
+                    self.regs.resize(needed + 64, Value::nil());
+                }
+                for (i, &v) in args.iter().enumerate() {
+                    self.regs[base + i] = v;
+                }
                 self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, base, args.len() as u8, 255)
             }
         } else {
@@ -1565,20 +1719,18 @@ impl Vm {
             Ok(())
         };
         let run_result = match setup {
-            Ok(()) if !self.frames.is_empty() =>
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner())) {
-                    Ok(r) => r.map_err(|e| self.enrich_error_line(e)),
-                    Err(payload) => {
-                        self.poison(nesting);
-                        Err(VmError::RuntimeError(format!("internal error (panic): {}", panic_message(&*payload))))
-                    }
-                },
+            Ok(()) if !self.frames.is_empty() => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner())) {
+                Ok(r) => r.map_err(|e| self.enrich_error_line(e)),
+                Err(payload) => {
+                    self.poison(nesting);
+                    Err(VmError::RuntimeError(format!("internal error (panic): {}", panic_message(&*payload))))
+                }
+            },
             Ok(()) => Ok(()),
             // A host-function coroutine that calls yield() can't suspend —
             // there's no frame to park — so report it like any other yield
             // across a C-call boundary.
-            Err(VmError::Yield(_)) if self.frames.is_empty() =>
-                Err(VmError::RuntimeError("attempt to yield across a C-call boundary".into())),
+            Err(VmError::Yield(_)) if self.frames.is_empty() => Err(VmError::RuntimeError("attempt to yield across a C-call boundary".into())),
             Err(e) => Err(e),
         };
         let co_results = std::mem::take(&mut self.top_level_results);
@@ -1614,7 +1766,9 @@ impl Vm {
     fn get_mm(&mut self, obj: Value, name: &str) -> Value {
         // Interning the name costs a hash lookup; skip it when there is no
         // metatable to look in.
-        if !obj.is_table() || self.gc.table(obj).metatable.is_none() { return Value::nil(); }
+        if !obj.is_table() || self.gc.table(obj).metatable.is_none() {
+            return Value::nil();
+        }
         let key = self.intern(name);
         self.gc.meta_get(obj, key)
     }
@@ -1622,20 +1776,28 @@ impl Vm {
     fn get_mm2(&mut self, a: Value, b: Value, name: &str) -> Value {
         let key = self.intern(name);
         let mm = self.gc.meta_get(a, key);
-        if !mm.is_nil() { return mm; }
+        if !mm.is_nil() {
+            return mm;
+        }
         self.gc.meta_get(b, key)
     }
 
     pub(crate) fn table_index_chain(&mut self, tbl: Value, key: Value) -> VmResult<Value> {
         let mut current = tbl;
         for _ in 0..100 {
-            if !current.is_table() { break; }
+            if !current.is_table() {
+                break;
+            }
             let t = self.gc.table(current);
             let raw = t.raw_get(key);
-            if !raw.is_nil() || t.metatable.is_none() { return Ok(raw); }
+            if !raw.is_nil() || t.metatable.is_none() {
+                return Ok(raw);
+            }
             let idx_key = self.intern("__index");
             let mm = self.gc.meta_get(current, idx_key);
-            if mm.is_nil() { return Ok(Value::nil()); }
+            if mm.is_nil() {
+                return Ok(Value::nil());
+            }
             if mm.is_table() {
                 current = mm;
             } else {
@@ -1651,7 +1813,9 @@ impl Vm {
     pub(crate) fn table_newindex_chain(&mut self, tbl: Value, key: Value, val: Value) -> VmResult<()> {
         let mut current = tbl;
         for _ in 0..100 {
-            if !current.is_table() { break; }
+            if !current.is_table() {
+                break;
+            }
             let t = self.gc.table(current);
             if !t.raw_get(key).is_nil() || t.metatable.is_none() {
                 return self.raw_store(current, key, val);
@@ -1674,7 +1838,9 @@ impl Vm {
     // rawset for script and host: a none key is an error, as Lua's nil key
     // is, since nothing can be filed under it. NaN keys are none here.
     pub(crate) fn raw_store(&mut self, t: Value, key: Value, val: Value) -> VmResult<()> {
-        if key.is_nil() { return Err(none_index()); }
+        if key.is_nil() {
+            return Err(none_index());
+        }
         self.gc.raw_set(t, key, val);
         Ok(())
     }
@@ -1686,8 +1852,18 @@ impl Vm {
             // string identity is content-based everywhere else.
             let ltmp;
             let rtmp;
-            let ls: &str = if left.is_string() { self.gc.str(left) } else { ltmp = coerce_num_str(left); &ltmp };
-            let rs: &str = if right.is_string() { self.gc.str(right) } else { rtmp = coerce_num_str(right); &rtmp };
+            let ls: &str = if left.is_string() {
+                self.gc.str(left)
+            } else {
+                ltmp = coerce_num_str(left);
+                &ltmp
+            };
+            let rs: &str = if right.is_string() {
+                self.gc.str(right)
+            } else {
+                rtmp = coerce_num_str(right);
+                &rtmp
+            };
             let mut buf = Vec::with_capacity(ls.len() + rs.len() + 1);
             buf.extend_from_slice(ls.as_bytes());
             buf.extend_from_slice(rs.as_bytes());
@@ -1698,8 +1874,7 @@ impl Vm {
         let mm = self.get_mm2(left, right, "__concat");
         if mm.is_nil() {
             let bad = if !left.is_string() && !left.is_number() { left } else { right };
-            return Err(VmError::RuntimeError(format!(
-                "attempt to concatenate a {} value", bad.type_name())));
+            return Err(VmError::RuntimeError(format!("attempt to concatenate a {} value", bad.type_name())));
         }
         let res = self.call_value_isolated(mm, &[left, right])?;
         Ok(res.into_iter().next().unwrap_or(Value::nil()))
@@ -1724,7 +1899,9 @@ impl Vm {
     }
 
     fn values_eq_mm(&mut self, a: Value, b: Value) -> VmResult<bool> {
-        if a.raw_bits() == b.raw_bits() { return Ok(true); }
+        if a.raw_bits() == b.raw_bits() {
+            return Ok(true);
+        }
         if a.is_table() && b.is_table() {
             let mm = self.get_mm2(a, b, "__eq");
             if !mm.is_nil() {
@@ -1741,8 +1918,7 @@ impl Vm {
         }
         let mm = self.get_mm2(a, b, "__lt");
         if mm.is_nil() {
-            return Err(VmError::RuntimeError(format!(
-                "attempt to compare {} with {}", a.type_name(), b.type_name())));
+            return Err(VmError::RuntimeError(format!("attempt to compare {} with {}", a.type_name(), b.type_name())));
         }
         let res = self.call_value_isolated(mm, &[a, b])?;
         Ok(res.into_iter().next().unwrap_or(Value::nil()).is_truthy())
@@ -1762,8 +1938,7 @@ impl Vm {
             let res = self.call_value_isolated(mm_lt, &[b, a])?;
             return Ok(!res.into_iter().next().unwrap_or(Value::nil()).is_truthy());
         }
-        Err(VmError::RuntimeError(format!(
-            "attempt to compare {} with {}", a.type_name(), b.type_name())))
+        Err(VmError::RuntimeError(format!("attempt to compare {} with {}", a.type_name(), b.type_name())))
     }
 
     #[inline(always)]
@@ -1781,11 +1956,11 @@ impl Vm {
             return self.intern_const_str(sc);
         }
         match c {
-            Const::Nil       => Value::nil(),
-            Const::Bool(b)   => Value::bool(*b),
-            Const::Int(n)    => self.make_int(*n),
-            Const::Float(f)  => Value::float(*f),
-            Const::Str(_)    => unreachable!(),
+            Const::Nil => Value::nil(),
+            Const::Bool(b) => Value::bool(*b),
+            Const::Int(n) => self.make_int(*n),
+            Const::Float(f) => Value::float(*f),
+            Const::Str(_) => unreachable!(),
         }
     }
 
@@ -1810,13 +1985,22 @@ impl Vm {
         // the VM from inside a native can't collide with the running script.
         // The frame roots the chunk from its push on.
         let ptr = self.own_proto(chunk);
-        self.nested(|vm| vm.run_isolated(ptr, std::ptr::null_mut(), 0, &[]))
-            .map_err(thrown_to_runtime)
+        self.nested(|vm| vm.run_isolated(ptr, std::ptr::null_mut(), 0, &[])).map_err(thrown_to_runtime)
     }
 
     #[inline(always)]
-    pub(crate) fn push_frame(&mut self, proto: *const GcProto, upvals_ptr: *mut Value, upvals_len: usize, base: usize, nargs: u8, expected: u8) -> VmResult<()> {
-        if self.frames.len() >= 200 { return Err(VmError::StackOverflow); }
+    pub(crate) fn push_frame(
+        &mut self,
+        proto: *const GcProto,
+        upvals_ptr: *mut Value,
+        upvals_len: usize,
+        base: usize,
+        nargs: u8,
+        expected: u8,
+    ) -> VmResult<()> {
+        if self.frames.len() >= 200 {
+            return Err(VmError::StackOverflow);
+        }
         // SAFETY: `proto` came from a function Value or from exec.
         let p = unsafe { crate::heap::proto(proto) };
         let needed = base + p.max_regs as usize + 8;
@@ -1894,7 +2078,9 @@ impl Vm {
     // `msg` prefixed with the running script position, unless it already
     // has one or no script is running.
     pub(crate) fn positioned(&self, msg: String) -> String {
-        if has_position_prefix(&msg) { return msg; }
+        if has_position_prefix(&msg) {
+            return msg;
+        }
         let Some(frame) = self.frames.last() else { return msg };
         let proto = frame.proto();
         match proto.lines.get(frame.pc.saturating_sub(1)) {
@@ -1953,9 +2139,7 @@ impl Vm {
     // The traceback of the error an isolated call made at this level just
     // returned, if that error was enriched and recorded after serial `since`.
     pub(crate) fn delivered_traceback(&self, since: u64) -> Option<&str> {
-        self.err_traces.last()
-            .filter(|t| t.level == self.nesting && t.serial > since)
-            .map(|t| t.traceback.as_str())
+        self.err_traces.last().filter(|t| t.level == self.nesting && t.serial > since).map(|t| t.traceback.as_str())
     }
 
     // The running thread's stack from segment `from` out to the innermost
@@ -1963,7 +2147,9 @@ impl Vm {
     // saved_frames[i], a stack run_isolated parked; saved_frames.len() is
     // the running one.
     fn stack_traceback(&self, from: usize) -> String {
-        if from > self.saved_frames.len() { return String::new(); }
+        if from > self.saved_frames.len() {
+            return String::new();
+        }
         let segments = std::iter::once(&self.frames).chain(self.saved_frames[from..].iter().rev());
         let parts: Vec<String> = segments.filter(|s| !s.is_empty()).map(|s| build_traceback(s)).collect();
         parts.join("\n")
@@ -1974,7 +2160,9 @@ impl Vm {
             // GC work runs here, before `frame` becomes a raw pointer into
             // self.frames: a step may finish a cycle and queue __gc
             // finalizers, which push frames of their own when drained.
-            if self.gc.should_step() { self.gc_step(); }
+            if self.gc.should_step() {
+                self.gc_step();
+            }
 
             // The hard ceiling can't wait for an incremental cycle to finish:
             // force a full collection, then error if it's still exceeded.
@@ -2021,12 +2209,14 @@ impl Vm {
             macro_rules! R {
                 // SAFETY: base + r < self.regs.len() by the sizing above, and
                 // `regs` is current: every resize is followed by refresh!().
-                ($r:expr) => { *unsafe { &mut *regs.add(base + $r) } }
+                ($r:expr) => {
+                    *unsafe { &mut *regs.add(base + $r) }
+                };
             }
             macro_rules! RK {
                 ($x:expr) => {
                     if is_rk($x) { self.resolve_const(proto, rk_idx($x)) } else { R!($x) }
-                }
+                };
             }
             // GC/budget checkpoint. Only needed where a loop can spin
             // (backward jumps, calls, returns) or a GC object was just
@@ -2036,7 +2226,7 @@ impl Vm {
                     if self.gc.should_step() || (self.step_limit != 0 && self.step_count > self.step_limit) {
                         continue 'outer;
                     }
-                }
+                };
             }
             macro_rules! arith_op {
                 ($dst:expr, $b:expr, $c:expr, $int_op:expr, $float_op:expr, $mm_name:expr) => {{
@@ -2055,13 +2245,15 @@ impl Vm {
                             let bad = if !bv.is_number() { ($b, bv) } else { ($c, cv) };
                             return Err(VmError::RuntimeError(format!(
                                 "attempt to perform arithmetic on a {} value{}",
-                                bad.1.type_name(), rk_varinfo(proto, frame.pc - 1, bad.0))));
+                                bad.1.type_name(),
+                                rk_varinfo(proto, frame.pc - 1, bad.0)
+                            )));
                         }
                         let res = self.call_value_isolated(mm, &[bv, cv])?;
                         self.regs[base + $dst] = res.into_iter().next().unwrap_or(Value::nil());
                         continue 'outer;
                     }
-                }}
+                }};
             }
             // The compiler always emits a Jmp right after a conditional op;
             // consume it inline so a compare+branch costs one dispatch.
@@ -2077,9 +2269,11 @@ impl Vm {
                     self.step_count += 1;
                     if $taken {
                         frame.pc = (frame.pc as i32 + isbx(j)) as usize;
-                        if isbx(j) < 0 { ck!(); }
+                        if isbx(j) < 0 {
+                            ck!();
+                        }
                     }
-                }}
+                }};
             }
             // Shared table-index body for GetTable/GetField/SelfOp: stores
             // the looked-up value in R[dst]. The __index path can swap
@@ -2104,31 +2298,22 @@ impl Vm {
                             continue;
                         }
                     } else if tv.is_string() {
-                        if self.string_lib.is_table() {
-                            self.gc.table(self.string_lib).raw_get(kv)
-                        } else {
-                            Value::nil()
-                        }
+                        if self.string_lib.is_table() { self.gc.table(self.string_lib).raw_get(kv) } else { Value::nil() }
                     } else if tv.is_bytes() {
                         if kv.is_int_like() {
                             let b = self.gc.bytes(tv);
                             let i = kv.as_int().unwrap();
-                            if i >= 1 && i <= b.len as i64 {
-                                Value::int(b.data[(i - 1) as usize] as i64)
-                            } else {
-                                Value::nil()
-                            }
+                            if i >= 1 && i <= b.len as i64 { Value::int(b.data[(i - 1) as usize] as i64) } else { Value::nil() }
                         } else if self.bytes_lib.is_table() {
                             self.gc.table(self.bytes_lib).raw_get(kv)
                         } else {
                             Value::nil()
                         }
                     } else {
-                        return Err(VmError::RuntimeError(format!("attempt to index a {} value{}",
-                            tv.type_name(), varinfo(proto, frame.pc - 1, $treg))));
+                        return Err(VmError::RuntimeError(format!("attempt to index a {} value{}", tv.type_name(), varinfo(proto, frame.pc - 1, $treg))));
                     };
                     R!($dst) = v;
-                }}
+                }};
             }
             // `$any_key` is false for SetField, whose key is a constant
             // string, so only SetTable pays for the none-key check.
@@ -2140,7 +2325,9 @@ impl Vm {
                     if tv.is_table() {
                         let t = self.gc.table(tv);
                         if t.metatable.is_none() || !t.raw_get(kv).is_nil() {
-                            if $any_key && kv.is_nil() { return Err(none_index()); }
+                            if $any_key && kv.is_nil() {
+                                return Err(none_index());
+                            }
                             self.gc.raw_set(tv, kv, vv);
                         } else {
                             self.table_newindex_chain(tv, kv, vv)?;
@@ -2159,30 +2346,27 @@ impl Vm {
                         };
                         b.data[(i - 1) as usize] = n;
                     } else {
-                        return Err(VmError::RuntimeError(format!("attempt to index a {} value{}",
-                            tv.type_name(), varinfo(proto, frame.pc - 1, $treg))));
+                        return Err(VmError::RuntimeError(format!("attempt to index a {} value{}", tv.type_name(), varinfo(proto, frame.pc - 1, $treg))));
                     }
-                }}
+                }};
             }
 
             // Every compiled Proto ends in Return, so the loop exits through
             // the Return arm — no per-instruction pc bounds check needed.
             loop {
-
                 // Cheap per-instruction counting only; the actual gc_collect()/
                 // budget-error handling happens back at 'outer's top, where it's
                 // safe to mutate self.frames (frame/proto aren't held past this point).
                 self.step_count += 1;
 
-
                 // SAFETY: every compiled proto ends in Return and jumps
                 // target its own code, so pc stays in bounds.
                 let instr = unsafe { *proto.code.get_unchecked(frame.pc) };
                 frame.pc += 1;
-                let a   = || ia(instr);
-                let b   = || ib(instr);
-                let c   = || ic(instr);
-                let bx  = || ibx(instr);
+                let a = || ia(instr);
+                let b = || ib(instr);
+                let c = || ic(instr);
+                let bx = || ibx(instr);
                 let sbx = || isbx(instr);
 
                 // Op is #[repr(u8)] with contiguous variants 0..=TailCall and the
@@ -2190,20 +2374,22 @@ impl Vm {
                 debug_assert!(iop(instr) <= Op::TailCall as u8);
                 // SAFETY: as the debug_assert says, and Op is repr(u8).
                 match unsafe { std::mem::transmute::<u8, Op>(iop(instr)) } {
-                    Op::LoadNil  => R!(a()) = Value::nil(),
+                    Op::LoadNil => R!(a()) = Value::nil(),
                     Op::LoadBool => {
                         R!(a()) = Value::bool(b() != 0);
-                        if c() != 0 { frame.pc += 1; }
+                        if c() != 0 {
+                            frame.pc += 1;
+                        }
                     }
-                    Op::LoadInt  => R!(a()) = Value::int(sbx() as i64),
-                    Op::LoadK    => {
+                    Op::LoadInt => R!(a()) = Value::int(sbx() as i64),
+                    Op::LoadK => {
                         let v = self.resolve_const(proto, bx());
                         R!(a()) = v;
                     }
-                    Op::Move     => R!(a()) = R!(b()),
+                    Op::Move => R!(a()) = R!(b()),
 
-                    Op::Add  => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_add(y)) }, |x: f64, y: f64| x + y, "__add"),
-                    Op::Sub  => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_sub(y)) }, |x: f64, y: f64| x - y, "__sub"),
+                    Op::Add => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_add(y)) }, |x: f64, y: f64| x + y, "__add"),
+                    Op::Sub => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_sub(y)) }, |x: f64, y: f64| x - y, "__sub"),
                     // Immediate arith: C is a signed literal, not an RK
                     // operand — the int fast path skips the const resolve.
                     // The metamethod/error path behaves exactly like the
@@ -2222,7 +2408,9 @@ impl Vm {
                             if mm.is_nil() {
                                 return Err(VmError::RuntimeError(format!(
                                     "attempt to perform arithmetic on a {} value{}",
-                                    bv.type_name(), varinfo(proto, frame.pc - 1, b()))));
+                                    bv.type_name(),
+                                    varinfo(proto, frame.pc - 1, b())
+                                )));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
@@ -2243,16 +2431,19 @@ impl Vm {
                             if mm.is_nil() {
                                 return Err(VmError::RuntimeError(format!(
                                     "attempt to perform arithmetic on a {} value{}",
-                                    bv.type_name(), varinfo(proto, frame.pc - 1, b()))));
+                                    bv.type_name(),
+                                    varinfo(proto, frame.pc - 1, b())
+                                )));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
                             continue 'outer;
                         }
                     }
-                    Op::Mul  => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_mul(y)) }, |x: f64, y: f64| x * y, "__mul"),
-                    Op::Div  => {
-                        let bv = RK!(b()); let cv = RK!(c());
+                    Op::Mul => arith_op!(a(), b(), c(), |x: i64, y: i64| -> VmResult<i64> { Ok(x.wrapping_mul(y)) }, |x: f64, y: f64| x * y, "__mul"),
+                    Op::Div => {
+                        let bv = RK!(b());
+                        let cv = RK!(c());
                         if bv.is_number() && cv.is_number() {
                             R!(a()) = Value::float(bv.to_float().unwrap() / cv.to_float().unwrap());
                         } else {
@@ -2261,25 +2452,38 @@ impl Vm {
                                 let bad = if !bv.is_number() { (b(), bv) } else { (c(), cv) };
                                 return Err(VmError::RuntimeError(format!(
                                     "attempt to perform arithmetic on a {} value{}",
-                                    bad.1.type_name(), rk_varinfo(proto, frame.pc - 1, bad.0))));
+                                    bad.1.type_name(),
+                                    rk_varinfo(proto, frame.pc - 1, bad.0)
+                                )));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
                             continue 'outer;
                         }
                     }
-                    Op::IDiv => arith_op!(a(), b(), c(),
+                    Op::IDiv => arith_op!(
+                        a(),
+                        b(),
+                        c(),
                         |x: i64, y: i64| -> VmResult<i64> {
                             if y == 0 { Err(VmError::RuntimeError("attempt to perform 'n//0'".into())) } else { Ok(lua_idiv(x, y)) }
                         },
-                        |x: f64, y: f64| (x / y).floor(), "__idiv"),
-                    Op::Mod  => arith_op!(a(), b(), c(),
+                        |x: f64, y: f64| (x / y).floor(),
+                        "__idiv"
+                    ),
+                    Op::Mod => arith_op!(
+                        a(),
+                        b(),
+                        c(),
                         |x: i64, y: i64| -> VmResult<i64> {
                             if y == 0 { Err(VmError::RuntimeError("attempt to perform 'n%0'".into())) } else { Ok(lua_mod(x, y)) }
                         },
-                        |x: f64, y: f64| x - (x / y).floor() * y, "__mod"),
-                    Op::Pow  => {
-                        let bv = RK!(b()); let cv = RK!(c());
+                        |x: f64, y: f64| x - (x / y).floor() * y,
+                        "__mod"
+                    ),
+                    Op::Pow => {
+                        let bv = RK!(b());
+                        let cv = RK!(c());
                         if bv.is_number() && cv.is_number() {
                             R!(a()) = Value::float(bv.to_float().unwrap().powf(cv.to_float().unwrap()));
                         } else {
@@ -2288,7 +2492,9 @@ impl Vm {
                                 let bad = if !bv.is_number() { (b(), bv) } else { (c(), cv) };
                                 return Err(VmError::RuntimeError(format!(
                                     "attempt to perform arithmetic on a {} value{}",
-                                    bad.1.type_name(), rk_varinfo(proto, frame.pc - 1, bad.0))));
+                                    bad.1.type_name(),
+                                    rk_varinfo(proto, frame.pc - 1, bad.0)
+                                )));
                             }
                             let res = self.call_value_isolated(mm, &[bv, cv])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
@@ -2307,7 +2513,9 @@ impl Vm {
                             if mm.is_nil() {
                                 return Err(VmError::RuntimeError(format!(
                                     "attempt to perform arithmetic on a {} value{}",
-                                    v.type_name(), varinfo(proto, frame.pc - 1, b()))));
+                                    v.type_name(),
+                                    varinfo(proto, frame.pc - 1, b())
+                                )));
                             }
                             let res = self.call_value_isolated(mm, &[v, v])?;
                             self.regs[base + a()] = res.into_iter().next().unwrap_or(Value::nil());
@@ -2315,27 +2523,32 @@ impl Vm {
                         }
                     }
                     Op::BAnd => {
-                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
+                        let bv = int_val(RK!(b()))?;
+                        let cv = int_val(RK!(c()))?;
                         let res = self.make_int(bv & cv);
                         R!(a()) = res;
                     }
-                    Op::BOr  => {
-                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
+                    Op::BOr => {
+                        let bv = int_val(RK!(b()))?;
+                        let cv = int_val(RK!(c()))?;
                         let res = self.make_int(bv | cv);
                         R!(a()) = res;
                     }
                     Op::BXor => {
-                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
+                        let bv = int_val(RK!(b()))?;
+                        let cv = int_val(RK!(c()))?;
                         let res = self.make_int(bv ^ cv);
                         R!(a()) = res;
                     }
-                    Op::Shl  => {
-                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
+                    Op::Shl => {
+                        let bv = int_val(RK!(b()))?;
+                        let cv = int_val(RK!(c()))?;
                         let res = self.make_int(lua_shl(bv, cv));
                         R!(a()) = res;
                     }
-                    Op::Shr  => {
-                        let bv = int_val(RK!(b()))?; let cv = int_val(RK!(c()))?;
+                    Op::Shr => {
+                        let bv = int_val(RK!(b()))?;
+                        let cv = int_val(RK!(c()))?;
                         let res = self.make_int(lua_shl(bv, cv.wrapping_neg()));
                         R!(a()) = res;
                     }
@@ -2344,8 +2557,8 @@ impl Vm {
                         let res = self.make_int(!v);
                         R!(a()) = res;
                     }
-                    Op::Not  => R!(a()) = Value::bool(!R!(b()).is_truthy()),
-                    Op::Len  => {
+                    Op::Not => R!(a()) = Value::bool(!R!(b()).is_truthy()),
+                    Op::Len => {
                         let v = R!(b());
                         if v.is_string() {
                             let n = self.gc.str(v).len();
@@ -2367,8 +2580,11 @@ impl Vm {
                             }
                             R!(a()) = Value::int(len);
                         } else {
-                            return Err(VmError::RuntimeError(format!("attempt to get length of a {} value{}",
-                                v.type_name(), varinfo(proto, frame.pc - 1, b()))));
+                            return Err(VmError::RuntimeError(format!(
+                                "attempt to get length of a {} value{}",
+                                v.type_name(),
+                                varinfo(proto, frame.pc - 1, b())
+                            )));
                         }
                     }
                     Op::Concat => {
@@ -2381,18 +2597,18 @@ impl Vm {
                         let mut acc_reg = c();
                         for (k, &left) in vals.iter().enumerate().rev() {
                             match self.concat_two(left, acc) {
-                                Ok(v) => { acc = v; acc_reg = lo + k; }
+                                Ok(v) => {
+                                    acc = v;
+                                    acc_reg = lo + k;
+                                }
                                 Err(e) => {
-                                    let (bad, reg) = if !left.is_string() && !left.is_number() {
-                                        (left, lo + k)
-                                    } else {
-                                        (acc, acc_reg)
-                                    };
+                                    let (bad, reg) = if !left.is_string() && !left.is_number() { (left, lo + k) } else { (acc, acc_reg) };
                                     return Err(match e {
-                                        VmError::RuntimeError(m) if m.starts_with("attempt to concatenate") =>
-                                            VmError::RuntimeError(format!(
-                                                "attempt to concatenate a {} value{}",
-                                                bad.type_name(), varinfo(proto, frame.pc - 1, reg))),
+                                        VmError::RuntimeError(m) if m.starts_with("attempt to concatenate") => VmError::RuntimeError(format!(
+                                            "attempt to concatenate a {} value{}",
+                                            bad.type_name(),
+                                            varinfo(proto, frame.pc - 1, reg)
+                                        )),
                                         other => other,
                                     });
                                 }
@@ -2415,7 +2631,8 @@ impl Vm {
                     // consumed the Jmp: ck!() resumes at frame.pc, so a step
                     // taken first would run the Jmp unconditionally.
                     Op::Eq => {
-                        let bv = RK!(b()); let cv = RK!(c());
+                        let bv = RK!(b());
+                        let cv = RK!(c());
                         let (eq, slow) = if bv.raw_bits() == cv.raw_bits() {
                             (true, false)
                         } else {
@@ -2424,11 +2641,14 @@ impl Vm {
                             (eq, true)
                         };
                         fused_jmp!(eq == (a() != 0));
-                        if slow { ck!(); }
+                        if slow {
+                            ck!();
+                        }
                     }
 
                     Op::Lt => {
-                        let bv = RK!(b()); let cv = RK!(c());
+                        let bv = RK!(b());
+                        let cv = RK!(c());
                         // Numbers compare inline (floats can never be NaN here —
                         // Value::float maps NaN to nil); only non-numbers take
                         // the metamethod path, which may swap frames.
@@ -2442,10 +2662,13 @@ impl Vm {
                             (lt.map_err(|e| name_order_err(e, proto, frame.pc - 1, bv, cv, b(), c()))?, true)
                         };
                         fused_jmp!(lt == (a() != 0));
-                        if slow { ck!(); }
+                        if slow {
+                            ck!();
+                        }
                     }
                     Op::Le => {
-                        let bv = RK!(b()); let cv = RK!(c());
+                        let bv = RK!(b());
+                        let cv = RK!(c());
                         let (le, slow) = if bv.is_int() && cv.is_int() {
                             (bv.as_int().unwrap() <= cv.as_int().unwrap(), false)
                         } else if bv.is_number() && cv.is_number() {
@@ -2456,7 +2679,9 @@ impl Vm {
                             (le.map_err(|e| name_order_err(e, proto, frame.pc - 1, bv, cv, b(), c()))?, true)
                         };
                         fused_jmp!(le == (a() != 0));
-                        if slow { ck!(); }
+                        if slow {
+                            ck!();
+                        }
                     }
 
                     // Immediate compares: R[B] against a signed literal (C).
@@ -2477,7 +2702,9 @@ impl Vm {
                             (lt.map_err(|e| name_order_err(e, proto, frame.pc - 1, bv, Value::int(k), b(), usize::MAX))?, true)
                         };
                         fused_jmp!(lt == (a() != 0));
-                        if slow { ck!(); }
+                        if slow {
+                            ck!();
+                        }
                     }
                     Op::LeI => {
                         let bv = R!(b());
@@ -2492,7 +2719,9 @@ impl Vm {
                             (le.map_err(|e| name_order_err(e, proto, frame.pc - 1, bv, Value::int(k), b(), usize::MAX))?, true)
                         };
                         fused_jmp!(le == (a() != 0));
-                        if slow { ck!(); }
+                        if slow {
+                            ck!();
+                        }
                     }
                     Op::GtI => {
                         let bv = R!(b());
@@ -2507,7 +2736,9 @@ impl Vm {
                             (gt.map_err(|e| name_order_err(e, proto, frame.pc - 1, Value::int(k), bv, usize::MAX, b()))?, true)
                         };
                         fused_jmp!(gt == (a() != 0));
-                        if slow { ck!(); }
+                        if slow {
+                            ck!();
+                        }
                     }
                     Op::GeI => {
                         let bv = R!(b());
@@ -2522,7 +2753,9 @@ impl Vm {
                             (ge.map_err(|e| name_order_err(e, proto, frame.pc - 1, Value::int(k), bv, usize::MAX, b()))?, true)
                         };
                         fused_jmp!(ge == (a() != 0));
-                        if slow { ck!(); }
+                        if slow {
+                            ck!();
+                        }
                     }
                     Op::EqI => {
                         let bv = R!(b());
@@ -2535,7 +2768,9 @@ impl Vm {
                             (eq, true)
                         };
                         fused_jmp!(eq == (a() != 0));
-                        if slow { ck!(); }
+                        if slow {
+                            ck!();
+                        }
                     }
 
                     Op::Test => {
@@ -2544,12 +2779,16 @@ impl Vm {
                     Op::TestSet => {
                         let bv = R!(b());
                         let taken = bv.is_truthy() == (c() != 0);
-                        if taken { R!(a()) = bv; }
+                        if taken {
+                            R!(a()) = bv;
+                        }
                         fused_jmp!(taken);
                     }
                     Op::Jmp => {
                         frame.pc = (frame.pc as i32 + sbx()) as usize;
-                        if sbx() < 0 { ck!(); }
+                        if sbx() < 0 {
+                            ck!();
+                        }
                     }
 
                     Op::NewTable => {
@@ -2590,9 +2829,7 @@ impl Vm {
                         let bi = bx();
                         let cached = proto.global_cache.get(bi).map(|c| c.get());
                         if let Some((owner, g, bits)) = cached {
-                            if bits != 0 && owner == self.id
-                                && g == self.globals_gen
-                            {
+                            if bits != 0 && owner == self.id && g == self.globals_gen {
                                 R!(a()) = Value::from_raw(bits);
                                 continue;
                             }
@@ -2642,18 +2879,18 @@ impl Vm {
                         } else if fn_val.is_table() {
                             let mm = self.get_mm(fn_val, "__call");
                             if mm.is_nil() {
-                                return Err(VmError::RuntimeError(format!("attempt to call a table value{}",
-                                    varinfo(proto, frame.pc - 1, a()))));
+                                return Err(VmError::RuntimeError(format!("attempt to call a table value{}", varinfo(proto, frame.pc - 1, a()))));
                             }
                             let mut mm_args = Vec::with_capacity(nargs as usize + 1);
                             mm_args.push(fn_val);
-                            for i in 0..nargs as usize { mm_args.push(R!(a() + 1 + i)); }
+                            for i in 0..nargs as usize {
+                                mm_args.push(R!(a() + 1 + i));
+                            }
                             let results = self.call_value_isolated(mm, &mm_args)?;
                             self.place_results(base + a(), results, nresults);
                             continue 'outer;
                         } else {
-                            return Err(VmError::RuntimeError(format!("attempt to call a {} value{}",
-                                fn_val.type_name(), varinfo(proto, frame.pc - 1, a()))));
+                            return Err(VmError::RuntimeError(format!("attempt to call a {} value{}", fn_val.type_name(), varinfo(proto, frame.pc - 1, a()))));
                         }
                     }
 
@@ -2711,12 +2948,13 @@ impl Vm {
                         } else if fn_val.is_table() {
                             let mm = self.get_mm(fn_val, "__call");
                             if mm.is_nil() {
-                                return Err(VmError::RuntimeError(format!("attempt to call a table value{}",
-                                    varinfo(proto, frame.pc - 1, a()))));
+                                return Err(VmError::RuntimeError(format!("attempt to call a table value{}", varinfo(proto, frame.pc - 1, a()))));
                             }
                             let mut mm_args = Vec::with_capacity(nargs + 1);
                             mm_args.push(fn_val);
-                            for i in 0..nargs { mm_args.push(R!(a() + 1 + i)); }
+                            for i in 0..nargs {
+                                mm_args.push(R!(a() + 1 + i));
+                            }
                             let expected = frame.expected_results;
                             let base_save = base;
                             let results = self.call_value_isolated(mm, &mm_args)?;
@@ -2728,8 +2966,7 @@ impl Vm {
                             self.place_results(base_save - 1, results, expected);
                             continue 'outer;
                         } else {
-                            return Err(VmError::RuntimeError(format!("attempt to call a {} value{}",
-                                fn_val.type_name(), varinfo(proto, frame.pc - 1, a()))));
+                            return Err(VmError::RuntimeError(format!("attempt to call a {} value{}", fn_val.type_name(), varinfo(proto, frame.pc - 1, a()))));
                         }
                     }
 
@@ -2739,8 +2976,7 @@ impl Vm {
                         let base_save = base;
                         self.frames.pop();
                         if self.frames.is_empty() {
-                            self.top_level_results =
-                                self.regs[base_save + a()..base_save + a() + nv].to_vec();
+                            self.top_level_results = self.regs[base_save + a()..base_save + a() + nv].to_vec();
                             return Ok(());
                         }
                         // The frame was pushed at (call site A) + 1, so results land
@@ -2766,14 +3002,10 @@ impl Vm {
                         frame.pc = (frame.pc as i32 + sbx()) as usize;
                     }
                     Op::ForLoop => {
-                        let idx  = to_number(R!(a()), "initial value")?;
-                        let lim  = to_number(R!(a() + 1), "limit")?;
+                        let idx = to_number(R!(a()), "initial value")?;
+                        let lim = to_number(R!(a() + 1), "limit")?;
                         let step = to_number(R!(a() + 2), "step")?;
-                        let in_range = if num_is_positive(step) {
-                            num_le(idx, lim)
-                        } else {
-                            num_le(lim, idx)
-                        };
+                        let in_range = if num_is_positive(step) { num_le(idx, lim) } else { num_le(lim, idx) };
                         if in_range {
                             R!(a() + 3) = R!(a());
                             // Advance the candidate for the next check. Integer
@@ -2791,22 +3023,23 @@ impl Vm {
                     // so its Return lands the results on a+4 like the cfn path.
                     Op::TForCall => {
                         let fn_val = R!(a());
-                        let state  = R!(a() + 1);
-                        let ctrl   = R!(a() + 2);
+                        let state = R!(a() + 1);
+                        let ctrl = R!(a() + 2);
                         let nresults = c() as u8;
                         if crate::heap::is_native(fn_val) {
                             let results = self.call_native(fn_val, &[state, ctrl])?;
                             self.place_results(base + a() + 4, results, nresults);
                             continue 'outer;
                         } else {
-                            let cp = self.gc.callable(fn_val)
-                                .ok_or_else(|| VmError::RuntimeError(format!(
-                                    "attempt to call a {} value (for iterator 'for iterator')",
-                                    fn_val.type_name())))?;
+                            let cp = self.gc.callable(fn_val).ok_or_else(|| {
+                                VmError::RuntimeError(format!("attempt to call a {} value (for iterator 'for iterator')", fn_val.type_name()))
+                            })?;
                             let new_base = base + a() + 5;
                             // SAFETY: the proto of a function Value.
                             let needed = new_base + unsafe { crate::heap::proto(cp.proto) }.max_regs as usize + 8;
-                            if needed > self.regs.len() { self.regs.resize(needed, Value::nil()); }
+                            if needed > self.regs.len() {
+                                self.regs.resize(needed, Value::nil());
+                            }
                             self.regs[new_base] = state;
                             self.regs[new_base + 1] = ctrl;
                             self.push_frame(cp.proto, cp.upvals_ptr, cp.upvals_len, new_base, 2, nresults)?;
@@ -2831,14 +3064,12 @@ impl Vm {
                         let closure_val = if inner_proto.upvals.is_empty() {
                             Value::userdata(inner as *mut u8)
                         } else {
-                            let upvals: Vec<Value> = inner_proto.upvals.iter().map(|desc| {
-                                if desc.in_stack { R!(desc.idx as usize) } else { frame.upval(desc.idx as usize) }
-                            }).collect();
-                            let lc = Box::new(LuaClosure {
-                                gc: crate::gc::GcHeader::new(crate::gc::GcKind::Closure),
-                                proto: inner,
-                                upvals,
-                            });
+                            let upvals: Vec<Value> = inner_proto
+                                .upvals
+                                .iter()
+                                .map(|desc| if desc.in_stack { R!(desc.idx as usize) } else { frame.upval(desc.idx as usize) })
+                                .collect();
+                            let lc = Box::new(LuaClosure { gc: crate::gc::GcHeader::new(crate::gc::GcKind::Closure), proto: inner, upvals });
                             let ptr = Box::into_raw(lc) as *mut u8;
                             self.gc.register(ptr);
                             Value::closure(ptr)
@@ -2862,15 +3093,22 @@ impl Vm {
 
                     Op::Vararg => {
                         let n = if b() == 0 { frame.varargs.len() } else { b() - 1 };
-                        if base + a() + n > self.regs.len() { self.regs.resize(base + a() + n + 64, Value::nil()); regs = self.regs.as_mut_ptr(); }
+                        if base + a() + n > self.regs.len() {
+                            self.regs.resize(base + a() + n + 64, Value::nil());
+                            regs = self.regs.as_mut_ptr();
+                        }
                         for i in 0..n {
                             R!(a() + i) = frame.varargs.get(i).copied().unwrap_or(Value::nil());
                         }
-                        if b() == 0 { frame.top = base + a() + n; }
+                        if b() == 0 {
+                            frame.top = base + a() + n;
+                        }
                     }
 
-                    Op::Tbc    => self.tbc.push((base + a(), b() != 0)),
-                    Op::TbcPop => { self.tbc.pop(); }
+                    Op::Tbc => self.tbc.push((base + a(), b() != 0)),
+                    Op::TbcPop => {
+                        self.tbc.pop();
+                    }
                 }
             }
         }
@@ -2880,11 +3118,19 @@ impl Vm {
     fn place_results(&mut self, at: usize, results: Vec<Value>, expected: u8) {
         let nr = results.len();
         let fill = if expected == 255 { nr } else { expected as usize };
-        if at + fill > self.regs.len() { self.regs.resize(at + fill + 64, Value::nil()); }
-        for (i, v) in results.into_iter().take(fill).enumerate() { self.regs[at + i] = v; }
-        for i in nr..fill { self.regs[at + i] = Value::nil(); }
+        if at + fill > self.regs.len() {
+            self.regs.resize(at + fill + 64, Value::nil());
+        }
+        for (i, v) in results.into_iter().take(fill).enumerate() {
+            self.regs[at + i] = v;
+        }
+        for i in nr..fill {
+            self.regs[at + i] = Value::nil();
+        }
         if expected == 255 {
-            if let Some(f) = self.frames.last_mut() { f.top = at + nr; }
+            if let Some(f) = self.frames.last_mut() {
+                f.top = at + nr;
+            }
         }
     }
 
@@ -2894,39 +3140,49 @@ impl Vm {
     #[inline(always)]
     fn place_results_from(&mut self, at: usize, src: usize, nr: usize, expected: u8) {
         let fill = if expected == 255 { nr } else { expected as usize };
-        if at + fill > self.regs.len() { self.regs.resize(at + fill + 64, Value::nil()); }
+        if at + fill > self.regs.len() {
+            self.regs.resize(at + fill + 64, Value::nil());
+        }
         let n = nr.min(fill);
         // dst < src always (results land one slot below the callee's base),
         // so a forward copy is safe; a plain loop beats memmove's call
         // overhead for the 0-2 results most returns carry.
         if src != at {
-            for i in 0..n { self.regs[at + i] = self.regs[src + i]; }
+            for i in 0..n {
+                self.regs[at + i] = self.regs[src + i];
+            }
         }
-        for i in n..fill { self.regs[at + i] = Value::nil(); }
+        for i in n..fill {
+            self.regs[at + i] = Value::nil();
+        }
         if expected == 255 {
-            if let Some(f) = self.frames.last_mut() { f.top = at + nr; }
+            if let Some(f) = self.frames.last_mut() {
+                f.top = at + nr;
+            }
         }
     }
 
     fn register_stdlib(&mut self) {
         self.set_global_cfn("print", |cx, args| {
             let mut parts = Vec::with_capacity(args.len());
-            for &v in args { parts.push(tostring_value(cx.vm, v)?); }
+            for &v in args {
+                parts.push(tostring_value(cx.vm, v)?);
+            }
             emit_line(cx.vm, parts.join("\t"), true);
             Ok(vec![])
         });
 
         self.set_global_cfn("tostring", |cx, args| {
-            let v = args.first().copied().ok_or_else(||
-                VmError::RuntimeError("tostring: value expected".into()))?;
-            if v.is_string() { return Ok(vec![v]); }
+            let v = args.first().copied().ok_or_else(|| VmError::RuntimeError("tostring: value expected".into()))?;
+            if v.is_string() {
+                return Ok(vec![v]);
+            }
             let s = tostring_value(cx.vm, v)?;
             Ok(vec![cx.vm.alloc_str(&s)])
         });
 
         self.set_global_cfn("tonumber", |cx, args| {
-            let v = args.first().copied().ok_or_else(||
-                VmError::RuntimeError("tonumber: value expected".into()))?;
+            let v = args.first().copied().ok_or_else(|| VmError::RuntimeError("tonumber: value expected".into()))?;
             // lua_isnoneornil: an absent or nil base means standard
             // conversion; the base itself is checked first either way.
             let base = match args.get(1) {
@@ -2935,7 +3191,9 @@ impl Vm {
                 Some(&b) => Some(int_arg(b, "tonumber")?),
             };
             let Some(base) = base else {
-                if v.is_number() { return Ok(vec![v]); }
+                if v.is_number() {
+                    return Ok(vec![v]);
+                }
                 let Some(s) = crate::heap::arg_str(args, 0) else { return Ok(vec![Value::nil()]) };
                 return Ok(vec![str_to_number(cx.vm, s).unwrap_or(Value::nil())]);
             };
@@ -2948,13 +3206,19 @@ impl Vm {
             // only — any trailing junk fails, and overflow wraps modulo 2^64.
             let mut t = s.trim();
             let neg = t.starts_with('-');
-            if neg || t.starts_with('+') { t = &t[1..]; }
-            if t.is_empty() { return Ok(vec![Value::nil()]); }
+            if neg || t.starts_with('+') {
+                t = &t[1..];
+            }
+            if t.is_empty() {
+                return Ok(vec![Value::nil()]);
+            }
             let mut n: u64 = 0;
             for c in t.bytes() {
                 let d = (c as char).to_digit(base as u32);
-                match d { Some(d) => n = n.wrapping_mul(base as u64).wrapping_add(d as u64),
-                          None => return Ok(vec![Value::nil()]) }
+                match d {
+                    Some(d) => n = n.wrapping_mul(base as u64).wrapping_add(d as u64),
+                    None => return Ok(vec![Value::nil()]),
+                }
             }
             let n = n as i64;
             Ok(vec![cx.vm.make_int(if neg { n.wrapping_neg() } else { n })])
@@ -2989,9 +3253,7 @@ impl Vm {
             let msg = args.first().copied().unwrap_or(Value::nil());
             let level = match args.get(1) {
                 None => 1,
-                Some(&v) => int_val(v).map_err(|_| {
-                    VmError::RuntimeError("bad argument #2 to 'error' (integer expected)".into())
-                })?,
+                Some(&v) => int_val(v).map_err(|_| VmError::RuntimeError("bad argument #2 to 'error' (integer expected)".into()))?,
             };
             // Non-string messages are thrown as-is at any level (Lua semantics).
             if !msg.is_string() {
@@ -3069,15 +3331,10 @@ impl Vm {
                         None => vm.stack_traceback(vm.thread_floor),
                     };
                     vm.drop_handled_traces();
-                    vm.handlers.push(Handling {
-                        caller_segment: vm.saved_frames.len(),
-                        thread: vm.resume_chain.len(),
-                        traceback,
-                    });
+                    vm.handlers.push(Handling { caller_segment: vm.saved_frames.len(), thread: vm.resume_chain.len(), traceback });
                     // The handler runs even if it panics/errors itself: its own
                     // failure shouldn't be worse than the error it's handling.
-                    let handled = vm.call_value_isolated(handler, &[msg])
-                        .unwrap_or_else(|_| vec![msg]);
+                    let handled = vm.call_value_isolated(handler, &[msg]).unwrap_or_else(|_| vec![msg]);
                     vm.handlers.pop();
                     let mut ret = vec![Value::bool(false)];
                     ret.extend(handled);
@@ -3150,14 +3407,13 @@ impl Vm {
             let iter_val = self.make_cfn_val(|cx, args| {
                 let tbl = args.first().copied().unwrap_or(Value::nil());
                 let idx = args.get(1).copied().unwrap_or(Value::nil());
-                if !tbl.is_table() { return Ok(vec![Value::nil()]); }
-                let i = idx.as_int()
-                    .or_else(|| idx.as_float().map(|f| f as i64))
-                    .unwrap_or(0);
+                if !tbl.is_table() {
+                    return Ok(vec![Value::nil()]);
+                }
+                let i = idx.as_int().or_else(|| idx.as_float().map(|f| f as i64)).unwrap_or(0);
                 let next_i = i + 1;
                 let v = cx.vm.gc.table(tbl).raw_get(Value::int(next_i));
-                if v.is_nil() { Ok(vec![Value::nil()]) }
-                else { Ok(vec![Value::int(next_i), v]) }
+                if v.is_nil() { Ok(vec![Value::nil()]) } else { Ok(vec![Value::int(next_i), v]) }
             });
             let ipairs = self.make_cfn_closure(&[iter_val], |_cx, args, up| {
                 let t = args.first().copied().unwrap_or(Value::nil());
@@ -3195,14 +3451,27 @@ impl Vm {
 
         self.set_global_cfn("unpack", |cx, args| {
             let t = args.first().copied().unwrap_or(Value::nil());
-            if !t.is_table() { return Err(VmError::RuntimeError("unpack: table expected".into())); }
+            if !t.is_table() {
+                return Err(VmError::RuntimeError("unpack: table expected".into()));
+            }
             let n = cx.vm.gc.table(t).length();
-            let i = match args.get(1) { None => 1, Some(&v) => int_arg(v, "unpack")? };
-            let j = match args.get(2) { None => n, Some(&v) => int_arg(v, "unpack")? };
+            let i = match args.get(1) {
+                None => 1,
+                Some(&v) => int_arg(v, "unpack")?,
+            };
+            let j = match args.get(2) {
+                None => n,
+                Some(&v) => int_arg(v, "unpack")?,
+            };
             if checked_range_len(i, j).is_none() {
                 return Err(VmError::RuntimeError("unpack: range too large".into()));
             }
-            Ok((i..=j).map(|k| { let k = cx.vm.make_int(k); cx.vm.gc.table(t).raw_get(k) }).collect())
+            Ok((i..=j)
+                .map(|k| {
+                    let k = cx.vm.make_int(k);
+                    cx.vm.gc.table(t).raw_get(k)
+                })
+                .collect())
         });
 
         self.set_global_cfn("select", |_cx, args| {
@@ -3219,10 +3488,9 @@ impl Vm {
             Ok(args.get(start as usize + 1..).map(|s| s.to_vec()).unwrap_or_default())
         });
 
-
         self.set_global_cfn("setmetatable", |cx, args| {
             let tbl = args.first().copied().unwrap_or(Value::nil());
-            let mt  = args.get(1).copied().unwrap_or(Value::nil());
+            let mt = args.get(1).copied().unwrap_or(Value::nil());
             if !tbl.is_table() {
                 return Err(VmError::RuntimeError("setmetatable: first arg must be a table".into()));
             }
@@ -3235,7 +3503,9 @@ impl Vm {
 
         self.set_global_cfn("getmetatable", |cx, args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if !v.is_table() { return Ok(vec![Value::nil()]); }
+            if !v.is_table() {
+                return Ok(vec![Value::nil()]);
+            }
             let gc = &cx.vm.gc;
             let t = gc.table(v);
             let Some(mt) = gc.metatable(t) else { return Ok(vec![Value::nil()]) };
@@ -3271,9 +3541,7 @@ impl Vm {
             Ok(vec![Value::bool(values_equal(&cx.vm.gc, a, b))])
         });
 
-        self.set_global_cfn("yield", |_cx, args| {
-            Err(VmError::Yield(args.to_vec()))
-        });
+        self.set_global_cfn("yield", |_cx, args| Err(VmError::Yield(args.to_vec())));
 
         let co_table_ptr = alloc_table_raw();
         self.gc.register(co_table_ptr);
@@ -3311,8 +3579,8 @@ impl Vm {
             }
             let s = match cx.vm.gc.coroutine(co_val).status {
                 CoStatus::Suspended => "suspended",
-                CoStatus::Running   => "running",
-                CoStatus::Dead      => "dead",
+                CoStatus::Running => "running",
+                CoStatus::Dead => "dead",
             };
             Ok(vec![cx.vm.alloc_str(s)])
         });
@@ -3324,15 +3592,13 @@ impl Vm {
             Ok(vec![wrapper])
         });
 
-        let isyieldable_val = self.make_cfn_val(|cx, _args| {
-            Ok(vec![Value::bool(!cx.vm.resume_chain.is_empty())])
-        });
+        let isyieldable_val = self.make_cfn_val(|cx, _args| Ok(vec![Value::bool(!cx.vm.resume_chain.is_empty())]));
 
         let ct = Value::table(co_table_ptr);
-        let k_create      = self.intern("create");
-        let k_resume      = self.intern("resume");
-        let k_status      = self.intern("status");
-        let k_wrap        = self.intern("wrap");
+        let k_create = self.intern("create");
+        let k_resume = self.intern("resume");
+        let k_status = self.intern("status");
+        let k_wrap = self.intern("wrap");
         let k_isyieldable = self.intern("isyieldable");
         self.gc.raw_set(ct, k_create, create_val);
         self.gc.raw_set(ct, k_resume, resume_val);
@@ -3347,17 +3613,17 @@ impl Vm {
         let str_table_ptr = alloc_table_raw();
         self.gc.register(str_table_ptr);
 
-        let v_str_len = self.make_cfn_val(|_cx, args| {
-            Ok(vec![Value::int(str_arg(args, 0, "string.len")?.len() as i64)])
-        });
+        let v_str_len = self.make_cfn_val(|_cx, args| Ok(vec![Value::int(str_arg(args, 0, "string.len")?.len() as i64)]));
         let v_str_sub = self.make_cfn_val(|cx, args| {
             let s = str_arg(args, 0, "string.sub")?;
             let len = s.len();
             let i = opt_int_arg(args, 1, "string.sub", 1)?;
             let j = opt_int_arg(args, 2, "string.sub", -1)?;
             let start = lua_str_start(len, i);
-            let end   = lua_str_end(len, j);
-            if start >= end { return Ok(vec![cx.vm.alloc_str("")]); }
+            let end = lua_str_end(len, j);
+            if start >= end {
+                return Ok(vec![cx.vm.alloc_str("")]);
+            }
             Ok(vec![cx.vm.alloc_str(&String::from_utf8_lossy(&s.as_bytes()[start..end]))])
         });
         let v_str_rep = self.make_cfn_val(|cx, args| {
@@ -3369,7 +3635,9 @@ impl Vm {
                 Some(&v) if v.is_number() => coerce_to_concat_str(v),
                 Some(_) => return Err(VmError::RuntimeError("string.rep: string expected".into())),
             };
-            if n <= 0 { return Ok(vec![cx.vm.alloc_str("")]); }
+            if n <= 0 {
+                return Ok(vec![cx.vm.alloc_str("")]);
+            }
             let n = n as usize;
             let total = n.saturating_mul(s.len() + sep.len());
             if total > MAX_ALLOC_LEN {
@@ -3379,7 +3647,9 @@ impl Vm {
             // 16 bytes per repeat on top of the join's own buffer.
             let mut buf = Vec::with_capacity(total + 1);
             for i in 0..n {
-                if i > 0 { buf.extend_from_slice(sep.as_bytes()); }
+                if i > 0 {
+                    buf.extend_from_slice(sep.as_bytes());
+                }
                 buf.extend_from_slice(s.as_bytes());
             }
             let len = buf.len();
@@ -3390,13 +3660,11 @@ impl Vm {
         let v_str_upper = self.make_cfn_val(|cx, args| {
             // C-locale toupper: ASCII only, like Lua. Byte-wise mapping keeps
             // multibyte UTF-8 sequences untouched.
-            let bytes: Vec<u8> = str_arg(args, 0, "string.upper")?.bytes()
-                .map(|b| b.to_ascii_uppercase()).collect();
+            let bytes: Vec<u8> = str_arg(args, 0, "string.upper")?.bytes().map(|b| b.to_ascii_uppercase()).collect();
             Ok(vec![cx.vm.alloc_str(&String::from_utf8_lossy(&bytes))])
         });
         let v_str_lower = self.make_cfn_val(|cx, args| {
-            let bytes: Vec<u8> = str_arg(args, 0, "string.lower")?.bytes()
-                .map(|b| b.to_ascii_lowercase()).collect();
+            let bytes: Vec<u8> = str_arg(args, 0, "string.lower")?.bytes().map(|b| b.to_ascii_lowercase()).collect();
             Ok(vec![cx.vm.alloc_str(&String::from_utf8_lossy(&bytes))])
         });
         let v_str_reverse = self.make_cfn_val(|cx, args| {
@@ -3410,7 +3678,7 @@ impl Vm {
             let i = opt_int_arg(args, 1, "string.byte", 1)?;
             let j = opt_int_arg(args, 2, "string.byte", i)?;
             let start = lua_str_start(s.len(), i);
-            let end   = lua_str_end(s.len(), j).min(s.len());
+            let end = lua_str_end(s.len(), j).min(s.len());
             if end.saturating_sub(start) > MAX_ALLOC_LEN / 8 {
                 return Err(VmError::RuntimeError("string.byte: string slice too long".into()));
             }
@@ -3429,22 +3697,22 @@ impl Vm {
         let v_str_find = self.make_cfn_val(|cx, args| {
             let s = str_arg(args, 0, "string.find")?;
             let pat = str_arg(args, 1, "string.find")?;
-            let init = match args.get(2) { None => 1, Some(&v) => int_arg(v, "string.find")? };
+            let init = match args.get(2) {
+                None => 1,
+                Some(&v) => int_arg(v, "string.find")?,
+            };
             let plain = args.get(3).map(|&v| v.is_truthy()).unwrap_or(false);
             // Lua: init past len+1 finds nothing (even an empty pattern).
-            if init > s.len() as i64 + 1 { return Ok(vec![Value::nil()]); }
+            if init > s.len() as i64 + 1 {
+                return Ok(vec![Value::nil()]);
+            }
             let start = lua_str_start(s.len(), init);
             if plain {
                 let hay = &s.as_bytes()[start..];
-                let found = if pat.is_empty() { Some(0) } else {
-                    hay.windows(pat.len()).position(|w| w == pat.as_bytes())
-                };
+                let found = if pat.is_empty() { Some(0) } else { hay.windows(pat.len()).position(|w| w == pat.as_bytes()) };
                 return match found {
                     None => Ok(vec![Value::nil()]),
-                    Some(pos) => Ok(vec![
-                        Value::int((start + pos + 1) as i64),
-                        Value::int((start + pos + pat.len()) as i64),
-                    ]),
+                    Some(pos) => Ok(vec![Value::int((start + pos + 1) as i64), Value::int((start + pos + pat.len()) as i64)]),
                 };
             }
             match pattern::find_from(s.as_bytes(), pat.as_bytes(), start) {
@@ -3460,8 +3728,13 @@ impl Vm {
         let v_str_match = self.make_cfn_val(|cx, args| {
             let s = str_arg(args, 0, "string.match")?;
             let pat = str_arg(args, 1, "string.match")?;
-            let init = match args.get(2) { None => 1, Some(&v) => int_arg(v, "string.match")? };
-            if init > s.len() as i64 + 1 { return Ok(vec![Value::nil()]); }
+            let init = match args.get(2) {
+                None => 1,
+                Some(&v) => int_arg(v, "string.match")?,
+            };
+            if init > s.len() as i64 + 1 {
+                return Ok(vec![Value::nil()]);
+            }
             let start = lua_str_start(s.len(), init);
             match pattern::find_from(s.as_bytes(), pat.as_bytes(), start) {
                 Ok(Some(m)) => {
@@ -3478,26 +3751,38 @@ impl Vm {
         let v_str_gmatch = self.make_cfn_val(|cx, args| {
             let s = str_arg(args, 0, "string.gmatch")?.to_owned();
             let pat = str_arg(args, 1, "string.gmatch")?.to_owned();
-            let init = match args.get(2) { None => 1, Some(&v) => int_arg(v, "string.gmatch")? };
-            let pos = Cell::new(if init > s.len() as i64 + 1 { usize::MAX }
-                                else { lua_str_start(s.len(), init) });
+            let init = match args.get(2) {
+                None => 1,
+                Some(&v) => int_arg(v, "string.gmatch")?,
+            };
+            let pos = Cell::new(if init > s.len() as i64 + 1 { usize::MAX } else { lua_str_start(s.len(), init) });
             let iter_val = cx.vm.make_cfn_val(move |cx, _args| {
                 let sb = s.as_bytes();
-                if pos.get() > sb.len() { return Ok(vec![Value::nil()]); }
+                if pos.get() > sb.len() {
+                    return Ok(vec![Value::nil()]);
+                }
                 match pattern::find_from(sb, pat.as_bytes(), pos.get()) {
                     Ok(Some(m)) => {
                         // Empty match: step by one byte past it so the next
                         // call makes forward progress instead of looping forever.
                         // An anchored pattern only ever matches once.
-                        pos.set(if pat.starts_with('^') { sb.len() + 1 }
-                                else if m.end > m.start { m.end } else { m.end + 1 });
+                        pos.set(if pat.starts_with('^') {
+                            sb.len() + 1
+                        } else if m.end > m.start {
+                            m.end
+                        } else {
+                            m.end + 1
+                        });
                         if m.captures.is_empty() {
                             Ok(vec![cx.vm.alloc_str(&String::from_utf8_lossy(&sb[m.start..m.end]))])
                         } else {
                             Ok(pattern_captures(cx.vm, sb, &m))
                         }
                     }
-                    Ok(None) => { pos.set(sb.len() + 1); Ok(vec![Value::nil()]) }
+                    Ok(None) => {
+                        pos.set(sb.len() + 1);
+                        Ok(vec![Value::nil()])
+                    }
                     Err(e) => Err(VmError::RuntimeError(format!("string.gmatch: {e}"))),
                 }
             });
@@ -3507,7 +3792,10 @@ impl Vm {
             let s = str_arg(args, 0, "string.gsub")?;
             let pat = str_arg(args, 1, "string.gsub")?;
             let repl = args.get(2).copied().unwrap_or(Value::nil());
-            let max_n = match args.get(3) { None => i64::MAX, Some(&v) => int_arg(v, "string.gsub")? };
+            let max_n = match args.get(3) {
+                None => i64::MAX,
+                Some(&v) => int_arg(v, "string.gsub")?,
+            };
             let sb = s.as_bytes();
             let mut out: Vec<u8> = Vec::new();
             let mut pos = 0usize;
@@ -3528,12 +3816,18 @@ impl Vm {
                 pos = if m.end > m.start {
                     m.end
                 } else {
-                    if m.end < sb.len() { out.push(sb[m.end]); }
+                    if m.end < sb.len() {
+                        out.push(sb[m.end]);
+                    }
                     m.end + 1
                 };
-                if pat.starts_with('^') { break; }
+                if pat.starts_with('^') {
+                    break;
+                }
             }
-            if pos <= sb.len() { out.extend_from_slice(&sb[pos..]); }
+            if pos <= sb.len() {
+                out.extend_from_slice(&sb[pos..]);
+            }
             Ok(vec![cx.vm.alloc_str(&String::from_utf8_lossy(&out)), Value::int(count)])
         });
         let v_str_format = self.make_cfn_val(|cx, args| {
@@ -3565,7 +3859,10 @@ impl Vm {
         });
         let v_str_unpack = self.make_cfn_val(|cx, args| {
             let fmt = str_arg(args, 0, "string.unpack")?;
-            let init = match args.get(2) { None => 1, Some(&v) => int_arg(v, "string.unpack")? };
+            let init = match args.get(2) {
+                None => 1,
+                Some(&v) => int_arg(v, "string.unpack")?,
+            };
             let gc = &cx.vm.gc;
             let data: &[u8] = match args.get(1) {
                 Some(&v) if v.is_string() => gc.str(v).as_bytes(),
@@ -3573,11 +3870,14 @@ impl Vm {
                 _ => return Err(VmError::RuntimeError("string.unpack: bytes or string expected".into())),
             };
             let (vals, end_pos) = pack::unpack(fmt, data, init).map_err(VmError::RuntimeError)?;
-            let mut out: Vec<Value> = vals.into_iter().map(|pv| match pv {
-                pack::PackValue::Int(n) => cx.vm.make_int(n),
-                pack::PackValue::Float(f) => Value::float(f),
-                pack::PackValue::Str(s) => cx.vm.alloc_bytes(s),
-            }).collect();
+            let mut out: Vec<Value> = vals
+                .into_iter()
+                .map(|pv| match pv {
+                    pack::PackValue::Int(n) => cx.vm.make_int(n),
+                    pack::PackValue::Float(f) => Value::float(f),
+                    pack::PackValue::Str(s) => cx.vm.alloc_bytes(s),
+                })
+                .collect();
             out.push(cx.vm.make_int((end_pos + 1) as i64));
             Ok(out)
         });
@@ -3589,22 +3889,38 @@ impl Vm {
 
         {
             let st = Value::table(str_table_ptr);
-            let k = self.intern("len");     self.gc.raw_set(st, k, v_str_len);
-            let k = self.intern("sub");     self.gc.raw_set(st, k, v_str_sub);
-            let k = self.intern("rep");     self.gc.raw_set(st, k, v_str_rep);
-            let k = self.intern("upper");   self.gc.raw_set(st, k, v_str_upper);
-            let k = self.intern("lower");   self.gc.raw_set(st, k, v_str_lower);
-            let k = self.intern("reverse"); self.gc.raw_set(st, k, v_str_reverse);
-            let k = self.intern("byte");    self.gc.raw_set(st, k, v_str_byte);
-            let k = self.intern("char");    self.gc.raw_set(st, k, v_str_char);
-            let k = self.intern("find");    self.gc.raw_set(st, k, v_str_find);
-            let k = self.intern("match");   self.gc.raw_set(st, k, v_str_match);
-            let k = self.intern("gmatch");  self.gc.raw_set(st, k, v_str_gmatch);
-            let k = self.intern("gsub");    self.gc.raw_set(st, k, v_str_gsub);
-            let k = self.intern("format");  self.gc.raw_set(st, k, v_str_format);
-            let k = self.intern("pack");    self.gc.raw_set(st, k, v_str_pack);
-            let k = self.intern("unpack");  self.gc.raw_set(st, k, v_str_unpack);
-            let k = self.intern("packsize"); self.gc.raw_set(st, k, v_str_packsize);
+            let k = self.intern("len");
+            self.gc.raw_set(st, k, v_str_len);
+            let k = self.intern("sub");
+            self.gc.raw_set(st, k, v_str_sub);
+            let k = self.intern("rep");
+            self.gc.raw_set(st, k, v_str_rep);
+            let k = self.intern("upper");
+            self.gc.raw_set(st, k, v_str_upper);
+            let k = self.intern("lower");
+            self.gc.raw_set(st, k, v_str_lower);
+            let k = self.intern("reverse");
+            self.gc.raw_set(st, k, v_str_reverse);
+            let k = self.intern("byte");
+            self.gc.raw_set(st, k, v_str_byte);
+            let k = self.intern("char");
+            self.gc.raw_set(st, k, v_str_char);
+            let k = self.intern("find");
+            self.gc.raw_set(st, k, v_str_find);
+            let k = self.intern("match");
+            self.gc.raw_set(st, k, v_str_match);
+            let k = self.intern("gmatch");
+            self.gc.raw_set(st, k, v_str_gmatch);
+            let k = self.intern("gsub");
+            self.gc.raw_set(st, k, v_str_gsub);
+            let k = self.intern("format");
+            self.gc.raw_set(st, k, v_str_format);
+            let k = self.intern("pack");
+            self.gc.raw_set(st, k, v_str_pack);
+            let k = self.intern("unpack");
+            self.gc.raw_set(st, k, v_str_unpack);
+            let k = self.intern("packsize");
+            self.gc.raw_set(st, k, v_str_packsize);
         }
         let str_table_val = Value::table(str_table_ptr);
         self.string_lib = str_table_val;
@@ -3615,63 +3931,69 @@ impl Vm {
         self.gc.register(bytes_table_ptr);
 
         let v_bytes_new = self.make_cfn_val(|cx, args| {
-            let n = match args.first() { None => 0, Some(&v) => int_arg(v, "bytes.new")? };
+            let n = match args.first() {
+                None => 0,
+                Some(&v) => int_arg(v, "bytes.new")?,
+            };
             if !(0..=MAX_ALLOC_LEN as i64).contains(&n) {
                 return Err(VmError::RuntimeError("bytes.new: invalid size".into()));
             }
             Ok(vec![cx.vm.alloc_bytes_zeroed(n as usize)])
         });
-        let v_bytes_from = self.make_cfn_val(|cx, args| {
-            match args.first() {
-                Some(&v) if v.is_string() => {
-                    let data: Box<[u8]> = cx.vm.gc.str(v).as_bytes().into();
-                    Ok(vec![cx.vm.alloc_bytes(data)])
-                }
-                Some(&v) if v.is_bytes() => {
-                    let data = cx.vm.gc.bytes(v).data.clone();
-                    Ok(vec![cx.vm.alloc_bytes(data)])
-                }
-                _ => Err(VmError::RuntimeError("bytes.from: string expected".into())),
+        let v_bytes_from = self.make_cfn_val(|cx, args| match args.first() {
+            Some(&v) if v.is_string() => {
+                let data: Box<[u8]> = cx.vm.gc.str(v).as_bytes().into();
+                Ok(vec![cx.vm.alloc_bytes(data)])
             }
+            Some(&v) if v.is_bytes() => {
+                let data = cx.vm.gc.bytes(v).data.clone();
+                Ok(vec![cx.vm.alloc_bytes(data)])
+            }
+            _ => Err(VmError::RuntimeError("bytes.from: string expected".into())),
         });
-        let v_bytes_tostring = self.make_cfn_val(|cx, args| {
-            match args.first() {
-                Some(&v) if v.is_bytes() => {
-                    let b = cx.vm.gc.bytes(v);
-                    match std::str::from_utf8(&b.data[..b.len]).map(str::to_owned) {
-                        Ok(s) => Ok(vec![cx.vm.alloc_str(&s)]),
-                        Err(_) => Err(VmError::RuntimeError("bytes.tostring: not valid UTF-8".into())),
-                    }
+        let v_bytes_tostring = self.make_cfn_val(|cx, args| match args.first() {
+            Some(&v) if v.is_bytes() => {
+                let b = cx.vm.gc.bytes(v);
+                match std::str::from_utf8(&b.data[..b.len]).map(str::to_owned) {
+                    Ok(s) => Ok(vec![cx.vm.alloc_str(&s)]),
+                    Err(_) => Err(VmError::RuntimeError("bytes.tostring: not valid UTF-8".into())),
                 }
-                _ => Err(VmError::RuntimeError("bytes.tostring: bytes expected".into())),
             }
+            _ => Err(VmError::RuntimeError("bytes.tostring: bytes expected".into())),
         });
         let v_bytes_concat = self.make_cfn_val(|cx, args| {
             let mut out = Vec::new();
             for &v in args {
-                if v.is_bytes() { out.extend_from_slice(&cx.vm.gc.bytes(v).data); }
-                else if v.is_string() { out.extend_from_slice(cx.vm.gc.str(v).as_bytes()); }
-                else { return Err(VmError::RuntimeError("bytes.concat: bytes or string expected".into())); }
+                if v.is_bytes() {
+                    out.extend_from_slice(&cx.vm.gc.bytes(v).data);
+                } else if v.is_string() {
+                    out.extend_from_slice(cx.vm.gc.str(v).as_bytes());
+                } else {
+                    return Err(VmError::RuntimeError("bytes.concat: bytes or string expected".into()));
+                }
             }
             Ok(vec![cx.vm.alloc_bytes(out)])
         });
-        let v_bytes_len = self.make_cfn_val(|cx, args| {
-            match args.first() {
-                Some(&v) if v.is_bytes() => {
-                    let n = cx.vm.gc.bytes(v).len;
-                    Ok(vec![Value::int(n as i64)])
-                }
-                _ => Err(VmError::RuntimeError("bytes.len: bytes expected".into())),
+        let v_bytes_len = self.make_cfn_val(|cx, args| match args.first() {
+            Some(&v) if v.is_bytes() => {
+                let n = cx.vm.gc.bytes(v).len;
+                Ok(vec![Value::int(n as i64)])
             }
+            _ => Err(VmError::RuntimeError("bytes.len: bytes expected".into())),
         });
 
         {
             let bt = Value::table(bytes_table_ptr);
-            let k = self.intern("new");      self.gc.raw_set(bt, k, v_bytes_new);
-            let k = self.intern("from");     self.gc.raw_set(bt, k, v_bytes_from);
-            let k = self.intern("tostring"); self.gc.raw_set(bt, k, v_bytes_tostring);
-            let k = self.intern("concat");   self.gc.raw_set(bt, k, v_bytes_concat);
-            let k = self.intern("len");      self.gc.raw_set(bt, k, v_bytes_len);
+            let k = self.intern("new");
+            self.gc.raw_set(bt, k, v_bytes_new);
+            let k = self.intern("from");
+            self.gc.raw_set(bt, k, v_bytes_from);
+            let k = self.intern("tostring");
+            self.gc.raw_set(bt, k, v_bytes_tostring);
+            let k = self.intern("concat");
+            self.gc.raw_set(bt, k, v_bytes_concat);
+            let k = self.intern("len");
+            self.gc.raw_set(bt, k, v_bytes_len);
         }
         self.bytes_lib = Value::table(bytes_table_ptr);
         let k_bytes = self.intern("bytes");
@@ -3682,19 +4004,25 @@ impl Vm {
 
         let v_math_floor = self.make_cfn_val(|cx, args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int_like() { return Ok(vec![v]); }
+            if v.is_int_like() {
+                return Ok(vec![v]);
+            }
             let f = num_arg(v, "math.floor")?;
             Ok(vec![float_to_int_or_float(cx.vm, f.floor())])
         });
         let v_math_ceil = self.make_cfn_val(|cx, args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int_like() { return Ok(vec![v]); }
+            if v.is_int_like() {
+                return Ok(vec![v]);
+            }
             let f = num_arg(v, "math.ceil")?;
             Ok(vec![float_to_int_or_float(cx.vm, f.ceil())])
         });
         let v_math_abs = self.make_cfn_val(|cx, args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int_like() { return Ok(vec![cx.vm.make_int(v.as_int().unwrap().wrapping_abs())]); }
+            if v.is_int_like() {
+                return Ok(vec![cx.vm.make_int(v.as_int().unwrap().wrapping_abs())]);
+            }
             let f = num_arg(v, "math.abs")?;
             Ok(vec![Value::float(f.abs())])
         });
@@ -3703,7 +4031,9 @@ impl Vm {
             Ok(vec![Value::float(f.sqrt())])
         });
         let v_math_max = self.make_cfn_val(|cx, args| {
-            if args.is_empty() { return Err(VmError::RuntimeError("math.max: at least one arg required".into())); }
+            if args.is_empty() {
+                return Err(VmError::RuntimeError("math.max: at least one arg required".into()));
+            }
             num_value_arg(cx.vm, args[0], "math.max")?;
             // The winner is the original argument, like Lua's lua_pushvalue —
             // a numeric string stays a string.
@@ -3711,33 +4041,31 @@ impl Vm {
             for &v in &args[1..] {
                 let bv = num_value_arg(cx.vm, best, "math.max")?;
                 let vv = num_value_arg(cx.vm, v, "math.max")?;
-                if num_cmp(bv, vv).is_some_and(|o| o.is_lt()) { best = v; }
+                if num_cmp(bv, vv).is_some_and(|o| o.is_lt()) {
+                    best = v;
+                }
             }
             Ok(vec![best])
         });
         let v_math_min = self.make_cfn_val(|cx, args| {
-            if args.is_empty() { return Err(VmError::RuntimeError("math.min: at least one arg required".into())); }
+            if args.is_empty() {
+                return Err(VmError::RuntimeError("math.min: at least one arg required".into()));
+            }
             num_value_arg(cx.vm, args[0], "math.min")?;
             let mut best = args[0];
             for &v in &args[1..] {
                 let bv = num_value_arg(cx.vm, best, "math.min")?;
                 let vv = num_value_arg(cx.vm, v, "math.min")?;
-                if num_cmp(bv, vv).is_some_and(|o| o.is_gt()) { best = v; }
+                if num_cmp(bv, vv).is_some_and(|o| o.is_gt()) {
+                    best = v;
+                }
             }
             Ok(vec![best])
         });
-        let v_math_sin  = self.make_cfn_val(|_cx, args| {
-            Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.sin")?.sin())])
-        });
-        let v_math_cos  = self.make_cfn_val(|_cx, args| {
-            Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.cos")?.cos())])
-        });
-        let v_math_tan  = self.make_cfn_val(|_cx, args| {
-            Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.tan")?.tan())])
-        });
-        let v_math_exp  = self.make_cfn_val(|_cx, args| {
-            Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.exp")?.exp())])
-        });
+        let v_math_sin = self.make_cfn_val(|_cx, args| Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.sin")?.sin())]));
+        let v_math_cos = self.make_cfn_val(|_cx, args| Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.cos")?.cos())]));
+        let v_math_tan = self.make_cfn_val(|_cx, args| Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.tan")?.tan())]));
+        let v_math_exp = self.make_cfn_val(|_cx, args| Ok(vec![Value::float(num_arg(args.first().copied().unwrap_or(Value::nil()), "math.exp")?.exp())]));
         let v_math_log = self.make_cfn_val(|_cx, args| {
             let x = num_arg(args.first().copied().unwrap_or(Value::nil()), "math.log")?;
             let result = match args.get(1) {
@@ -3748,28 +4076,37 @@ impl Vm {
         });
         let v_math_modf = self.make_cfn_val(|cx, args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int_like() { return Ok(vec![v, Value::float(0.0)]); }
+            if v.is_int_like() {
+                return Ok(vec![v, Value::float(0.0)]);
+            }
             let f = num_arg(v, "math.modf")?;
             // Lua returns the integral part as an integer when it fits.
             Ok(vec![float_to_int_or_float(cx.vm, f.trunc()), Value::float(f.fract())])
         });
         let v_math_type = self.make_cfn_val(|cx, args| {
             let v = args.first().copied().unwrap_or(Value::nil());
-            if v.is_int_like() { return Ok(vec![cx.vm.alloc_str("integer")]); }
-            if v.is_float() { return Ok(vec![cx.vm.alloc_str("float")]); }
+            if v.is_int_like() {
+                return Ok(vec![cx.vm.alloc_str("integer")]);
+            }
+            if v.is_float() {
+                return Ok(vec![cx.vm.alloc_str("float")]);
+            }
             Ok(vec![Value::nil()])
         });
         let v_math_tointeger = self.make_cfn_val(|cx, args| {
-            let v = args.first().copied().ok_or_else(||
-                VmError::RuntimeError("math.tointeger: value expected".into()))?;
+            let v = args.first().copied().ok_or_else(|| VmError::RuntimeError("math.tointeger: value expected".into()))?;
             // lua_tointegerx coerces numeric strings too.
             let v = if let Some(s) = crate::heap::arg_str(args, 0) {
                 match str_to_number(cx.vm, s) {
                     Some(nv) => nv,
                     None => return Ok(vec![Value::nil()]),
                 }
-            } else { v };
-            if v.is_int_like() { return Ok(vec![v]); }
+            } else {
+                v
+            };
+            if v.is_int_like() {
+                return Ok(vec![v]);
+            }
             if v.is_float() {
                 let f = v.as_float().unwrap();
                 // Bounds first: `f as i64` saturates, and i64::MAX as f64 is
@@ -3777,7 +4114,9 @@ impl Vm {
                 // accept 2^63 (and any larger float) as i64::MAX.
                 if f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
                     let i = f as i64;
-                    if i as f64 == f { return Ok(vec![cx.vm.make_int(i)]); }
+                    if i as f64 == f {
+                        return Ok(vec![cx.vm.make_int(i)]);
+                    }
                 }
             }
             Ok(vec![Value::nil()])
@@ -3793,14 +4132,20 @@ impl Vm {
                 1 => {
                     let m = int_arg(args[0], "math.random")?;
                     // m == 0 means "any bits", like Lua's project.
-                    if m == 0 { return Ok(vec![cx.vm.make_int(r as i64)]); }
-                    if m < 0 { return Err(VmError::RuntimeError("math.random: interval is empty".into())); }
+                    if m == 0 {
+                        return Ok(vec![cx.vm.make_int(r as i64)]);
+                    }
+                    if m < 0 {
+                        return Err(VmError::RuntimeError("math.random: interval is empty".into()));
+                    }
                     Ok(vec![cx.vm.make_int(1 + (r % m as u64) as i64)])
                 }
                 _ => {
                     let lo = int_arg(args[0], "math.random")?;
                     let hi = int_arg(args[1], "math.random")?;
-                    if lo > hi { return Err(VmError::RuntimeError("math.random: interval is empty".into())); }
+                    if lo > hi {
+                        return Err(VmError::RuntimeError("math.random: interval is empty".into()));
+                    }
                     // The full i64 span can't be a u64 range; Lua treats it
                     // as "any bits" rather than erroring.
                     if lo == i64::MIN && hi == i64::MAX {
@@ -3812,7 +4157,10 @@ impl Vm {
             }
         });
         let v_math_randomseed = self.make_cfn_val(|cx, args| {
-            let seed = match args.first() { None => 0, Some(&v) => int_arg(v, "math.randomseed")? };
+            let seed = match args.first() {
+                None => 0,
+                Some(&v) => int_arg(v, "math.randomseed")?,
+            };
             cx.vm.rng = seed as u64;
             Ok(vec![])
         });
@@ -3821,7 +4169,9 @@ impl Vm {
             let b = args.get(1).copied().unwrap_or(Value::nil());
             if a.is_int_like() && b.is_int_like() {
                 let (x, y) = (a.as_int().unwrap(), b.as_int().unwrap());
-                if y == 0 { return Err(VmError::RuntimeError("math.fmod: zero divisor".into())); }
+                if y == 0 {
+                    return Err(VmError::RuntimeError("math.fmod: zero divisor".into()));
+                }
                 return Ok(vec![cx.vm.make_int(x.wrapping_rem(y))]);
             }
             let x = num_arg(a, "math.fmod")?;
@@ -3836,28 +4186,52 @@ impl Vm {
 
         {
             let mt = Value::table(math_table_ptr);
-            let k = self.intern("pi");          self.gc.raw_set(mt, k, Value::float(std::f64::consts::PI));
-            let k = self.intern("huge");        self.gc.raw_set(mt, k, Value::float(f64::INFINITY));
-            let k = self.intern("maxinteger");  let v = self.make_int(i64::MAX); self.gc.raw_set(mt, k, v);
-            let k = self.intern("mininteger");  let v = self.make_int(i64::MIN); self.gc.raw_set(mt, k, v);
-            let k = self.intern("floor");       self.gc.raw_set(mt, k, v_math_floor);
-            let k = self.intern("ceil");        self.gc.raw_set(mt, k, v_math_ceil);
-            let k = self.intern("abs");         self.gc.raw_set(mt, k, v_math_abs);
-            let k = self.intern("sqrt");        self.gc.raw_set(mt, k, v_math_sqrt);
-            let k = self.intern("max");         self.gc.raw_set(mt, k, v_math_max);
-            let k = self.intern("min");         self.gc.raw_set(mt, k, v_math_min);
-            let k = self.intern("sin");         self.gc.raw_set(mt, k, v_math_sin);
-            let k = self.intern("cos");         self.gc.raw_set(mt, k, v_math_cos);
-            let k = self.intern("tan");         self.gc.raw_set(mt, k, v_math_tan);
-            let k = self.intern("exp");         self.gc.raw_set(mt, k, v_math_exp);
-            let k = self.intern("log");         self.gc.raw_set(mt, k, v_math_log);
-            let k = self.intern("modf");        self.gc.raw_set(mt, k, v_math_modf);
-            let k = self.intern("type");        self.gc.raw_set(mt, k, v_math_type);
-            let k = self.intern("tointeger");   self.gc.raw_set(mt, k, v_math_tointeger);
-            let k = self.intern("random");      self.gc.raw_set(mt, k, v_math_random);
-            let k = self.intern("randomseed");  self.gc.raw_set(mt, k, v_math_randomseed);
-            let k = self.intern("fmod");        self.gc.raw_set(mt, k, v_math_fmod);
-            let k = self.intern("ult");         self.gc.raw_set(mt, k, v_math_ult);
+            let k = self.intern("pi");
+            self.gc.raw_set(mt, k, Value::float(std::f64::consts::PI));
+            let k = self.intern("huge");
+            self.gc.raw_set(mt, k, Value::float(f64::INFINITY));
+            let k = self.intern("maxinteger");
+            let v = self.make_int(i64::MAX);
+            self.gc.raw_set(mt, k, v);
+            let k = self.intern("mininteger");
+            let v = self.make_int(i64::MIN);
+            self.gc.raw_set(mt, k, v);
+            let k = self.intern("floor");
+            self.gc.raw_set(mt, k, v_math_floor);
+            let k = self.intern("ceil");
+            self.gc.raw_set(mt, k, v_math_ceil);
+            let k = self.intern("abs");
+            self.gc.raw_set(mt, k, v_math_abs);
+            let k = self.intern("sqrt");
+            self.gc.raw_set(mt, k, v_math_sqrt);
+            let k = self.intern("max");
+            self.gc.raw_set(mt, k, v_math_max);
+            let k = self.intern("min");
+            self.gc.raw_set(mt, k, v_math_min);
+            let k = self.intern("sin");
+            self.gc.raw_set(mt, k, v_math_sin);
+            let k = self.intern("cos");
+            self.gc.raw_set(mt, k, v_math_cos);
+            let k = self.intern("tan");
+            self.gc.raw_set(mt, k, v_math_tan);
+            let k = self.intern("exp");
+            self.gc.raw_set(mt, k, v_math_exp);
+            let k = self.intern("log");
+            self.gc.raw_set(mt, k, v_math_log);
+            let k = self.intern("modf");
+            self.gc.raw_set(mt, k, v_math_modf);
+            let k = self.intern("type");
+            self.gc.raw_set(mt, k, v_math_type);
+            let k = self.intern("tointeger");
+            self.gc.raw_set(mt, k, v_math_tointeger);
+            let k = self.intern("random");
+            self.gc.raw_set(mt, k, v_math_random);
+            let k = self.intern("randomseed");
+            self.gc.raw_set(mt, k, v_math_randomseed);
+            let k = self.intern("fmod");
+            self.gc.raw_set(mt, k, v_math_fmod);
+            let k = self.intern("ult");
+            self.gc.raw_set(mt, k, v_math_ult);
         }
         let k_math = self.intern("math");
         self.globals.raw_set(&mut self.gc, k_math, Value::table(math_table_ptr));
@@ -3867,7 +4241,9 @@ impl Vm {
 
         let v_tbl_insert = self.make_cfn_val(|cx, args| {
             let t = args.first().copied().unwrap_or(Value::nil());
-            if !t.is_table() { return Err(VmError::RuntimeError("table.insert: table expected".into())); }
+            if !t.is_table() {
+                return Err(VmError::RuntimeError("table.insert: table expected".into()));
+            }
             let gc = &mut cx.vm.gc;
             match args.len() {
                 2 => {
@@ -3876,7 +4252,7 @@ impl Vm {
                 }
                 3 => {
                     let pos = int_arg(args[1], "table.insert")?;
-                    let n   = gc.table(t).length();
+                    let n = gc.table(t).length();
                     if pos < 1 || pos > n + 1 {
                         return Err(VmError::RuntimeError("table.insert: position out of bounds".into()));
                     }
@@ -3892,7 +4268,9 @@ impl Vm {
         });
         let v_tbl_remove = self.make_cfn_val(|cx, args| {
             let t = args.first().copied().unwrap_or(Value::nil());
-            if !t.is_table() { return Err(VmError::RuntimeError("table.remove: table expected".into())); }
+            if !t.is_table() {
+                return Err(VmError::RuntimeError("table.remove: table expected".into()));
+            }
             let gc = &mut cx.vm.gc;
             let n = gc.table(t).length();
             let pos = opt_int_arg(args, 1, "table.remove", n)?;
@@ -3901,7 +4279,9 @@ impl Vm {
             if pos != n && (pos < 1 || pos > n + 1) {
                 return Err(VmError::RuntimeError("table.remove: position out of bounds".into()));
             }
-            if pos < 1 || pos > n { return Ok(vec![Value::nil()]); }
+            if pos < 1 || pos > n {
+                return Ok(vec![Value::nil()]);
+            }
             let removed = gc.table(t).raw_get(Value::int(pos));
             for i in pos..n {
                 let next = gc.table(t).raw_get(Value::int(i + 1));
@@ -3912,7 +4292,9 @@ impl Vm {
         });
         let v_tbl_concat = self.make_cfn_val(|cx, args| {
             let t = args.first().copied().unwrap_or(Value::nil());
-            if !t.is_table() { return Err(VmError::RuntimeError("table.concat: table expected".into())); }
+            if !t.is_table() {
+                return Err(VmError::RuntimeError("table.concat: table expected".into()));
+            }
             let sep = match args.get(1) {
                 None => String::new(),
                 Some(&v) if v.is_nil() => String::new(),
@@ -3930,9 +4312,13 @@ impl Vm {
             for k in i..=j {
                 let k = cx.vm.make_int(k);
                 let v = cx.vm.gc.table(t).raw_get(k);
-                let s = if v.is_string() { cx.vm.gc.str(v).to_owned() }
-                        else if v.is_number() { coerce_to_concat_str(v) }
-                        else { return Err(VmError::RuntimeError("table.concat: invalid value (not string or number)".into())); };
+                let s = if v.is_string() {
+                    cx.vm.gc.str(v).to_owned()
+                } else if v.is_number() {
+                    coerce_to_concat_str(v)
+                } else {
+                    return Err(VmError::RuntimeError("table.concat: invalid value (not string or number)".into()));
+                };
                 parts.push(s);
             }
             Ok(vec![cx.vm.alloc_str(&parts.join(&sep))])
@@ -3941,7 +4327,9 @@ impl Vm {
         // the table must keep both its contents and its roots either way.
         let v_tbl_sort = self.make_cfn_val(|cx, args| {
             let t = args.first().copied().unwrap_or(Value::nil());
-            if !t.is_table() { return Err(VmError::RuntimeError("table.sort: table expected".into())); }
+            if !t.is_table() {
+                return Err(VmError::RuntimeError("table.sort: table expected".into()));
+            }
             let comp_val: Option<Value> = args.get(1).copied().filter(|v| !v.is_nil());
             let mut arr = cx.vm.gc.table(t).array.clone();
             // The comparator may remove elements from the table and collect
@@ -3949,22 +4337,30 @@ impl Vm {
             cx.root_all(&arr);
             let mut sort_err: Option<VmError> = None;
             arr.sort_by(|a, b| {
-                if sort_err.is_some() { return std::cmp::Ordering::Equal; }
+                if sort_err.is_some() {
+                    return std::cmp::Ordering::Equal;
+                }
                 let lt = match comp_val {
-                    Some(cf) => cx.vm.call_value_isolated(cf, &[*a, *b])
-                        .map(|res| res.into_iter().next().unwrap_or(Value::nil()).is_truthy()),
+                    Some(cf) => cx.vm.call_value_isolated(cf, &[*a, *b]).map(|res| res.into_iter().next().unwrap_or(Value::nil()).is_truthy()),
                     None => value_lt(&cx.vm.gc, *a, *b),
                 };
                 match lt {
-                    Ok(true)  => std::cmp::Ordering::Less,
+                    Ok(true) => std::cmp::Ordering::Less,
                     Ok(false) => std::cmp::Ordering::Greater,
-                    Err(e)    => { sort_err = Some(e); std::cmp::Ordering::Equal }
+                    Err(e) => {
+                        sort_err = Some(e);
+                        std::cmp::Ordering::Equal
+                    }
                 }
             });
-            if let Some(e) = sort_err { return Err(e); }
+            if let Some(e) = sort_err {
+                return Err(e);
+            }
             // The write-back is a store like any other: the table may have
             // been scanned black while the elements were out of it.
-            for &v in &arr { cx.vm.gc.barrier_val(v); }
+            for &v in &arr {
+                cx.vm.gc.barrier_val(v);
+            }
             cx.vm.gc.table_mut(t).array = arr;
             Ok(vec![])
         });
@@ -3982,33 +4378,44 @@ impl Vm {
         });
         let v_tbl_unpack = self.make_cfn_val(|cx, args| {
             let t = args.first().copied().unwrap_or(Value::nil());
-            if !t.is_table() { return Err(VmError::RuntimeError("table.unpack: table expected".into())); }
+            if !t.is_table() {
+                return Err(VmError::RuntimeError("table.unpack: table expected".into()));
+            }
             let n = cx.vm.gc.table(t).length();
             let i = opt_int_arg(args, 1, "table.unpack", 1)?;
             let j = opt_int_arg(args, 2, "table.unpack", n)?;
             if checked_range_len(i, j).is_none() {
                 return Err(VmError::RuntimeError("table.unpack: range too large".into()));
             }
-            Ok((i..=j).map(|k| { let k = cx.vm.make_int(k); cx.vm.gc.table(t).raw_get(k) }).collect())
+            Ok((i..=j)
+                .map(|k| {
+                    let k = cx.vm.make_int(k);
+                    cx.vm.gc.table(t).raw_get(k)
+                })
+                .collect())
         });
         let v_tbl_move = self.make_cfn_val(|cx, args| {
             let a1 = args.first().copied().unwrap_or(Value::nil());
-            if !a1.is_table() { return Err(VmError::RuntimeError("table.move: table expected".into())); }
-            let f  = int_arg(args.get(1).copied().unwrap_or(Value::nil()), "table.move")?;
-            let e  = int_arg(args.get(2).copied().unwrap_or(Value::nil()), "table.move")?;
-            let t  = int_arg(args.get(3).copied().unwrap_or(Value::nil()), "table.move")?;
+            if !a1.is_table() {
+                return Err(VmError::RuntimeError("table.move: table expected".into()));
+            }
+            let f = int_arg(args.get(1).copied().unwrap_or(Value::nil()), "table.move")?;
+            let e = int_arg(args.get(2).copied().unwrap_or(Value::nil()), "table.move")?;
+            let t = int_arg(args.get(3).copied().unwrap_or(Value::nil()), "table.move")?;
             let a2 = match args.get(4) {
                 None => a1,
                 Some(&v) if v.is_table() => v,
                 Some(_) => return Err(VmError::RuntimeError("table.move: table expected".into())),
             };
             if e >= f {
-                if checked_range_len(f, e).is_none()
-                    || t.checked_add(e - f).is_none() {
+                if checked_range_len(f, e).is_none() || t.checked_add(e - f).is_none() {
                     return Err(VmError::RuntimeError("table.move: too many elements to move".into()));
                 }
                 let vals: Vec<Value> = (f..=e)
-                    .map(|k| { let k = cx.vm.make_int(k); cx.vm.gc.table(a1).raw_get(k) })
+                    .map(|k| {
+                        let k = cx.vm.make_int(k);
+                        cx.vm.gc.table(a1).raw_get(k)
+                    })
                     .collect();
                 for (idx, v) in vals.into_iter().enumerate() {
                     let key = cx.vm.make_int(t + idx as i64);
@@ -4020,13 +4427,20 @@ impl Vm {
 
         {
             let tt = Value::table(tbl_table_ptr);
-            let k = self.intern("insert"); self.gc.raw_set(tt, k, v_tbl_insert);
-            let k = self.intern("remove"); self.gc.raw_set(tt, k, v_tbl_remove);
-            let k = self.intern("concat"); self.gc.raw_set(tt, k, v_tbl_concat);
-            let k = self.intern("sort");   self.gc.raw_set(tt, k, v_tbl_sort);
-            let k = self.intern("pack");   self.gc.raw_set(tt, k, v_tbl_pack);
-            let k = self.intern("unpack"); self.gc.raw_set(tt, k, v_tbl_unpack);
-            let k = self.intern("move");   self.gc.raw_set(tt, k, v_tbl_move);
+            let k = self.intern("insert");
+            self.gc.raw_set(tt, k, v_tbl_insert);
+            let k = self.intern("remove");
+            self.gc.raw_set(tt, k, v_tbl_remove);
+            let k = self.intern("concat");
+            self.gc.raw_set(tt, k, v_tbl_concat);
+            let k = self.intern("sort");
+            self.gc.raw_set(tt, k, v_tbl_sort);
+            let k = self.intern("pack");
+            self.gc.raw_set(tt, k, v_tbl_pack);
+            let k = self.intern("unpack");
+            self.gc.raw_set(tt, k, v_tbl_unpack);
+            let k = self.intern("move");
+            self.gc.raw_set(tt, k, v_tbl_move);
         }
         let k_table = self.intern("table");
         self.globals.raw_set(&mut self.gc, k_table, Value::table(tbl_table_ptr));
@@ -4037,9 +4451,13 @@ impl Vm {
         let v_io_write = self.make_cfn_val(|cx, args| {
             let mut out = String::new();
             for &v in args {
-                if v.is_string() { out.push_str(cx.vm.gc.str(v)); }
-                else if v.is_number() { out.push_str(&format!("{v}")); }
-                else { return Err(VmError::RuntimeError("io.write: string or number expected".into())); }
+                if v.is_string() {
+                    out.push_str(cx.vm.gc.str(v));
+                } else if v.is_number() {
+                    out.push_str(&format!("{v}"));
+                } else {
+                    return Err(VmError::RuntimeError("io.write: string or number expected".into()));
+                }
             }
             emit_line(cx.vm, out, false);
             Ok(vec![])
@@ -4049,7 +4467,9 @@ impl Vm {
             let mut out = Vec::new();
             for fv in fmts {
                 let v = read_stdin_format(cx.vm, &fv)?;
-                if v.is_nil() { return Ok(vec![Value::nil()]); }
+                if v.is_nil() {
+                    return Ok(vec![Value::nil()]);
+                }
                 out.push(v);
             }
             Ok(out)
@@ -4065,12 +4485,24 @@ impl Vm {
             let mode = mode.trim_end_matches('b');
             let mut opts = std::fs::OpenOptions::new();
             match mode {
-                "r"  => { opts.read(true); }
-                "w"  => { opts.write(true).create(true).truncate(true); }
-                "a"  => { opts.append(true).create(true); }
-                "r+" => { opts.read(true).write(true); }
-                "w+" => { opts.read(true).write(true).create(true).truncate(true); }
-                "a+" => { opts.read(true).append(true).create(true); }
+                "r" => {
+                    opts.read(true);
+                }
+                "w" => {
+                    opts.write(true).create(true).truncate(true);
+                }
+                "a" => {
+                    opts.append(true).create(true);
+                }
+                "r+" => {
+                    opts.read(true).write(true);
+                }
+                "w+" => {
+                    opts.read(true).write(true).create(true).truncate(true);
+                }
+                "a+" => {
+                    opts.read(true).append(true).create(true);
+                }
                 _ => return Err(VmError::RuntimeError(format!("io.open: invalid mode '{mode}'"))),
             }
             let file = match opts.open(&path) {
@@ -4083,13 +4515,14 @@ impl Vm {
             let f = file.clone();
             let v_read = vm.make_cfn_val(move |cx, args| {
                 let mut guard = f.borrow_mut();
-                let file = guard.as_mut()
-                    .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
+                let file = guard.as_mut().ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
                 let fmts: Vec<Value> = if args.len() <= 1 { vec![Value::nil()] } else { args[1..].to_vec() };
                 let mut out = Vec::new();
                 for fv in fmts {
                     let v = read_file_format(cx.vm, file, &fv, binary)?;
-                    if v.is_nil() { return Ok(vec![Value::nil()]); }
+                    if v.is_nil() {
+                        return Ok(vec![Value::nil()]);
+                    }
                     out.push(v);
                 }
                 Ok(out)
@@ -4102,18 +4535,21 @@ impl Vm {
             let f = file.clone();
             let v_write = vm.make_cfn_closure(&[handle], move |cx, args, up| {
                 let mut guard = f.borrow_mut();
-                let file = guard.as_mut()
-                    .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
+                let file = guard.as_mut().ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
                 use std::io::Write;
                 let mut out: Vec<u8> = Vec::new();
                 for &v in args.get(1..).unwrap_or(&[]) {
-                    if v.is_string() { out.extend_from_slice(cx.vm.gc.str(v).as_bytes()); }
-                    else if v.is_bytes() { out.extend_from_slice(&cx.vm.gc.bytes(v).data); }
-                    else if v.is_number() { out.extend_from_slice(format!("{v}").as_bytes()); }
-                    else { return Err(VmError::RuntimeError("file:write: string, bytes or number expected".into())); }
+                    if v.is_string() {
+                        out.extend_from_slice(cx.vm.gc.str(v).as_bytes());
+                    } else if v.is_bytes() {
+                        out.extend_from_slice(&cx.vm.gc.bytes(v).data);
+                    } else if v.is_number() {
+                        out.extend_from_slice(format!("{v}").as_bytes());
+                    } else {
+                        return Err(VmError::RuntimeError("file:write: string, bytes or number expected".into()));
+                    }
                 }
-                file.write_all(&out)
-                    .map_err(|e| VmError::RuntimeError(format!("file:write: {e}")))?;
+                file.write_all(&out).map_err(|e| VmError::RuntimeError(format!("file:write: {e}")))?;
                 Ok(vec![up[0]])
             });
 
@@ -4128,14 +4564,18 @@ impl Vm {
                 let f = f.clone();
                 let iter_val = cx.vm.make_cfn_val(move |cx, _args| {
                     let mut guard = f.borrow_mut();
-                    let file = guard.as_mut()
-                        .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
+                    let file = guard.as_mut().ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
                     match read_line_from_file(file)? {
                         // Lua closes the file when its lines iterator
                         // reaches EOF.
-                        None => { guard.take(); Ok(vec![Value::nil()]) }
+                        None => {
+                            guard.take();
+                            Ok(vec![Value::nil()])
+                        }
                         Some(mut l) => {
-                            while l.last().is_some_and(|&c| c == b'\n' || c == b'\r') { l.pop(); }
+                            while l.last().is_some_and(|&c| c == b'\n' || c == b'\r') {
+                                l.pop();
+                            }
                             Ok(vec![cx.vm.alloc_str(&String::from_utf8_lossy(&l))])
                         }
                     }
@@ -4143,10 +4583,14 @@ impl Vm {
                 Ok(vec![iter_val])
             });
 
-            let k = vm.intern("read");  vm.gc.raw_set(handle, k, v_read);
-            let k = vm.intern("write"); vm.gc.raw_set(handle, k, v_write);
-            let k = vm.intern("close"); vm.gc.raw_set(handle, k, v_close);
-            let k = vm.intern("lines"); vm.gc.raw_set(handle, k, v_lines);
+            let k = vm.intern("read");
+            vm.gc.raw_set(handle, k, v_read);
+            let k = vm.intern("write");
+            vm.gc.raw_set(handle, k, v_write);
+            let k = vm.intern("close");
+            vm.gc.raw_set(handle, k, v_close);
+            let k = vm.intern("lines");
+            vm.gc.raw_set(handle, k, v_lines);
             Ok(vec![handle])
         });
         let v_io_lines = self.make_cfn_val(|cx, args| {
@@ -4158,12 +4602,16 @@ impl Vm {
             let file = std::rc::Rc::new(std::cell::RefCell::new(Some(file)));
             let iter_val = cx.vm.make_cfn_val(move |cx, _args| {
                 let mut guard = file.borrow_mut();
-                let f = guard.as_mut()
-                    .ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
+                let f = guard.as_mut().ok_or_else(|| VmError::RuntimeError("attempt to use a closed file".into()))?;
                 match read_line_from_file(f)? {
-                    None => { guard.take(); Ok(vec![Value::nil()]) }
+                    None => {
+                        guard.take();
+                        Ok(vec![Value::nil()])
+                    }
                     Some(mut l) => {
-                        while l.last().is_some_and(|&c| c == b'\n' || c == b'\r') { l.pop(); }
+                        while l.last().is_some_and(|&c| c == b'\n' || c == b'\r') {
+                            l.pop();
+                        }
                         Ok(vec![cx.vm.alloc_str(&String::from_utf8_lossy(&l))])
                     }
                 }
@@ -4172,18 +4620,25 @@ impl Vm {
         });
         let v_io_close = self.make_cfn_val(|cx, args| {
             let h = args.first().copied().unwrap_or(Value::nil());
-            if !h.is_table() { return Err(VmError::RuntimeError("io.close: file expected".into())); }
+            if !h.is_table() {
+                return Err(VmError::RuntimeError("io.close: file expected".into()));
+            }
             let key = cx.vm.alloc_str("close");
             let close = cx.vm.gc.table(h).raw_get(key);
             cx.vm.call_value_isolated(close, &[h])
         });
         {
             let iot = Value::table(io_table_ptr);
-            let k = self.intern("write"); self.gc.raw_set(iot, k, v_io_write);
-            let k = self.intern("read");  self.gc.raw_set(iot, k, v_io_read);
-            let k = self.intern("open");  self.gc.raw_set(iot, k, v_io_open);
-            let k = self.intern("lines"); self.gc.raw_set(iot, k, v_io_lines);
-            let k = self.intern("close"); self.gc.raw_set(iot, k, v_io_close);
+            let k = self.intern("write");
+            self.gc.raw_set(iot, k, v_io_write);
+            let k = self.intern("read");
+            self.gc.raw_set(iot, k, v_io_read);
+            let k = self.intern("open");
+            self.gc.raw_set(iot, k, v_io_open);
+            let k = self.intern("lines");
+            self.gc.raw_set(iot, k, v_io_lines);
+            let k = self.intern("close");
+            self.gc.raw_set(iot, k, v_io_close);
         }
         let k_io = self.intern("io");
         self.globals.raw_set(&mut self.gc, k_io, Value::table(io_table_ptr));
@@ -4198,7 +4653,10 @@ impl Vm {
                     return Err(VmError::RuntimeError("os.time: table expected".into()));
                 }
                 let vm = &mut *cx.vm;
-                let mut get = |name: &str| { let k = vm.intern(name); vm.gc.table(t).raw_get(k) };
+                let mut get = |name: &str| {
+                    let k = vm.intern(name);
+                    vm.gc.table(t).raw_get(k)
+                };
                 let mut field = |name: &str, who: &str| -> VmResult<i64> {
                     let v = get(name);
                     if v.is_nil() {
@@ -4206,21 +4664,18 @@ impl Vm {
                     }
                     int_arg(v, who)
                 };
-                let year  = field("year", "os.time")?;
+                let year = field("year", "os.time")?;
                 let month = field("month", "os.time")?;
-                let day   = field("day", "os.time")?;
-                let hour   = if get("hour").is_nil() { 12 } else { int_arg(get("hour"), "os.time")? };
-                let min    = if get("min").is_nil() { 0 } else { int_arg(get("min"), "os.time")? };
-                let sec    = if get("sec").is_nil() { 0 } else { int_arg(get("sec"), "os.time")? };
+                let day = field("day", "os.time")?;
+                let hour = if get("hour").is_nil() { 12 } else { int_arg(get("hour"), "os.time")? };
+                let min = if get("min").is_nil() { 0 } else { int_arg(get("min"), "os.time")? };
+                let sec = if get("sec").is_nil() { 0 } else { int_arg(get("sec"), "os.time")? };
                 // isdst is read but ignored: Umbra's clock is UTC, which has
                 // no DST, so mktime would not shift the result either.
                 let _isdst = get("isdst").is_truthy();
                 let days = days_from_civil(year, month, day);
-                let Some(secs) = days.checked_mul(86400)
-                    .and_then(|d| d.checked_add(hour * 3600 + min * 60 + sec))
-                else {
-                    return Err(VmError::RuntimeError(
-                        "os.time: time result cannot be represented".into()));
+                let Some(secs) = days.checked_mul(86400).and_then(|d| d.checked_add(hour * 3600 + min * 60 + sec)) else {
+                    return Err(VmError::RuntimeError("os.time: time result cannot be represented".into()));
                 };
                 // mktime writes the normalized fields back into the table.
                 let (ny, nm, nd, yday, wday) = civil_fields(secs);
@@ -4242,8 +4697,7 @@ impl Vm {
                 vm.gc.raw_set(t, k, Value::bool(false));
                 return Ok(vec![vm.make_int(secs)]);
             }
-            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64).unwrap_or(0);
+            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
             Ok(vec![cx.vm.make_int(secs)])
         });
         let v_os_clock = self.make_cfn_val(|_cx, _args| {
@@ -4267,12 +4721,12 @@ impl Vm {
                 Some(_) => return Err(VmError::RuntimeError("os.date: string expected".into())),
             };
             // '!' selects UTC; Umbra only has UTC, so it's a no-op marker.
-            if let Some(rest) = fmt.strip_prefix('!') { fmt = rest.to_owned(); }
+            if let Some(rest) = fmt.strip_prefix('!') {
+                fmt = rest.to_owned();
+            }
             let secs = match args.get(1) {
-                None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64).unwrap_or(0),
-                Some(&v) if v.is_nil() => std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+                None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+                Some(&v) if v.is_nil() => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
                 Some(&v) => int_arg(v, "os.date")?,
             };
             if fmt == "*t" {
@@ -4301,10 +4755,14 @@ impl Vm {
         });
         {
             let ot = Value::table(os_table_ptr);
-            let k = self.intern("time");   self.gc.raw_set(ot, k, v_os_time);
-            let k = self.intern("clock");  self.gc.raw_set(ot, k, v_os_clock);
-            let k = self.intern("getenv"); self.gc.raw_set(ot, k, v_os_getenv);
-            let k = self.intern("date");   self.gc.raw_set(ot, k, v_os_date);
+            let k = self.intern("time");
+            self.gc.raw_set(ot, k, v_os_time);
+            let k = self.intern("clock");
+            self.gc.raw_set(ot, k, v_os_clock);
+            let k = self.intern("getenv");
+            self.gc.raw_set(ot, k, v_os_getenv);
+            let k = self.intern("date");
+            self.gc.raw_set(ot, k, v_os_date);
         }
         let k_os = self.intern("os");
         self.globals.raw_set(&mut self.gc, k_os, Value::table(os_table_ptr));
@@ -4316,8 +4774,7 @@ impl Vm {
             let mut s = String::new();
             for &v in args {
                 let n = int_arg(v, "utf8.char")?;
-                let cp = u32::try_from(n).ok().and_then(char::from_u32)
-                    .ok_or_else(|| VmError::RuntimeError("utf8.char: value out of range".into()))?;
+                let cp = u32::try_from(n).ok().and_then(char::from_u32).ok_or_else(|| VmError::RuntimeError("utf8.char: value out of range".into()))?;
                 s.push(cp);
             }
             Ok(vec![cx.vm.alloc_str(&s)])
@@ -4337,7 +4794,9 @@ impl Vm {
             }
             // Counts characters that START in [i, j]; a mid-character j is
             // fine, but a mid-character i is an invalid position.
-            if posi > posj { return Ok(vec![Value::int(0)]); }
+            if posi > posj {
+                return Ok(vec![Value::int(0)]);
+            }
             let (start, end) = ((posi - 1) as usize, (posj - 1) as usize);
             if !s.is_char_boundary(start) {
                 return Ok(vec![Value::nil(), Value::int(start as i64 + 1)]);
@@ -4361,7 +4820,9 @@ impl Vm {
             if pose > s.len() as i64 {
                 return Err(VmError::RuntimeError("utf8.codepoint: final position out of bounds".into()));
             }
-            if posi > pose { return Ok(vec![]); }
+            if posi > pose {
+                return Ok(vec![]);
+            }
             let start = (posi - 1) as usize;
             // Characters that start in [posi, pose]; pose may sit mid-character.
             if !s.is_char_boundary(start) {
@@ -4369,7 +4830,9 @@ impl Vm {
             }
             let mut result = Vec::new();
             for (off, ch) in s[start..].char_indices() {
-                if start + off >= pose as usize { break; }
+                if start + off >= pose as usize {
+                    break;
+                }
                 result.push(cx.vm.make_int(ch as i64));
             }
             Ok(result)
@@ -4387,46 +4850,54 @@ impl Vm {
             let mut n = n;
             if n == 0 {
                 // Beginning of the byte sequence containing position i.
-                while posi > 0 && !s.is_char_boundary(posi) { posi -= 1; }
+                while posi > 0 && !s.is_char_boundary(posi) {
+                    posi -= 1;
+                }
             } else {
                 if posi < s.len() && !s.is_char_boundary(posi) {
-                    return Err(VmError::RuntimeError(
-                        "utf8.offset: initial position is a continuation byte".into()));
+                    return Err(VmError::RuntimeError("utf8.offset: initial position is a continuation byte".into()));
                 }
                 if n < 0 {
                     while n < 0 && posi > 0 {
                         posi -= 1;
-                        while posi > 0 && !s.is_char_boundary(posi) { posi -= 1; }
+                        while posi > 0 && !s.is_char_boundary(posi) {
+                            posi -= 1;
+                        }
                         n += 1;
                     }
                 } else {
                     n -= 1;
                     while n > 0 && posi < s.len() {
                         posi += 1;
-                        while posi < s.len() && !s.is_char_boundary(posi) { posi += 1; }
+                        while posi < s.len() && !s.is_char_boundary(posi) {
+                            posi += 1;
+                        }
                         n -= 1;
                     }
                 }
             }
-            if n == 0 { Ok(vec![cx.vm.make_int(posi as i64 + 1)]) }
-            else { Ok(vec![Value::nil()]) }
+            if n == 0 { Ok(vec![cx.vm.make_int(posi as i64 + 1)]) } else { Ok(vec![Value::nil()]) }
         });
         let v_utf8_codes = self.make_cfn_val(|cx, args| {
             let s = str_arg(args, 0, "utf8.codes")?.to_owned();
             let iter_val = cx.vm.make_cfn_val(move |cx, cargs| {
-                let prev = match cargs.get(1) { None => 0, Some(&v) => int_arg(v, "utf8.codes")? };
+                let prev = match cargs.get(1) {
+                    None => 0,
+                    Some(&v) => int_arg(v, "utf8.codes")?,
+                };
                 // The control value is the 1-based start of the previous
                 // character; skip its continuation bytes like iter_aux.
-                let next_byte = if prev <= 0 { 0usize } else {
+                let next_byte = if prev <= 0 {
+                    0usize
+                } else {
                     let mut p = prev as usize;
-                    while p < s.len() && !s.is_char_boundary(p) { p += 1; }
+                    while p < s.len() && !s.is_char_boundary(p) {
+                        p += 1;
+                    }
                     p
                 };
                 match s.get(next_byte..).and_then(|rest| rest.chars().next()) {
-                    Some(ch) => Ok(vec![
-                        cx.vm.make_int(next_byte as i64 + 1),
-                        cx.vm.make_int(ch as i64),
-                    ]),
+                    Some(ch) => Ok(vec![cx.vm.make_int(next_byte as i64 + 1), cx.vm.make_int(ch as i64)]),
                     None => Ok(vec![Value::nil()]),
                 }
             });
@@ -4434,11 +4905,16 @@ impl Vm {
         });
         {
             let ut = Value::table(utf8_table_ptr);
-            let k = self.intern("char");      self.gc.raw_set(ut, k, v_utf8_char);
-            let k = self.intern("len");       self.gc.raw_set(ut, k, v_utf8_len);
-            let k = self.intern("codepoint"); self.gc.raw_set(ut, k, v_utf8_codepoint);
-            let k = self.intern("codes");     self.gc.raw_set(ut, k, v_utf8_codes);
-            let k = self.intern("offset");    self.gc.raw_set(ut, k, v_utf8_offset);
+            let k = self.intern("char");
+            self.gc.raw_set(ut, k, v_utf8_char);
+            let k = self.intern("len");
+            self.gc.raw_set(ut, k, v_utf8_len);
+            let k = self.intern("codepoint");
+            self.gc.raw_set(ut, k, v_utf8_codepoint);
+            let k = self.intern("codes");
+            self.gc.raw_set(ut, k, v_utf8_codes);
+            let k = self.intern("offset");
+            self.gc.raw_set(ut, k, v_utf8_offset);
         }
         let k_utf8 = self.intern("utf8");
         self.globals.raw_set(&mut self.gc, k_utf8, Value::table(utf8_table_ptr));
@@ -4466,7 +4942,8 @@ impl Vm {
         });
         {
             let dt = Value::table(debug_table_ptr);
-            let k = self.intern("traceback"); self.gc.raw_set(dt, k, v_debug_traceback);
+            let k = self.intern("traceback");
+            self.gc.raw_set(dt, k, v_debug_traceback);
         }
         let k_debug = self.intern("debug");
         self.globals.raw_set(&mut self.gc, k_debug, Value::table(debug_table_ptr));
@@ -4494,11 +4971,7 @@ impl Vm {
     /// as the native lives, and every call gets them as its third argument.
     /// They are fixed at creation; mutable state goes in a table upvalue.
     pub fn make_cfn_closure(&mut self, upvals: &[Value], f: impl Fn(&mut Ctx<'_>, &[Value], &[Value]) -> VmResult<Vec<Value>> + 'static) -> Value {
-        let native = Box::new(NativeFn {
-            gc: crate::gc::GcHeader::new(crate::gc::GcKind::Native),
-            upvals: upvals.into(),
-            f: Box::new(f),
-        });
+        let native = Box::new(NativeFn { gc: crate::gc::GcHeader::new(crate::gc::GcKind::Native), upvals: upvals.into(), f: Box::new(f) });
         let ptr = Box::into_raw(native) as *mut u8;
         self.gc.register(ptr);
         Value::native(ptr)
@@ -4514,12 +4987,15 @@ impl Vm {
         // SAFETY: `f` is a native, rooted until cx drops after the call.
         let (body, upvals) = unsafe { crate::heap::native(f) };
         let result = body(&mut cx, args, upvals);
-        if result.is_ok() { cx.vm.drop_handled_traces(); }
+        if result.is_ok() {
+            cx.vm.drop_handled_traces();
+        }
         result
     }
 
-    pub fn intern_pub(&mut self, s: &str) -> Value { self.intern(s) }
-
+    pub fn intern_pub(&mut self, s: &str) -> Value {
+        self.intern(s)
+    }
 
     /// Host-only instruction budget (0 = unlimited); resets the count.
     pub fn set_step_limit(&mut self, limit: u64) {
@@ -4544,7 +5020,6 @@ impl Vm {
         self.globals.raw_get(k)
     }
 }
-
 
 /// A native function. It receives the calling VM through `cx` (allocate,
 /// call back into script, reach the host via Ctx::host) and its arguments,
@@ -4579,13 +5054,11 @@ fn lua_mod(x: i64, y: i64) -> i64 {
 // there is no script-side handler left to receive the object.
 fn thrown_to_runtime(e: VmError) -> VmError {
     match e {
-        VmError::Thrown(v) if v.is_string() =>
-            VmError::RuntimeError(crate::heap::with_str(v, str::to_owned)),
+        VmError::Thrown(v) if v.is_string() => VmError::RuntimeError(crate::heap::with_str(v, str::to_owned)),
         VmError::Thrown(v) => VmError::RuntimeError(format!("{v}")),
         other => other,
     }
 }
-
 
 // require's work for a module not yet loaded: fetch its source, compile it
 // and run it. Returns the module's value and its chunk.
@@ -4594,34 +5067,36 @@ fn load_module(cx: &mut Ctx<'_>, name: &str) -> VmResult<(Value, Value)> {
     // through it the host) while it runs.
     let (src, chunk) = match cx.vm.module_loader.clone() {
         Some(loader) => {
-            let m = loader(cx, name)
-                .map_err(|e| VmError::RuntimeError(format!("require: {e}")))?;
+            let m = loader(cx, name).map_err(|e| VmError::RuntimeError(format!("require: {e}")))?;
             (m.source, m.chunk_name)
         }
         None => {
             let path = format!("{}.umbra", name.replace('.', "/"));
-            let src = std::fs::read_to_string(&path)
-                .map_err(|e| VmError::RuntimeError(format!("require: cannot open '{path}': {e}")))?;
+            let src = std::fs::read_to_string(&path).map_err(|e| VmError::RuntimeError(format!("require: cannot open '{path}': {e}")))?;
             (src, path)
         }
     };
     let vm = &mut *cx.vm;
-    let chunk_fn = vm.load_proto(&src, Some(chunk.clone()))
-        .map_err(|e| VmError::RuntimeError(format!("require: {chunk}: {e}")))?;
+    let chunk_fn = vm.load_proto(&src, Some(chunk.clone())).map_err(|e| VmError::RuntimeError(format!("require: {chunk}: {e}")))?;
     let results = vm.call_value_isolated(chunk_fn, &[]).map_err(thrown_to_runtime)?;
     Ok((results.first().copied().unwrap_or(Value::bool(true)), chunk_fn))
 }
 
 fn pattern_captures(vm: &mut Vm, subj: &[u8], m: &pattern::Match) -> Vec<Value> {
-    m.captures.iter().map(|c| match c {
-        pattern::Capture::Position(p) => vm.make_int(*p as i64),
-        pattern::Capture::Str(a, b) => vm.alloc_str(&String::from_utf8_lossy(&subj[*a..*b])),
-    }).collect()
+    m.captures
+        .iter()
+        .map(|c| match c {
+            pattern::Capture::Position(p) => vm.make_int(*p as i64),
+            pattern::Capture::Str(a, b) => vm.alloc_str(&String::from_utf8_lossy(&subj[*a..*b])),
+        })
+        .collect()
 }
 
 fn apply_gsub_repl(vm: &mut Vm, repl: Value, subj: &[u8], m: &pattern::Match, whole: &[u8]) -> VmResult<Option<Vec<u8>>> {
     let cap_bytes = |i: usize| -> Vec<u8> {
-        if m.captures.is_empty() { return whole.to_vec(); }
+        if m.captures.is_empty() {
+            return whole.to_vec();
+        }
         match &m.captures[i] {
             pattern::Capture::Str(a, b) => subj[*a..*b].to_vec(),
             pattern::Capture::Position(p) => p.to_string().into_bytes(),
@@ -4637,9 +5112,11 @@ fn apply_gsub_repl(vm: &mut Vm, repl: Value, subj: &[u8], m: &pattern::Match, wh
             }
             if rb[i] == b'%' && i + 1 < rb.len() {
                 let c = rb[i + 1];
-                if c == b'%' { result.push(b'%'); }
-                else if c == b'0' { result.extend_from_slice(whole); }
-                else if c.is_ascii_digit() {
+                if c == b'%' {
+                    result.push(b'%');
+                } else if c == b'0' {
+                    result.extend_from_slice(whole);
+                } else if c.is_ascii_digit() {
                     let idx = (c - b'1') as usize;
                     if m.captures.is_empty() {
                         if idx != 0 {
@@ -4676,11 +5153,7 @@ fn apply_gsub_repl(vm: &mut Vm, repl: Value, subj: &[u8], m: &pattern::Match, wh
         return gsub_result_value(v);
     }
     if crate::heap::is_native(repl) || vm.gc.closure_proto(repl).is_some() {
-        let call_args: Vec<Value> = if m.captures.is_empty() {
-            vec![vm.alloc_str(&String::from_utf8_lossy(whole))]
-        } else {
-            pattern_captures(vm, subj, m)
-        };
+        let call_args: Vec<Value> = if m.captures.is_empty() { vec![vm.alloc_str(&String::from_utf8_lossy(whole))] } else { pattern_captures(vm, subj, m) };
         let result = vm.call_value_isolated(repl, &call_args)?;
         let v = result.into_iter().next().unwrap_or(Value::nil());
         return gsub_result_value(v);
@@ -4689,36 +5162,46 @@ fn apply_gsub_repl(vm: &mut Vm, repl: Value, subj: &[u8], m: &pattern::Match, wh
 }
 
 fn gsub_result_value(v: Value) -> VmResult<Option<Vec<u8>>> {
-    if !v.is_truthy() { return Ok(None); }
-    if v.is_string() { return Ok(Some(crate::heap::with_str(v, |s| s.as_bytes().to_vec()))); }
-    if v.is_number() { return Ok(Some(format!("{v}").into_bytes())); }
+    if !v.is_truthy() {
+        return Ok(None);
+    }
+    if v.is_string() {
+        return Ok(Some(crate::heap::with_str(v, |s| s.as_bytes().to_vec())));
+    }
+    if v.is_number() {
+        return Ok(Some(format!("{v}").into_bytes()));
+    }
     Err(VmError::RuntimeError("invalid replacement value (a table/function must return a string/number/false/none)".into()))
 }
 
 fn coerce_to_concat_str(v: Value) -> String {
-    if v.is_string() { crate::heap::with_str(v, str::to_owned) }
-    else { coerce_num_str(v) }
+    if v.is_string() { crate::heap::with_str(v, str::to_owned) } else { coerce_num_str(v) }
 }
 
 // Number half of coerce_to_concat_str; concat_two borrows string operands
 // instead of copying them, so only numbers need a scratch String.
 fn coerce_num_str(v: Value) -> String {
-    if v.is_int_like() { v.as_int().unwrap().to_string() }
-    else { crate::value::lua_float_str(v.as_float().unwrap()) }
+    if v.is_int_like() { v.as_int().unwrap().to_string() } else { crate::value::lua_float_str(v.as_float().unwrap()) }
 }
 
 // __tostring-aware stringification shared by print/tostring/string.format.
 // Tables without __tostring, functions, coroutines and bytes print their
 // type and identity (`table: 0x...`), as in Lua.
 fn tostring_value(vm: &mut Vm, v: Value) -> VmResult<String> {
-    if v.is_string() { return Ok(vm.gc.str(v).to_owned()); }
+    if v.is_string() {
+        return Ok(vm.gc.str(v).to_owned());
+    }
     if v.is_table() {
         let mm = vm.get_mm(v, "__tostring");
         if !mm.is_nil() {
             let sv = vm.call_value_isolated(mm, &[v])?.into_iter().next().unwrap_or(Value::nil());
             // luaL_tolstring: __tostring must return a string or a number.
-            if sv.is_string() { return Ok(vm.gc.str(sv).to_owned()); }
-            if sv.is_number() { return Ok(format!("{sv}")); }
+            if sv.is_string() {
+                return Ok(vm.gc.str(sv).to_owned());
+            }
+            if sv.is_number() {
+                return Ok(format!("{sv}"));
+            }
             return Err(VmError::RuntimeError("'__tostring' must return a string".into()));
         }
     }
@@ -4726,15 +5209,13 @@ fn tostring_value(vm: &mut Vm, v: Value) -> VmResult<String> {
 }
 
 fn float_to_int_or_float(vm: &mut Vm, f: f64) -> Value {
-    if f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
-        vm.make_int(f as i64)
-    } else {
-        Value::float(f)
-    }
+    if f >= -9223372036854775808.0 && f < 9223372036854775808.0 { vm.make_int(f as i64) } else { Value::float(f) }
 }
 
 fn int_val(v: Value) -> VmResult<i64> {
-    if let Some(n) = v.as_int() { return Ok(n); }
+    if let Some(n) = v.as_int() {
+        return Ok(n);
+    }
     if let Some(f) = v.as_float() {
         if f.fract() == 0.0 && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
             return Ok(f as i64);
@@ -4751,12 +5232,17 @@ fn int_val(v: Value) -> VmResult<i64> {
 // argument checkers) don't need the VM; str_to_number boxes the result.
 fn parse_number(s: &str) -> Option<Num> {
     let s = s.trim();
-    let (neg, body) = match s.strip_prefix('-') { Some(r) => (true, r), None => (false, s) };
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
+    };
     let body = body.strip_prefix('+').unwrap_or(body);
     if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         if !hex.is_empty() && hex.bytes().all(|b| (b as char).is_ascii_hexdigit()) {
             let mut n: u64 = 0;
-            for c in hex.bytes() { n = n.wrapping_mul(16).wrapping_add((c as char).to_digit(16).unwrap() as u64); }
+            for c in hex.bytes() {
+                n = n.wrapping_mul(16).wrapping_add((c as char).to_digit(16).unwrap() as u64);
+            }
             let n = n as i64;
             return Some(Num::Int(if neg { n.wrapping_neg() } else { n }));
         }
@@ -4767,12 +5253,15 @@ fn parse_number(s: &str) -> Option<Num> {
     }
     // l_str2d rejects strings whose first '.', 'x'/'X', or 'n'/'N' is an
     // 'n'/'N' — that's how 'inf'/'nan' are excluded from strtod's grammar.
-    if s.bytes().find(|b| matches!(b, b'.' | b'x' | b'X' | b'n' | b'N'))
-        .is_some_and(|b| b == b'n' || b == b'N') {
+    if s.bytes().find(|b| matches!(b, b'.' | b'x' | b'X' | b'n' | b'N')).is_some_and(|b| b == b'n' || b == b'N') {
         return None;
     }
-    if let Ok(n) = s.parse::<i64>() { return Some(Num::Int(n)); }
-    if let Ok(f) = s.parse::<f64>() { return Some(Num::Float(f)); }
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(Num::Int(n));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Some(Num::Float(f));
+    }
     None
 }
 
@@ -4794,7 +5283,9 @@ fn int_arg(v: Value, who: &str) -> VmResult<i64> {
             Some(Num::Float(f)) => Value::float(f),
             None => return Err(VmError::RuntimeError(format!("{who}: integer expected, got string"))),
         }
-    } else { v };
+    } else {
+        v
+    };
     int_val(v).map_err(|e| match e {
         VmError::RuntimeError(m) => VmError::RuntimeError(format!("{who}: {m}")),
         other => other,
@@ -4813,7 +5304,9 @@ fn opt_int_arg(args: &[Value], idx: usize, who: &'static str, default: i64) -> V
 // Float argument for stdlib calls, matching luaL_checknumber: numbers and
 // numeric strings convert (as a float even for integral strings).
 fn num_arg(v: Value, who: &str) -> VmResult<f64> {
-    if let Some(f) = v.to_float() { return Ok(f); }
+    if let Some(f) = v.to_float() {
+        return Ok(f);
+    }
     if v.is_string() {
         match crate::heap::with_str(v, parse_number) {
             Some(Num::Int(n)) => return Ok(n as f64),
@@ -4826,7 +5319,9 @@ fn num_arg(v: Value, who: &str) -> VmResult<f64> {
 // Same coercion as num_arg but keeps the Value (int stays int) — for
 // comparisons that must not go through f64, like math.max/min.
 fn num_value_arg(vm: &mut Vm, v: Value, who: &str) -> VmResult<Value> {
-    if v.is_number() { return Ok(v); }
+    if v.is_number() {
+        return Ok(v);
+    }
     if v.is_string() {
         match crate::heap::with_str(v, parse_number) {
             Some(Num::Int(n)) => return Ok(vm.make_int(n)),
@@ -4839,17 +5334,28 @@ fn num_value_arg(vm: &mut Vm, v: Value, who: &str) -> VmResult<Value> {
 
 // Lua shift semantics: negative counts shift the other way, |n| >= 64 gives 0.
 fn lua_shl(x: i64, n: i64) -> i64 {
-    if n <= -64 || n >= 64 { 0 }
-    else if n >= 0 { ((x as u64) << n) as i64 }
-    else { ((x as u64) >> -n) as i64 }
+    if n <= -64 || n >= 64 {
+        0
+    } else if n >= 0 {
+        ((x as u64) << n) as i64
+    } else {
+        ((x as u64) >> -n) as i64
+    }
 }
 
 #[derive(Clone, Copy)]
-enum Num { Int(i64), Float(f64) }
+enum Num {
+    Int(i64),
+    Float(f64),
+}
 
 fn to_number(v: Value, what: &str) -> VmResult<Num> {
-    if v.is_int_like() { return Ok(Num::Int(v.as_int().unwrap())); }
-    if v.is_float() { return Ok(Num::Float(v.as_float().unwrap())); }
+    if v.is_int_like() {
+        return Ok(Num::Int(v.as_int().unwrap()));
+    }
+    if v.is_float() {
+        return Ok(Num::Float(v.as_float().unwrap()));
+    }
     Err(VmError::RuntimeError(format!("'for' {what} must be a number, got {}", v.type_name())))
 }
 
@@ -4870,17 +5376,20 @@ fn num_add(vm: &mut Vm, a: Num, b: Num) -> Value {
 fn num_le(a: Num, b: Num) -> bool {
     use crate::value::cmp_int_float;
     match (a, b) {
-        (Num::Int(x), Num::Int(y))     => x <= y,
+        (Num::Int(x), Num::Int(y)) => x <= y,
         (Num::Float(x), Num::Float(y)) => x <= y,
         // Exact int/float compare: `x as f64` would round e.g. i64::MAX up to
         // 2^63 and wrongly include it in a `<= 2^63` range.
-        (Num::Int(x), Num::Float(y))   => cmp_int_float(x, y).is_some_and(|o| o.is_le()),
-        (Num::Float(x), Num::Int(y))   => cmp_int_float(y, x).is_some_and(|o| o.is_ge()),
+        (Num::Int(x), Num::Float(y)) => cmp_int_float(x, y).is_some_and(|o| o.is_le()),
+        (Num::Float(x), Num::Int(y)) => cmp_int_float(y, x).is_some_and(|o| o.is_ge()),
     }
 }
 
 fn num_is_positive(n: Num) -> bool {
-    match n { Num::Int(x) => x > 0, Num::Float(x) => x > 0.0 }
+    match n {
+        Num::Int(x) => x > 0,
+        Num::Float(x) => x > 0.0,
+    }
 }
 
 fn values_equal(gc: &Gc, a: Value, b: Value) -> bool {
@@ -4901,7 +5410,9 @@ fn num_cmp(a: Value, b: Value) -> Option<std::cmp::Ordering> {
 }
 
 fn value_lt(gc: &Gc, a: Value, b: Value) -> VmResult<bool> {
-    if let Some(ord) = num_cmp(a, b) { return Ok(ord.is_lt()); }
+    if let Some(ord) = num_cmp(a, b) {
+        return Ok(ord.is_lt());
+    }
     if a.is_string() && b.is_string() {
         return Ok(gc.str(a) < gc.str(b));
     }
@@ -4909,13 +5420,14 @@ fn value_lt(gc: &Gc, a: Value, b: Value) -> VmResult<bool> {
 }
 
 fn value_le(gc: &Gc, a: Value, b: Value) -> VmResult<bool> {
-    if let Some(ord) = num_cmp(a, b) { return Ok(ord.is_le()); }
+    if let Some(ord) = num_cmp(a, b) {
+        return Ok(ord.is_le());
+    }
     if a.is_string() && b.is_string() {
         return Ok(gc.str(a) <= gc.str(b));
     }
     Err(VmError::RuntimeError(format!("attempt to compare {} with {}", a.type_name(), b.type_name())))
 }
-
 
 fn capture_yield_site(co: &mut Coroutine) {
     if let Some(frame) = co.frames.last() {
@@ -4940,12 +5452,16 @@ fn read_line_from_file(file: &mut std::fs::File) -> VmResult<Option<Vec<u8>>> {
             Ok(0) => break,
             Ok(_) => {
                 bytes.push(byte[0]);
-                if byte[0] == b'\n' { break; }
+                if byte[0] == b'\n' {
+                    break;
+                }
             }
             Err(e) => return Err(VmError::RuntimeError(format!("file:read: {e}"))),
         }
     }
-    if bytes.is_empty() { return Ok(None); }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(bytes))
 }
 
@@ -4958,14 +5474,21 @@ fn str_to_number_prefix(vm: &mut Vm, s: &str) -> Option<(Value, usize)> {
     // Try every prefix length, longest first — cheap because numeric prefixes
     // are short; stops at the first parseable one.
     for end in (1..=t.len()).rev() {
-        if !t.is_char_boundary(end) { continue; }
+        if !t.is_char_boundary(end) {
+            continue;
+        }
         let cand = &t[..end];
-        let (neg, body) = match cand.strip_prefix('-') { Some(r) => (true, r), None => (false, cand) };
+        let (neg, body) = match cand.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, cand),
+        };
         let body = body.strip_prefix('+').unwrap_or(body);
         if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
             if !hex.is_empty() && hex.bytes().all(|b| (b as char).is_ascii_hexdigit()) {
                 let mut n: u64 = 0;
-                for c in hex.bytes() { n = n.wrapping_mul(16).wrapping_add((c as char).to_digit(16).unwrap() as u64); }
+                for c in hex.bytes() {
+                    n = n.wrapping_mul(16).wrapping_add((c as char).to_digit(16).unwrap() as u64);
+                }
                 let n = n as i64;
                 return Some((vm.make_int(if neg { n.wrapping_neg() } else { n }), ws + end));
             }
@@ -4998,7 +5521,9 @@ fn read_number_from_file(vm: &mut Vm, file: &mut std::fs::File) -> VmResult<Valu
                 buf.push(b);
                 let numeric = b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_');
                 let still_ws = buf.iter().all(|c| c.is_ascii_whitespace());
-                if !numeric && !still_ws { break; }
+                if !numeric && !still_ws {
+                    break;
+                }
             }
             Err(e) => return Err(VmError::RuntimeError(format!("file:read: {e}"))),
         }
@@ -5018,16 +5543,22 @@ fn read_number_from_file(vm: &mut Vm, file: &mut std::fs::File) -> VmResult<Valu
 // end; too-far-negative clamps to 0 (which callers then reject or treat as
 // an empty range).
 fn u_posrelat(pos: i64, len: usize) -> i64 {
-    if pos >= 0 { pos }
-    else if pos.wrapping_neg() as u64 > len as u64 { 0 }
-    else { len as i64 + pos + 1 }
+    if pos >= 0 {
+        pos
+    } else if pos.wrapping_neg() as u64 > len as u64 {
+        0
+    } else {
+        len as i64 + pos + 1
+    }
 }
 
 fn read_file_format(vm: &mut Vm, file: &mut std::fs::File, fv: &Value, binary: bool) -> VmResult<Value> {
     use std::io::{Read, Seek};
     if fv.is_number() {
         let n = int_arg(*fv, "file:read")?;
-        if n < 0 { return Err(VmError::RuntimeError("file:read: invalid length".into())); }
+        if n < 0 {
+            return Err(VmError::RuntimeError("file:read: invalid length".into()));
+        }
         if n == 0 {
             // Probe for EOF: empty string if more data, nil at EOF.
             let mut b = [0u8; 1];
@@ -5042,7 +5573,9 @@ fn read_file_format(vm: &mut Vm, file: &mut std::fs::File, fv: &Value, binary: b
         }
         let mut buf = vec![0u8; n as usize];
         let got = file.read(&mut buf).map_err(|e| VmError::RuntimeError(format!("file:read: {e}")))?;
-        if got == 0 { return Ok(Value::nil()); }
+        if got == 0 {
+            return Ok(Value::nil());
+        }
         buf.truncate(got);
         return Ok(if binary { vm.alloc_bytes(buf) } else { vm.alloc_str(&String::from_utf8_lossy(&buf)) });
     }
@@ -5056,16 +5589,16 @@ fn read_file_format(vm: &mut Vm, file: &mut std::fs::File, fv: &Value, binary: b
     match fmt.as_str() {
         "a" => {
             let mut buf = Vec::new();
-            file.read_to_end(&mut buf)
-                .map_err(|e| VmError::RuntimeError(format!("file:read: {e}")))?;
-            Ok(if binary { vm.alloc_bytes(buf) }
-               else { vm.alloc_str(&String::from_utf8_lossy(&buf)) })
+            file.read_to_end(&mut buf).map_err(|e| VmError::RuntimeError(format!("file:read: {e}")))?;
+            Ok(if binary { vm.alloc_bytes(buf) } else { vm.alloc_str(&String::from_utf8_lossy(&buf)) })
         }
         "n" => read_number_from_file(vm, file),
         "l" => match read_line_from_file(file)? {
             None => Ok(Value::nil()),
             Some(mut l) => {
-                while l.last().is_some_and(|&c| c == b'\n' || c == b'\r') { l.pop(); }
+                while l.last().is_some_and(|&c| c == b'\n' || c == b'\r') {
+                    l.pop();
+                }
                 Ok(if binary { vm.alloc_bytes(l) } else { vm.alloc_str(&String::from_utf8_lossy(&l)) })
             }
         },
@@ -5081,11 +5614,14 @@ fn read_stdin_format(vm: &mut Vm, fv: &Value) -> VmResult<Value> {
     use std::io::Read;
     if fv.is_number() {
         let n = int_arg(*fv, "io.read")?;
-        if n < 0 { return Err(VmError::RuntimeError("io.read: invalid length".into())); }
+        if n < 0 {
+            return Err(VmError::RuntimeError("io.read: invalid length".into()));
+        }
         let mut buf = vec![0u8; n as usize];
-        let got = std::io::stdin().read(&mut buf)
-            .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
-        if got == 0 && n > 0 { return Ok(Value::nil()); }
+        let got = std::io::stdin().read(&mut buf).map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+        if got == 0 && n > 0 {
+            return Ok(Value::nil());
+        }
         buf.truncate(got);
         return Ok(vm.alloc_str(&String::from_utf8_lossy(&buf)));
     }
@@ -5099,16 +5635,14 @@ fn read_stdin_format(vm: &mut Vm, fv: &Value) -> VmResult<Value> {
     match fmt.as_str() {
         "a" => {
             let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)
-                .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+            std::io::stdin().read_to_string(&mut buf).map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
             Ok(vm.alloc_str(&buf))
         }
         "n" => {
             // stdin isn't seekable, so the longest numeric prefix of the line
             // is taken and the rest of the line is consumed.
             let mut line = String::new();
-            std::io::stdin().read_line(&mut line)
-                .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+            std::io::stdin().read_line(&mut line).map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
             match str_to_number_prefix(vm, &line) {
                 Some((v, _)) => Ok(v),
                 None => Ok(Value::nil()),
@@ -5116,40 +5650,47 @@ fn read_stdin_format(vm: &mut Vm, fv: &Value) -> VmResult<Value> {
         }
         "l" | "L" => {
             let mut line = String::new();
-            let n = std::io::stdin().read_line(&mut line)
-                .map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
-            if n == 0 { return Ok(Value::nil()); }
-            if fmt == "l" { while line.ends_with('\n') || line.ends_with('\r') { line.pop(); } }
+            let n = std::io::stdin().read_line(&mut line).map_err(|e| VmError::RuntimeError(format!("io.read: {e}")))?;
+            if n == 0 {
+                return Ok(Value::nil());
+            }
+            if fmt == "l" {
+                while line.ends_with('\n') || line.ends_with('\r') {
+                    line.pop();
+                }
+            }
             Ok(vm.alloc_str(&line))
         }
         _ => Err(VmError::RuntimeError(format!("io.read: invalid format '{fmt}'"))),
     }
 }
 
-
 fn str_arg<'a>(args: &'a [Value], idx: usize, fn_name: &'static str) -> VmResult<&'a str> {
-    crate::heap::arg_str(args, idx)
-        .ok_or_else(|| VmError::RuntimeError(format!("{fn_name}: string expected")))
+    crate::heap::arg_str(args, idx).ok_or_else(|| VmError::RuntimeError(format!("{fn_name}: string expected")))
 }
-
 
 // i64::MIN..=i64::MAX overflows i64 arithmetic directly, so the length is
 // computed in i128; returns None if the (inclusive) range exceeds MAX_ALLOC_LEN.
 fn checked_range_len(lo: i64, hi: i64) -> Option<usize> {
-    if hi < lo { return Some(0); }
+    if hi < lo {
+        return Some(0);
+    }
     let len = (hi as i128) - (lo as i128) + 1;
     if len > MAX_ALLOC_LEN as i128 { None } else { Some(len as usize) }
 }
 
 fn lua_str_start(len: usize, i: i64) -> usize {
-    if i > 0 { ((i - 1) as usize).min(len) }
-    else if i < 0 { (len as i64 + i).max(0) as usize }
-    else { 0 }
+    if i > 0 {
+        ((i - 1) as usize).min(len)
+    } else if i < 0 {
+        (len as i64 + i).max(0) as usize
+    } else {
+        0
+    }
 }
 
 fn lua_str_end(len: usize, j: i64) -> usize {
-    if j >= 0 { (j as usize).min(len) }
-    else { (len as i64 + j + 1).max(0) as usize }
+    if j >= 0 { (j as usize).min(len) } else { (len as i64 + j + 1).max(0) as usize }
 }
 
 fn splitmix64(x: u64) -> u64 {
@@ -5160,11 +5701,15 @@ fn splitmix64(x: u64) -> u64 {
 }
 
 fn pad_str(s: String, width: usize, left_align: bool, zero_pad: bool) -> String {
-    if s.len() >= width { return s; }
+    if s.len() >= width {
+        return s;
+    }
     let n = width - s.len();
     if left_align {
         let mut r = s;
-        for _ in 0..n { r.push(' '); }
+        for _ in 0..n {
+            r.push(' ');
+        }
         r
     } else if zero_pad {
         // Put zeros after any leading sign character.
@@ -5177,8 +5722,12 @@ fn pad_str(s: String, width: usize, left_align: bool, zero_pad: bool) -> String 
 
 // C-style %e: Rust's {:e} prints "1.23e4"; C wants "1.23e+04".
 fn fmt_e(f: f64, prec: usize, upper: bool) -> String {
-    if f.is_nan() { return if upper { "NAN".into() } else { "nan".into() }; }
-    if f.is_infinite() { return if upper { "INF".into() } else { "inf".into() }; }
+    if f.is_nan() {
+        return if upper { "NAN".into() } else { "nan".into() };
+    }
+    if f.is_infinite() {
+        return if upper { "INF".into() } else { "inf".into() };
+    }
     let t = format!("{:.*e}", prec, f);
     let epos = t.rfind('e').unwrap();
     let ex: i32 = t[epos + 1..].parse().unwrap();
@@ -5189,8 +5738,12 @@ fn fmt_e(f: f64, prec: usize, upper: bool) -> String {
 // C-style %g: shortest of %e/%f at the given significant-digit count, with
 // trailing zeros stripped.
 fn fmt_g(f: f64, prec: usize, upper: bool, alt: bool) -> String {
-    if f.is_nan() { return if upper { "NAN".into() } else { "nan".into() }; }
-    if f.is_infinite() { return if upper { "INF".into() } else { "inf".into() }; }
+    if f.is_nan() {
+        return if upper { "NAN".into() } else { "nan".into() };
+    }
+    if f.is_infinite() {
+        return if upper { "INF".into() } else { "inf".into() };
+    }
     let p = if prec == 0 { 1 } else { prec };
     let e = format!("{:.*e}", p - 1, f);
     let exp: i32 = e[e.rfind('e').unwrap() + 1..].parse().unwrap();
@@ -5201,16 +5754,24 @@ fn fmt_g(f: f64, prec: usize, upper: bool, alt: bool) -> String {
         let mut m: String = t[..epos].into();
         // '#' keeps trailing zeros (and the point) instead of stripping.
         if !alt && m.contains('.') {
-            while m.ends_with('0') { m.pop(); }
-            if m.ends_with('.') { m.pop(); }
+            while m.ends_with('0') {
+                m.pop();
+            }
+            if m.ends_with('.') {
+                m.pop();
+            }
         }
         format!("{}e{}{:02}", m, if ex < 0 { "-" } else { "+" }, ex.abs())
     } else {
         let decimals = (p as i32 - 1 - exp).max(0) as usize;
         let mut t = format!("{:.*}", decimals, f);
         if !alt && t.contains('.') {
-            while t.ends_with('0') { t.pop(); }
-            if t.ends_with('.') { t.pop(); }
+            while t.ends_with('0') {
+                t.pop();
+            }
+            if t.ends_with('.') {
+                t.pop();
+            }
         }
         t
     };
@@ -5219,9 +5780,15 @@ fn fmt_g(f: f64, prec: usize, upper: bool, alt: bool) -> String {
 
 // C-style %a hex float on |f| (caller handles the sign).
 fn fmt_a(f: f64, prec: Option<usize>, upper: bool) -> String {
-    if f.is_nan() { return if upper { "NAN".into() } else { "nan".into() }; }
-    if f.is_infinite() { return if upper { "INF".into() } else { "inf".into() }; }
-    if f == 0.0 { return "0x0p+0".into(); }
+    if f.is_nan() {
+        return if upper { "NAN".into() } else { "nan".into() };
+    }
+    if f.is_infinite() {
+        return if upper { "INF".into() } else { "inf".into() };
+    }
+    if f == 0.0 {
+        return "0x0p+0".into();
+    }
     let bits = f.abs().to_bits();
     let raw_exp = ((bits >> 52) & 0x7ff) as i64;
     let mut frac = bits & ((1u64 << 52) - 1);
@@ -5232,22 +5799,35 @@ fn fmt_a(f: f64, prec: Option<usize>, upper: bool) -> String {
             // Minimal form: emit all 13 nibbles, then drop trailing zeros.
             let mut ds = Vec::new();
             let mut m = frac;
-            for _ in 0..13 { ds.push((m >> 48) & 0xf); m <<= 4; }
-            while ds.last() == Some(&0) { ds.pop(); }
-            for d in ds { digits.push(char::from_digit(d as u32, 16).unwrap()); }
+            for _ in 0..13 {
+                ds.push((m >> 48) & 0xf);
+                m <<= 4;
+            }
+            while ds.last() == Some(&0) {
+                ds.pop();
+            }
+            for d in ds {
+                digits.push(char::from_digit(d as u32, 16).unwrap());
+            }
         }
         Some(p) => {
             if p == 0 {
                 // glibc rounds the whole significand (leading digit included)
                 // without renormalizing: %.0a of 1.5 is 0x2p+0, not 0x1p+1.
-                if frac >= 1u64 << 51 { lead += 1; }
+                if frac >= 1u64 << 51 {
+                    lead += 1;
+                }
             } else if p < 13 {
                 // Round the 52-bit mantissa to p hex digits (half up).
                 let drop = 52 - p as u32 * 4;
                 frac += 1u64 << (drop - 1);
                 if frac >= 1u64 << 52 {
                     frac = 0;
-                    if lead == 0 { lead = 1; } else { e2 += 1; }
+                    if lead == 0 {
+                        lead = 1;
+                    } else {
+                        e2 += 1;
+                    }
                 }
                 frac >>= drop;
                 for k in (0..p).rev() {
@@ -5255,13 +5835,17 @@ fn fmt_a(f: f64, prec: Option<usize>, upper: bool) -> String {
                 }
             } else {
                 let mut m = frac;
-                for _ in 0..13 { digits.push(char::from_digit(((m >> 48) & 0xf) as u32, 16).unwrap()); m <<= 4; }
-                for _ in 13..p { digits.push('0'); }
+                for _ in 0..13 {
+                    digits.push(char::from_digit(((m >> 48) & 0xf) as u32, 16).unwrap());
+                    m <<= 4;
+                }
+                for _ in 13..p {
+                    digits.push('0');
+                }
             }
         }
     }
-    let s = if digits.is_empty() { format!("0x{lead}p{e2:+}") }
-            else { format!("0x{lead}.{digits}p{e2:+}") };
+    let s = if digits.is_empty() { format!("0x{lead}p{e2:+}") } else { format!("0x{lead}.{digits}p{e2:+}") };
     if upper { s.to_uppercase() } else { s }
 }
 
@@ -5282,12 +5866,15 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
         if pos >= bytes.len() {
             return Err(VmError::RuntimeError("invalid option '%' to 'format'".into()));
         }
-        if bytes[pos] == b'%' { out.push('%'); pos += 1; continue; }
+        if bytes[pos] == b'%' {
+            out.push('%');
+            pos += 1;
+            continue;
+        }
 
         // Lua checks the argument exists before parsing the specifier.
         arg_idx += 1;
-        let v = args.get(arg_idx - 1).copied().ok_or_else(|| VmError::RuntimeError(
-            format!("bad argument #{arg_idx} to 'format' (value expected)")))?;
+        let v = args.get(arg_idx - 1).copied().ok_or_else(|| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' (value expected)")))?;
 
         let mut left = false;
         let mut plus = false;
@@ -5296,11 +5883,26 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
         let mut alt = false;
         loop {
             match bytes.get(pos) {
-                Some(b'-') => { left = true;  pos += 1; }
-                Some(b'+') => { plus = true;  pos += 1; }
-                Some(b'0') if !left => { zero = true; pos += 1; }
-                Some(b' ') => { space = true; pos += 1; }
-                Some(b'#') => { alt = true; pos += 1; }
+                Some(b'-') => {
+                    left = true;
+                    pos += 1;
+                }
+                Some(b'+') => {
+                    plus = true;
+                    pos += 1;
+                }
+                Some(b'0') if !left => {
+                    zero = true;
+                    pos += 1;
+                }
+                Some(b' ') => {
+                    space = true;
+                    pos += 1;
+                }
+                Some(b'#') => {
+                    alt = true;
+                    pos += 1;
+                }
                 _ => break,
             }
         }
@@ -5333,16 +5935,21 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
         if pos >= bytes.len() {
             return Err(VmError::RuntimeError("invalid option '%' to 'format'".into()));
         }
-        let spec = bytes[pos] as char; pos += 1;
+        let spec = bytes[pos] as char;
+        pos += 1;
 
         let num_err = |m: &str| VmError::RuntimeError(format!("bad argument #{arg_idx} to 'format' ({m})"));
         let conv_err = || VmError::RuntimeError("invalid conversion specification to 'format'".into());
         // checkformat: each conversion allows a subset of the flags.
         let check_flags = |allowed: &str, allow_prec: bool| -> VmResult<()> {
             for (on, f) in [(left, '-'), (plus, '+'), (zero, '0'), (space, ' '), (alt, '#')] {
-                if on && !allowed.contains(f) { return Err(conv_err()); }
+                if on && !allowed.contains(f) {
+                    return Err(conv_err());
+                }
             }
-            if prec.is_some() && !allow_prec { return Err(conv_err()); }
+            if prec.is_some() && !allow_prec {
+                return Err(conv_err());
+            }
             Ok(())
         };
         let fmt_int = |v: Value| -> VmResult<i64> {
@@ -5351,8 +5958,12 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
                     Num::Int(n) => return Ok(n),
                     Num::Float(f) => Value::float(f),
                 }
-            } else { v };
-            if let Some(n) = v.as_int() { return Ok(n); }
+            } else {
+                v
+            };
+            if let Some(n) = v.as_int() {
+                return Ok(n);
+            }
             if let Some(f) = v.as_float() {
                 if f.fract() == 0.0 && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
                     return Ok(f as i64);
@@ -5362,7 +5973,9 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
             Err(num_err("number expected"))
         };
         let fmt_num = |v: Value| -> VmResult<f64> {
-            if let Some(f) = v.to_float() { return Ok(f); }
+            if let Some(f) = v.to_float() {
+                return Ok(f);
+            }
             if v.is_string() {
                 match crate::heap::with_str(v, parse_number) {
                     Some(Num::Int(n)) => return Ok(n as f64),
@@ -5374,8 +5987,15 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
         };
         // Sign + zero-padding shared by the float conversions.
         let float_body = |f: f64, body: String| -> String {
-            let sign = if f.is_sign_negative() { "-" }
-                       else if plus { "+" } else if space { " " } else { "" };
+            let sign = if f.is_sign_negative() {
+                "-"
+            } else if plus {
+                "+"
+            } else if space {
+                " "
+            } else {
+                ""
+            };
             format!("{sign}{body}")
         };
 
@@ -5387,13 +6007,22 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
                 // Precision for integers means minimum digits (zero-filled),
                 // disables the '0' flag, and %.0d of zero prints nothing.
                 if let Some(p) = prec {
-                    if p == 0 && n == 0 { raw.clear(); }
-                    while raw.len() < p { raw.insert(0, '0'); }
+                    if p == 0 && n == 0 {
+                        raw.clear();
+                    }
+                    while raw.len() < p {
+                        raw.insert(0, '0');
+                    }
                 }
-                let signed = if n < 0 { format!("-{raw}") }
-                             else if plus { format!("+{raw}") }
-                             else if space { format!(" {raw}") }
-                             else { raw };
+                let signed = if n < 0 {
+                    format!("-{raw}")
+                } else if plus {
+                    format!("+{raw}")
+                } else if space {
+                    format!(" {raw}")
+                } else {
+                    raw
+                };
                 pad_str(signed, width, left, zero && prec.is_none())
             }
             'u' => {
@@ -5401,24 +6030,44 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
                 check_flags("-0", true)?;
                 let mut raw = n.to_string();
                 if let Some(p) = prec {
-                    if p == 0 && n == 0 { raw.clear(); }
-                    while raw.len() < p { raw.insert(0, '0'); }
+                    if p == 0 && n == 0 {
+                        raw.clear();
+                    }
+                    while raw.len() < p {
+                        raw.insert(0, '0');
+                    }
                 }
                 pad_str(raw, width, left, zero && prec.is_none())
             }
             'x' | 'X' | 'o' => {
                 let n = fmt_int(v)? as u64;
                 check_flags("-#0", true)?;
-                let mut raw = match spec { 'x' => format!("{n:x}"), 'X' => format!("{n:X}"), _ => format!("{n:o}") };
+                let mut raw = match spec {
+                    'x' => format!("{n:x}"),
+                    'X' => format!("{n:X}"),
+                    _ => format!("{n:o}"),
+                };
                 if let Some(p) = prec {
-                    if p == 0 && n == 0 { raw.clear(); }
-                    while raw.len() < p { raw.insert(0, '0'); }
+                    if p == 0 && n == 0 {
+                        raw.clear();
+                    }
+                    while raw.len() < p {
+                        raw.insert(0, '0');
+                    }
                 }
                 // For octal, '#' forces a leading zero.
-                if alt && spec == 'o' && !raw.starts_with('0') { raw = format!("0{raw}"); }
+                if alt && spec == 'o' && !raw.starts_with('0') {
+                    raw = format!("0{raw}");
+                }
                 let prefix = if alt && n != 0 {
-                    match spec { 'x' => "0x", 'X' => "0X", _ => "" }
-                } else { "" };
+                    match spec {
+                        'x' => "0x",
+                        'X' => "0X",
+                        _ => "",
+                    }
+                } else {
+                    ""
+                };
                 // Zero-padding goes after the base prefix: %#08x → 0x0000ff.
                 if zero && prec.is_none() && !left && raw.len() + prefix.len() < width {
                     let zeros = width - prefix.len() - raw.len();
@@ -5437,7 +6086,9 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
                 let f = fmt_num(v)?;
                 check_flags("-+#0 ", true)?;
                 let mut body = format!("{:.*}", prec.unwrap_or(6), f.abs());
-                if alt && !body.contains('.') { body.push('.'); }
+                if alt && !body.contains('.') {
+                    body.push('.');
+                }
                 pad_str(float_body(f, body), width, left, zero && f.is_finite())
             }
             'e' | 'E' => {
@@ -5446,7 +6097,9 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
                 let mut body = fmt_e(f.abs(), prec.unwrap_or(6), spec == 'E');
                 if alt {
                     let epos = body.find(['e', 'E']).unwrap_or(body.len());
-                    if !body[..epos].contains('.') { body.insert(epos, '.'); }
+                    if !body[..epos].contains('.') {
+                        body.insert(epos, '.');
+                    }
                 }
                 pad_str(float_body(f, body), width, left, zero && f.is_finite())
             }
@@ -5479,15 +6132,18 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
                 // the result stays valid UTF-8.
                 let raw = if let Some(p) = prec {
                     let mut cut = p.min(raw.len());
-                    while !raw.is_char_boundary(cut) { cut -= 1; }
+                    while !raw.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
                     raw[..cut].to_owned()
-                } else { raw };
+                } else {
+                    raw
+                };
                 pad_str(raw, width, left, false)
             }
             'q' => {
                 if left || plus || zero || space || alt || width > 0 || prec.is_some() {
-                    return Err(VmError::RuntimeError(
-                        "specifier '%q' cannot have modifiers".into()));
+                    return Err(VmError::RuntimeError("specifier '%q' cannot have modifiers".into()));
                 }
                 if v.is_int_like() {
                     let n = v.as_int().unwrap();
@@ -5511,7 +6167,10 @@ fn string_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> VmResult<Vec<Value>>
                     q.push(b'"');
                     for (i, &b) in sb.iter().enumerate() {
                         match b {
-                            b'"' | b'\\' | b'\n' => { q.push(b'\\'); q.push(b); }
+                            b'"' | b'\\' | b'\n' => {
+                                q.push(b'\\');
+                                q.push(b);
+                            }
                             _ if b < 0x20 || b == 0x7f => {
                                 // \ddd only when a digit follows (else \d).
                                 if i + 1 < sb.len() && sb[i + 1].is_ascii_digit() {

@@ -67,7 +67,9 @@ impl Gc {
     /// has no metatable.
     #[inline(always)]
     pub(crate) fn meta_get(&self, obj: Value, key: Value) -> Value {
-        if !obj.is_table() { return Value::nil(); }
+        if !obj.is_table() {
+            return Value::nil();
+        }
         match self.metatable(self.table(obj)) {
             Some(mt) => mt.raw_get(key),
             None => Value::nil(),
@@ -133,7 +135,9 @@ impl Gc {
     #[inline(always)]
     pub(crate) fn callable(&mut self, v: Value) -> Option<CallableProto> {
         if v.is_userdata() {
-            if is_native(v) { return None; }
+            if is_native(v) {
+                return None;
+            }
             let proto = v.as_userdata().unwrap() as *const GcProto;
             return Some(CallableProto { proto, upvals_ptr: std::ptr::null_mut(), upvals_len: 0 });
         }
@@ -253,4 +257,3 @@ pub(crate) unsafe fn proto<'a>(p: *const GcProto) -> &'a Proto {
     // SAFETY: per the caller; a field place, so the header isn't covered.
     unsafe { &(*p).proto }
 }
-

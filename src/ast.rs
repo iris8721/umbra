@@ -88,11 +88,27 @@ pub enum Unop {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Binop {
-    Add, Sub, Mul, Div, IDiv, Mod, Pow,
-    BAnd, BOr, BXor, Shl, Shr,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    IDiv,
+    Mod,
+    Pow,
+    BAnd,
+    BOr,
+    BXor,
+    Shl,
+    Shr,
     Concat,
-    Eq, Ne, Lt, Le, Gt, Ge,
-    And, Or,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +120,7 @@ pub struct TableConstructor {
 #[derive(Debug, Clone)]
 pub enum TableField {
     Indexed { key: Expr, val: Expr },
-    Named   { key: String, val: Expr, line: u32 },
+    Named { key: String, val: Expr, line: u32 },
     Positional(Expr),
 }
 
@@ -125,28 +141,28 @@ pub struct Block {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    Assign   { targets: Vec<Expr>, values: Vec<Expr>, line: u32 },
+    Assign { targets: Vec<Expr>, values: Vec<Expr>, line: u32 },
     // closes[i] is true if names[i] was declared with a <close> attribute.
-    Local    { mutable: bool, names: Vec<String>, closes: Vec<bool>, values: Vec<Expr>, line: u32 },
+    Local { mutable: bool, names: Vec<String>, closes: Vec<bool>, values: Vec<Expr>, line: u32 },
     Destructure { mutable: bool, fields: Vec<String>, value: Expr, line: u32 },
-    Do       { body: Block, line: u32 },
-    While    { cond: Expr, body: Block, line: u32 },
+    Do { body: Block, line: u32 },
+    While { cond: Expr, body: Block, line: u32 },
     RepeatUntil { body: Block, cond: Expr, line: u32 },
-    If       { cond: Expr, then: Block, elseifs: Vec<(Expr, Block)>, else_: Option<Block>, line: u32 },
-    ForNum   { var: String, start: Expr, limit: Expr, step: Option<Expr>, body: Block, line: u32 },
-    ForIn    { vars: Vec<String>, iters: Vec<Expr>, body: Block, line: u32 },
-    FuncDef  { name: FuncName, body: FuncBody, line: u32 },
+    If { cond: Expr, then: Block, elseifs: Vec<(Expr, Block)>, else_: Option<Block>, line: u32 },
+    ForNum { var: String, start: Expr, limit: Expr, step: Option<Expr>, body: Block, line: u32 },
+    ForIn { vars: Vec<String>, iters: Vec<Expr>, body: Block, line: u32 },
+    FuncDef { name: FuncName, body: FuncBody, line: u32 },
     LocalFunc { name: String, body: FuncBody, line: u32 },
-    Call     (CallExpr),
+    Call(CallExpr),
     MethodCall(MethodCallExpr),
     // For expressions used as statements purely for their side effect (currently
     // just ++/--); the value is discarded, unlike Call/MethodCall which can also
     // appear in value position and get their own dedicated Expr variants already.
-    ExprStmt (Expr),
-    Break    (u32),
-    Continue (u32),
-    Goto     (String, u32),
-    Label    (String, u32),
+    ExprStmt(Expr),
+    Break(u32),
+    Continue(u32),
+    Goto(String, u32),
+    Label(String, u32),
 }
 
 #[derive(Debug, Clone)]
